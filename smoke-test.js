@@ -431,6 +431,17 @@ try {
   assertStatus(await call(app.handle,'PATCH',`/api/orders/${lead.id}`,{cookie:orderManager.cookie,body:{status:'review'}}),403,'Order Manager cannot update an order outside the assigned scope');
   assert.equal(asJson(await call(app.handle,'GET','/api/dashboard',{cookie:orderManager.cookie})).orders.some(row=>row.id===conversationLeadId),true,'Order Manager dashboard lists assigned customer order');
   assert.equal(asJson(await call(app.handle,'GET','/api/dashboard',{cookie:orderManager.cookie})).orders.some(row=>row.id===lead.id),false,'Order Manager dashboard omits another unassigned customer order');
+  assertStatus(await call(app.handle,'POST','/api/auth/logout',{cookie:conversationClient.cookie}),200,'customer can end the session after the template conversation becomes an order');
+  const returningClientLogin=await call(app.handle,'POST','/api/auth/login',{body:{username:'conversation-client@example.test',password:conversationClient.password,accountType:'client'}});
+  assertStatus(returningClientLogin,200,'customer can sign in again with the same account');
+  conversationClient.cookie=sessionFrom(returningClientLogin);
+  const clientAfterRelogin=asJson(await call(app.handle,'GET','/api/dashboard',{cookie:conversationClient.cookie}));
+  const persistedOrder=clientAfterRelogin.orders.find(row=>row.id===conversationLeadId);
+  assert.ok(persistedOrder,'formal project request remains in the customer account after logout and login');
+  assert.equal(persistedOrder.status,'active','the Order Manager status update persists across customer sessions');
+  const persistedConversation=asJson(await call(app.handle,'GET',`/api/conversations/${conversation.id}`,{cookie:conversationClient.cookie})).conversation;
+  assert.match(JSON.stringify(persistedConversation.messages),/prepare a scoped quote/,'staff reply remains in the conversation after customer login');
+  assert.equal(persistedConversation.quote.status,'accepted','accepted quote remains saved after customer login');
   assert.equal(asJson(await call(app.handle,'GET','/api/referral-intelligence',{cookie:adminCookie})).summary.sales,0,'template conversation, quote acceptance and formal request do not count as sales');
 
   const hrInvite = await invite('Smoke People Lead', 'smokehr', 'hr_manager');
