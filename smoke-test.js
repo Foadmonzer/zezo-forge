@@ -5,10 +5,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes, createHmac } from 'node:crypto';
 import { templateCatalog, templateById } from './public/template-catalog.js';
+import { buildTemplateEnquiryMessage, buildWhatsAppUrl, normalizeWhatsAppNumber } from './public/whatsapp.js';
 
 const testDataDir = await mkdtemp(join(tmpdir(), 'zezo-v1-smoke-'));
 process.env.ZEZO_DATA_DIR = testDataDir;
 process.env.NODE_ENV = 'test';
+process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP = '+971500000001';
+process.env.ZEZO_ORDERS_WHATSAPP = '+971500000002';
 for (const key of ['RESEND_API_KEY','ZEZO_FROM_EMAIL','ZEZO_NOTIFICATION_EMAIL','OPENAI_API_KEY','OPENAI_MODEL']) process.env[key]='';
 const temporaryPassword = () => `Smoke!${randomBytes(24).toString('base64url')}`;
 function currentTotp(secret){
@@ -115,6 +118,15 @@ try {
   assertStatus(await call(app.handle,'GET','/templates.css'),200,'template library stylesheet');
   assert.equal((await call(app.handle,'GET','/templates.css')).headers['Content-Type'],'text/css; charset=utf-8');
   assertStatus(await call(app.handle,'GET','/template-catalog.js'),200,'template catalog module');
+  const whatsappModule=await call(app.handle,'GET','/whatsapp.js');
+  assertStatus(whatsappModule,200,'WhatsApp helper module must be served as JavaScript instead of the SPA fallback');
+  assert.equal(whatsappModule.headers['Content-Type'],'text/javascript; charset=utf-8','WhatsApp helper module has the JavaScript content type');
+  assert.match(whatsappModule.body,/encodeURIComponent\(text\)/,'browser-served WhatsApp helper URL-encodes Arabic template messages');
+  const browserApp=await call(app.handle,'GET','/app.js');
+  assertStatus(browserApp,200,'browser application module');
+  assert.match(browserApp.body,/const contact=buildWhatsAppUrl\(whatsappPhone\('support'\)/,'developer project support action uses the customer-support number');
+  assert.match(browserApp.body,/function openTemplateWhatsApp\(item,action='customize'\)\{[\s\S]*?whatsappPhone\('orders'\)/,'template WhatsApp enquiries use the orders number');
+  assert.match(browserApp.body,/event\.target\.closest\('\#whatsappOrder'\)\)\{const phone=whatsappPhone\('orders'\)/,'project-form WhatsApp action uses the orders number');
   assertStatus(await call(app.handle,'GET','/live-demos.js'),200,'interactive demo module');
   assertStatus(await call(app.handle,'GET','/live-demos.css'),200,'interactive demo stylesheet');
   const liveDemoSource=await call(app.handle,'GET','/live-demos.js');
@@ -152,6 +164,22 @@ try {
   const health = await call(app.handle, 'GET', '/api/health');
   assertStatus(health, 200, 'health endpoint');
   const publicConfig=asJson(await call(app.handle,'GET','/api/public'));
+  assert.equal(publicConfig.customerSupportWhatsappNumber,'971500000001','public config separates general customer support WhatsApp');
+  assert.equal(publicConfig.ordersWhatsappNumber,'971500000002','public config separates the order and sales WhatsApp');
+  assert.equal(publicConfig.customerSupportWhatsappUrl,'https://wa.me/971500000001','customer support link uses the official wa.me host');
+  assert.equal(publicConfig.ordersWhatsappUrl,'https://wa.me/971500000002','orders link uses the official wa.me host');
+  assert.equal(normalizeWhatsAppNumber('+971 50 000 0002'),'971500000002','WhatsApp number normalization strips punctuation and country-code plus');
+  assert.equal(normalizeWhatsAppNumber('12345'),'','invalid short WhatsApp number is not published');
+  const templateMessage=buildTemplateEnquiryMessage({title:'عيادة النور',code:'WEB-003',price:200,referralCode:'ZEZO-TEST-REF',language:'ar'});
+  assert.match(templateMessage,/اسم القالب: عيادة النور/,'template enquiry message names the selected template');
+  assert.match(templateMessage,/رمز القالب: WEB-003/,'template enquiry message includes its code');
+  assert.match(templateMessage,/السعر الابتدائي: 200 شيكل/,'Arabic template enquiry message states the starting price in ILS');
+  assert.match(templateMessage,/رمز الإحالة: ZEZO-TEST-REF/,'template enquiry message includes an available referral code');
+  const templateUrl=new URL(buildWhatsAppUrl('+971500000002',templateMessage));
+  assert.equal(templateUrl.origin,'https://wa.me','WhatsApp links use the official Click to Chat domain');
+  assert.equal(templateUrl.pathname,'/971500000002','template order opens the orders department number');
+  assert.equal(templateUrl.searchParams.get('text'),templateMessage,'Arabic and line breaks survive wa.me URL encoding');
+  assert.ok(!buildTemplateEnquiryMessage({title:'Template',code:'WEB-003',price:200}).includes('رمز الإحالة'),'template message omits absent referral attribution');
   assert.equal(publicConfig.adminSetupAvailable,true,'local first-admin setup should be available before the first administrator exists');
   assert.equal(publicConfig.prices.find(p=>p.id==='landing-basic')?.price,150,'basic landing page price should be 150 ILS');
   assert.equal(publicConfig.prices.find(p=>p.id==='landing-custom')?.price,300,'custom landing page price should be 300 ILS');
@@ -161,7 +189,7 @@ try {
   const quote=asJson(await call(app.handle,'POST','/api/quote',{body:{brief:'أحتاج صفحة تعريف بسيطة من صفحة واحدة',lang:'ar'}}));
   assert.equal(quote.packageId,'landing-basic','quote assistant should recommend only a scoped fixed package');
   assert.equal(quote.price,150);
-  const initialAdminPassword = '123456789';
+  const initialAdminPassword = temporaryPassword();
   const adminPassword = temporaryPassword();
   process.env.NODE_ENV='production';
   assert.equal(asJson(await call(app.handle,'GET','/api/public')).adminSetupAvailable,false,'production must hide first-admin setup');
@@ -223,7 +251,7 @@ try {
   assert.match(referralCookie,/zezo_ref=/,'a valid referral is stored in a server-only first-touch cookie');
   assertStatus(await call(app.handle,'POST','/api/leads',{raw:true,body:{}}),401,'anonymous users cannot submit formal project requests');
   const multipartBoundary = 'ZEZO_SMOKE_BOUNDARY';
-  const fields = { name:'Temporary Client', email:'temporary@example.test', phone:'', whatsappCountryCode:'+971', whatsappLocalNumber:'522754716', service:'web', category:'site', details:'Temporary smoke test request, removed after checks.', budget:'300–1000 ILS', templateId:'web-copper-table', templateAction:'customize', consent:'true', referralCode:marketerInvite.user.referralCode };
+  const fields = { name:'Temporary Client', email:'temporary@example.test', phone:'', whatsappCountryCode:'+971', whatsappLocalNumber:'500000099', service:'web', category:'site', details:'Temporary smoke test request, removed after checks.', budget:'300–1000 ILS', templateId:'web-copper-table', templateAction:'customize', consent:'true', referralCode:marketerInvite.user.referralCode };
   assertStatus(await call(app.handle,'POST','/api/admin/template-prices',{cookie:adminCookie,body:{templatePrices:{},templateActive:{'web-copper-table':false}}}),200,'owner deactivates a template for new requests');
   assert.equal(asJson(await call(app.handle,'GET','/api/public')).templateActive['web-copper-table'],false,'template availability is published');
   assertStatus(await call(app.handle,'POST','/api/leads',{remoteAddress:'127.0.0.42',body:{...fields,email:'inactive-template@example.test'}}),409,'server rejects new requests for an unavailable template');
@@ -256,14 +284,14 @@ try {
   assert.equal(storedLead.templateName,'مطعم السعادة للشاورما','chosen template name should be visible to admin');
   assert.equal(storedLead.templateAction,'customize','template customization intent should be stored');
   assert.equal(storedLead.referralUserId,marketerInvite.user.id,'template enquiry should retain its marketer attribution across referral-code rotation');
-  assert.equal(storedLead.phone,'+971522754716','order stores the entered international WhatsApp number');
+  assert.equal(storedLead.phone,'+971500000099','order stores the entered international WhatsApp number');
   const clientDashboard=asJson(await call(app.handle,'GET','/api/dashboard',{cookie:temporaryClient.cookie}));
   assert.equal(clientDashboard.role,'client','client sign-in opens a customer-only dashboard');
   assert.deepEqual(clientDashboard.orders.map(order=>order.id),[lead.id],'client sees only their own orders');
-  assert.equal(clientDashboard.orders[0].phone,'+971522754716','client sees the phone snapshot recorded on their request');
+  assert.equal(clientDashboard.orders[0].phone,'+971500000099','client sees the phone snapshot recorded on their request');
   assertStatus(await call(app.handle,'PATCH','/api/profile',{cookie:temporaryClient.cookie,body:{name:'Temporary Client',email:fields.email,phone:'+971500000000',student:'true',university:'Test University'}}),200,'client can update their own profile and WhatsApp number');
   const snapshotAfterProfileChange=asJson(await call(app.handle,'GET','/api/dashboard',{cookie:adminCookie})).leads.find(item=>item.id===lead.id);
-  assert.equal(snapshotAfterProfileChange.phone,'+971522754716','changing profile contact does not mutate a past order phone snapshot');
+  assert.equal(snapshotAfterProfileChange.phone,'+971500000099','changing profile contact does not mutate a past order phone snapshot');
   assertStatus(await call(app.handle,'POST','/api/leads',{cookie:temporaryClient.cookie,body:{...fields,whatsappCountryCode:'+971',whatsappLocalNumber:'abc'}}),400,'server rejects an invalid international WhatsApp number');
   assertStatus(await call(app.handle,'POST','/api/admin/invite',{cookie:temporaryClient.cookie,body:{name:'Escalation Attempt',username:'escalate',role:'admin',email:'escalate@example.test'}}),403,'client accounts cannot access staff invitations');
   const secondClient=await ensureTestClient(app.handle,{name:'Other Client',email:'other-client@example.test'});
@@ -312,7 +340,7 @@ try {
   assert.equal(attributedRequest.referralLinkId,currentReferralLink.id,'request is pinned to its original monthly-link record');
   assert.equal(marketerDash.rank.qualifiedSales,0,'unpaid enquiries do not qualify for rank sales');
   assert.doesNotMatch(JSON.stringify(marketerDash), /temporary@example\.test|Temporary Client|smoke test request/i, 'marketer view must not expose client contact or description');
-  assert.doesNotMatch(JSON.stringify(marketerDash), /\+971522754716|wa\.me\/971522754716/i, 'marketers cannot see a client WhatsApp number');
+  assert.doesNotMatch(JSON.stringify(marketerDash), /\+971500000099|wa\.me\/971500000099/i, 'marketers cannot see a client WhatsApp number');
 
   const marketingInvite = await invite('Smoke Marketing Lead', 'smokemarketing', 'marketing_manager');
   const marketing = await activate(marketingInvite, temporaryPassword());
@@ -322,8 +350,8 @@ try {
   const marketingDash = asJson(marketingDashResponse);
   assert.equal(marketingDash.performance[0].leads, 3);
   assert.match(JSON.stringify(marketingDash), /temporary@example\.test|Temporary Client|smoke test request/i, 'marketing support can view customer contact and enquiry details');
-  assert.match(JSON.stringify(marketingDash),/\+971522754716/,'authorized customer support sees the per-request WhatsApp number');
-  assert.match(JSON.stringify(marketingDash),/wa\.me\/971522754716/,'support dashboard provides a direct WhatsApp contact URL');
+  assert.match(JSON.stringify(marketingDash),/\+971500000099/,'authorized customer support sees the per-request WhatsApp number');
+  assert.match(JSON.stringify(marketingDash),/wa\.me\/971500000099/,'support dashboard provides a direct WhatsApp contact URL');
   assertStatus(await call(app.handle,'POST','/api/referral-inquiries',{cookie:marketing.cookie,body:{followupId:'ZRI-FAKE12345678',code:currentReferralLink.code}}),409,'manual confirmation must reference a recorded WhatsApp click');
   assertStatus(await call(app.handle,'PATCH',`/api/marketing/leads/${lead.id}`,{cookie:marketing.cookie,body:{status:'review',supportNote:'Contacted for discovery call.'}}),200,'marketing manager can log customer support follow-up');
   assertStatus(await call(app.handle,'PATCH','/api/admin/leads/'+lead.id,{cookie:adminCookie,body:{status:'proposal',contractAmount:500}}),200,'owner sends a formal quote');
@@ -403,6 +431,17 @@ try {
   assertStatus(await call(app.handle,'PATCH',`/api/orders/${lead.id}`,{cookie:orderManager.cookie,body:{status:'review'}}),403,'Order Manager cannot update an order outside the assigned scope');
   assert.equal(asJson(await call(app.handle,'GET','/api/dashboard',{cookie:orderManager.cookie})).orders.some(row=>row.id===conversationLeadId),true,'Order Manager dashboard lists assigned customer order');
   assert.equal(asJson(await call(app.handle,'GET','/api/dashboard',{cookie:orderManager.cookie})).orders.some(row=>row.id===lead.id),false,'Order Manager dashboard omits another unassigned customer order');
+  assertStatus(await call(app.handle,'POST','/api/auth/logout',{cookie:conversationClient.cookie}),200,'customer can end the session after the template conversation becomes an order');
+  const returningClientLogin=await call(app.handle,'POST','/api/auth/login',{body:{username:'conversation-client@example.test',password:conversationClient.password,accountType:'client'}});
+  assertStatus(returningClientLogin,200,'customer can sign in again with the same account');
+  conversationClient.cookie=sessionFrom(returningClientLogin);
+  const clientAfterRelogin=asJson(await call(app.handle,'GET','/api/dashboard',{cookie:conversationClient.cookie}));
+  const persistedOrder=clientAfterRelogin.orders.find(row=>row.id===conversationLeadId);
+  assert.ok(persistedOrder,'formal project request remains in the customer account after logout and login');
+  assert.equal(persistedOrder.status,'active','the Order Manager status update persists across customer sessions');
+  const persistedConversation=asJson(await call(app.handle,'GET',`/api/conversations/${conversation.id}`,{cookie:conversationClient.cookie})).conversation;
+  assert.match(JSON.stringify(persistedConversation.messages),/prepare a scoped quote/,'staff reply remains in the conversation after customer login');
+  assert.equal(persistedConversation.quote.status,'accepted','accepted quote remains saved after customer login');
   assert.equal(asJson(await call(app.handle,'GET','/api/referral-intelligence',{cookie:adminCookie})).summary.sales,0,'template conversation, quote acceptance and formal request do not count as sales');
 
   const hrInvite = await invite('Smoke People Lead', 'smokehr', 'hr_manager');
@@ -414,7 +453,7 @@ try {
   assert.equal(hrDash.role, 'hr_manager');
   assert.equal(asJson(await call(app.handle,'GET','/api/crm',{cookie:hr.cookie})).scope,'aggregate','HR CRM access is aggregate-only');
   assert.doesNotMatch(JSON.stringify(asJson(await call(app.handle,'GET','/api/crm',{cookie:hr.cookie}))),/crm-contact@example\.test|CRM Smoke Contact|\+971551234567/,'HR CRM response contains no customer contact details');
-  assert.doesNotMatch(JSON.stringify(hrDash),/\+971522754716|wa\.me\/971522754716/i,'HR views employee and finance reviews without customer WhatsApp contact');
+  assert.doesNotMatch(JSON.stringify(hrDash),/\+971500000099|wa\.me\/971500000099/i,'HR views employee and finance reviews without customer WhatsApp contact');
   assert.ok(Array.isArray(hrDash.users));
   assert.equal('leads' in hrDash, false);
   assert.equal('summary' in hrDash, false);
@@ -504,7 +543,7 @@ try {
   assert.equal(developerDash.role,'developer');
   assert.ok(developerDash.projects.some(item=>item.id===lead.id&&item.contractAmount===300&&item.expectedCommission===75),'assigned developer sees project value and expected 25% commission');
   assert.doesNotMatch(JSON.stringify(developerDash),/temporary@example\.test|Temporary Client|300–1000 ILS/i,'developer cannot see client identity or customer budget');
-  assert.doesNotMatch(JSON.stringify(developerDash),/\+971522754716|wa\.me\/971522754716/i,'developer cannot see a customer WhatsApp number by default');
+  assert.doesNotMatch(JSON.stringify(developerDash),/\+971500000099|wa\.me\/971500000099/i,'developer cannot see a customer WhatsApp number by default');
   assertStatus(await call(app.handle,'GET','/api/admin/attachment/'+lead.id+'/0',{cookie:developer.cookie}),404,'developer cannot access project files before accepting task');
   assertStatus(await call(app.handle,'POST',`/api/developer/projects/${lead.id}/decision`,{cookie:developer.cookie,body:{decision:'accept'}}),200,'developer accepts task');
   assertStatus(await call(app.handle,'PATCH',`/api/developer/projects/${lead.id}`,{cookie:developer.cookie,body:{status:'in_progress',note:'Implementation started.'}}),200,'developer updates execution progress');

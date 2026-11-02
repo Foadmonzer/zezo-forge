@@ -5,6 +5,7 @@ import { extname, join, normalize, basename, isAbsolute, resolve } from 'node:pa
 import { randomBytes, scryptSync, timingSafeEqual, createHash, createHmac } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { templateCatalog, templateById } from './public/template-catalog.js';
+import { buildWhatsAppUrl, normalizeWhatsAppNumber } from './public/whatsapp.js';
 
 const ROOT = fileURLToPath(new URL('.', import.meta.url));
 const STAGING_MODE = process.env.ZEZO_STAGING === 'true';
@@ -1235,8 +1236,11 @@ async function handle(req, res) {
   if (path.startsWith('/api/')) {
     if (req.method === 'GET' && path === '/api/health') return json(res, 200, { ok: true, app: 'ZEZO', storage: 'local-json', staging: STAGING_MODE }, security);
     if (req.method === 'GET' && path === '/api/public') {
-      const phone = STAGING_MODE ? '' : String(process.env.ZEZO_WHATSAPP_NUMBER || '').replace(/\D/g, '');
-      return json(res, 200, { prices: store.settings.prices.filter(price=>price.active!==false), templatePrices: store.settings.templatePrices || {}, templateInclusions:store.settings.templateInclusions||{}, templateActive:store.settings.templateActive||{}, commissionConfigured: store.settings.commissionPercent != null, whatsappUrl: phone.length >= 8 ? `https://wa.me/${phone}` : '', emailReady: emailReady() && adminEmailReady(), aiQuoteReady:!STAGING_MODE&&Boolean(process.env.OPENAI_API_KEY&&process.env.OPENAI_MODEL), adminSetupAvailable:firstAdminSetupAvailable(), stagingMode:STAGING_MODE }, security);
+      const legacyPhone = process.env.ZEZO_WHATSAPP_NUMBER;
+      const customerSupportPhone = STAGING_MODE ? '' : normalizeWhatsAppNumber(process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP !== undefined ? process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP : legacyPhone);
+      const ordersPhone = STAGING_MODE ? '' : normalizeWhatsAppNumber(process.env.ZEZO_ORDERS_WHATSAPP !== undefined ? process.env.ZEZO_ORDERS_WHATSAPP : legacyPhone);
+      const ordersUrl = buildWhatsAppUrl(ordersPhone);
+      return json(res, 200, { prices: store.settings.prices.filter(price=>price.active!==false), templatePrices: store.settings.templatePrices || {}, templateInclusions:store.settings.templateInclusions||{}, templateActive:store.settings.templateActive||{}, commissionConfigured: store.settings.commissionPercent != null, customerSupportWhatsappNumber:customerSupportPhone, ordersWhatsappNumber:ordersPhone, customerSupportWhatsappUrl:buildWhatsAppUrl(customerSupportPhone), ordersWhatsappUrl:ordersUrl, whatsappUrl:ordersUrl, emailReady: emailReady() && adminEmailReady(), aiQuoteReady:!STAGING_MODE&&Boolean(process.env.OPENAI_API_KEY&&process.env.OPENAI_MODEL), adminSetupAvailable:firstAdminSetupAvailable(), stagingMode:STAGING_MODE }, security);
     }
     if(req.method==='POST'&&path==='/api/conversations'){
       if(!rateAllowedFor(conversationAttempts,`create:${req.socket.remoteAddress||'unknown'}`,15,60*60_000))return json(res,429,{error:'وصلنا الحد المؤقت للمحادثات. حاول لاحقاً / Conversation limit reached. Try again later.'},security);
@@ -2126,7 +2130,7 @@ async function handle(req, res) {
 
   if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405,security); return res.end('Method not allowed'); }
   let target=path==='/'?'/index.html':path;
-  if(!/^\/(index\.html|styles\.css|templates\.css|live-demos\.css|demo-(web|apps|ai|ideas)\.(js|css)|app\.js|live-demos\.js|template-catalog\.js|favicon\.svg|assets\/(zezo-nebula|zezo-planet-texture)\.jpg|assets\/lamsa-(abaya|dress|set|scarf)\.png|assets\/templates\/[a-z0-9-]+\.jpg)$/.test(target)) target='/index.html';
+  if(!/^\/(index\.html|styles\.css|templates\.css|live-demos\.css|demo-(web|apps|ai|ideas)\.(js|css)|app\.js|live-demos\.js|template-catalog\.js|whatsapp\.js|favicon\.svg|assets\/(zezo-nebula|zezo-planet-texture)\.jpg|assets\/lamsa-(abaya|dress|set|scarf)\.png|assets\/templates\/[a-z0-9-]+\.jpg)$/.test(target)) target='/index.html';
   let headers={...security,'Cache-Control':'no-cache'};
   if(target==='/index.html'){
     const cookies=[];

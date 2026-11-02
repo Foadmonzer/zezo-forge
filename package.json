@@ -11,7 +11,5 @@
     "test:staging": "node staging-smoke-test.js",
     "test": "npm run test:smoke && npm run test:staging"
   },
-  "engines": {
-    "node": ">=20"
-  }
+  "engines": { "node": ">=20" }
 }
