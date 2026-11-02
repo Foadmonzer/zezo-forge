@@ -1,0 +1,7 @@
+interface:
+  display_name: ZEZO Web
+  short_description: Websites, landing pages, and online stores
+  default_prompt: جهّز موقع العميل حسب طلبه للمراجعة والتسليم.
+  brand_color: "#0066FF"
+policy:
+  allow_implicit_invocation: true

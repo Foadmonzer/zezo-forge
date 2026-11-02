@@ -1,0 +1,17 @@
+{
+  "name": "zezo-digital-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ZEZO bilingual website and local-first referral workspace",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test:smoke": "node smoke-test.js",
+    "test:staging": "node staging-smoke-test.js",
+    "test": "npm run test:smoke && npm run test:staging"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

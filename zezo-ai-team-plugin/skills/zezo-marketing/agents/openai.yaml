@@ -1,0 +1,7 @@
+interface:
+  display_name: ZEZO Marketing
+  short_description: Campaigns, content, SEO, and leads
+  default_prompt: جهّز خطة أو محتوى تسويقي مناسب للعميل.
+  brand_color: "#0066FF"
+policy:
+  allow_implicit_invocation: true

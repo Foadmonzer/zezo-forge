@@ -1,0 +1,7 @@
+interface:
+  display_name: ZEZO Manager
+  short_description: Routes client requests and reviews delivery
+  default_prompt: عندي طلب جديد من عميل ZEZO. اختر التخصص وجهّز الناتج للمراجعة.
+  brand_color: "#0066FF"
+policy:
+  allow_implicit_invocation: true

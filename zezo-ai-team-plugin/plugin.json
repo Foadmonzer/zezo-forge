@@ -1,0 +1,24 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "zezo-ai-team",
+  "version": "1.0.0",
+  "description": "The ZEZO client delivery team: a central coordinator and specialists for websites, applications, AI automation, and marketing.",
+  "author": {
+    "name": "ZEZO"
+  },
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "ZEZO AI Team",
+        "shortDescription": "Client work, ready to review",
+        "longDescription": "Send one client brief to ZEZO's central coordinator. It selects the right specialist skills, creates reviewable deliverables, verifies implementation work, and returns a handoff for the owner to review.",
+        "developerName": "ZEZO",
+        "category": "Productivity",
+        "capabilities": [],
+        "brandColor": "#0066FF",
+        "brandColorDark": "#A3FF12",
+        "defaultPrompt": "عندي طلب جديد من عميل ZEZO. حلّله، اختر التخصص المناسب، وجهّز الناتج للمراجعة والتسليم."
+      }
+    }
+  }
+}

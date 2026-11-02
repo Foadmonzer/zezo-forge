@@ -1,0 +1,11 @@
+{
+  "purpose": "Illustrative synthetic scenarios for ZEZO review. This file is documentation, not imported by the application.",
+  "records": [
+    { "type": "customer", "name": "عميل تجريبي - سارة", "email": "sara.customer@example.test", "whatsapp": "+971500000001", "student": true },
+    { "type": "employee", "name": "موظف تجريبي - سامر", "username": "demo.orders", "role": "order_manager" },
+    { "type": "template_request", "templateId": "web-copper-table", "templateName": "مطعم السعادة للشاورما", "startingPriceILS": 200 },
+    { "type": "project", "service": "web", "status": "waiting_customer_approval", "illustrativeQuoteILS": 300 },
+    { "type": "payment", "kind": "deposit", "amountILS": 100, "status": "manual_test_only" }
+  ],
+  "usage": "To create app records, use the customer registration, owner setup, invitation, conversation, quote, and manual-payment flows. Never import this JSON directly into data-review/zezo-data.json."
+}

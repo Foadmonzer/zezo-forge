@@ -1,0 +1,24 @@
+# Local credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+
+# Local runtime output
+/data/uploads/
+/data/*.tmp
+/data/server*.log
+data-preview*/
+data-staging*/
+data-staging-recovery/
+*.log
+*.tmp
+*.bak
+*.backup
+
+# Generated and dependency files
+node_modules/
+coverage/
+dist/
+artifacts/
+graphify-out/
+*.zip

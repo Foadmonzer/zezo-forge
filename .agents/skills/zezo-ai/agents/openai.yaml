@@ -1,0 +1,7 @@
+interface:
+  display_name: ZEZO AI
+  short_description: AI assistants, integrations, and automation
+  default_prompt: صمّم حل الذكاء الاصطناعي أو الأتمتة المناسب للعميل.
+  brand_color: "#0066FF"
+policy:
+  allow_implicit_invocation: true

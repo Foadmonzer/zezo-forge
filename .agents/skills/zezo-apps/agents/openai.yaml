@@ -1,0 +1,7 @@
+interface:
+  display_name: ZEZO Apps
+  short_description: Web apps, mobile apps, and product software
+  default_prompt: حوّل طلب العميل إلى تطبيق جاهز للمراجعة.
+  brand_color: "#0066FF"
+policy:
+  allow_implicit_invocation: true
