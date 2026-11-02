@@ -4,6 +4,7 @@
 !.env.example
 
 # Local runtime output
+/data/
 /data/uploads/
 /data/*.tmp
 /data/server*.log

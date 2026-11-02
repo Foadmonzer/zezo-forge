@@ -4,11 +4,11 @@ import { renderWebDemo, mountWebDemo } from './demo-web.js';
 import { renderAppsDemo, mountAppsDemo } from './demo-apps.js';
 import { renderAiDemo, mountAiDemo } from './demo-ai.js';
 import { renderIdeasDemo, mountIdeasDemo } from './demo-ideas.js';
+import { buildWhatsAppUrl, buildTemplateEnquiryMessage } from './whatsapp.js';
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[char]));
 const savedMotion = localStorage.getItem('zezo-motion');
-const DEFAULT_WHATSAPP_URL = 'https://wa.me/971522754716';
 const IS_STAGING_MODE = document.documentElement.dataset.zezoStaging === 'true';
 const state = { lang: 'ar', stagingMode:IS_STAGING_MODE, prices: [], publicConfig: {}, category: 'all', templateService:'all', templateSearch:'', currentTemplate:null, templateCart:0, dashboard: null, dashboardTab: 'overview', notifications:[],notificationUnread:0,notificationAuthenticated:false,notificationFilters:{type:'',status:'unread',from:'',to:''},crmView:'table',crmFilters:{},crmOpenId:'',activationToken: '', resetToken:'', authMode:'team', pendingProjectSubmit:false, pendingTemplate:null,activeConversationId:'',conversationPoll:null, referralCode:'', referralVisitorId:'', referralAnalytics:localStorage.getItem('zezo-referral-analytics')==='yes', referralReport:null, motion: savedMotion === null ? matchMedia('(prefers-reduced-motion: reduce)').matches : savedMotion };
 let referralViewObserver=null;
@@ -39,10 +39,28 @@ function emitReferralEvent(type,resourceId='',followupId=''){
   if(navigator.sendBeacon)navigator.sendBeacon('/api/referral-events',new Blob([body],{type:'application/json'}));
   else fetch('/api/referral-events',{method:'POST',headers:{'Content-Type':'application/json'},body,keepalive:true}).catch(()=>{});
 }
-function openWhatsAppEnquiry(message,resourceId=''){
-  const base=state.publicConfig.whatsappUrl;if(!base){showToast(tx('واتساب غير مربوط حالياً.','WhatsApp is not connected yet.'),true);return}
-  const followupId=shortToken('ZRI-'),parts=[message,`ZEZO ${tx('رقم المتابعة','follow-up ID')}: ${followupId}`,`${tx('رمز الإحالة','Referral code')}: ${state.referralCode||tx('بدون','none')}`];
-  emitReferralEvent('whatsapp_click',resourceId,followupId);window.open(`${base}?text=${encodeURIComponent(parts.join('\n'))}`,'_blank','noopener,noreferrer');
+function whatsappPhone(kind='orders'){
+  return state.stagingMode?'':kind==='support'?state.publicConfig.customerSupportWhatsappNumber:state.publicConfig.ordersWhatsappNumber;
+}
+function openWhatsAppWindow(url){
+  if(!url)return;
+  const popup=window.open(url,'_blank');
+  if(popup)popup.opener=null;
+  else window.location.assign(url);
+}
+function openWhatsAppEnquiry(message,resourceId='',kind='orders'){
+  const phone=whatsappPhone(kind);if(!phone){showToast(tx('واتساب غير مربوط حالياً.','WhatsApp is not connected yet.'),true);return}
+  const followupId=shortToken('ZRI-'),parts=[message,`ZEZO ${tx('رقم المتابعة','follow-up ID')}: ${followupId}`];
+  if(state.referralCode)parts.push(`${tx('رمز الإحالة','Referral code')}: ${state.referralCode}`);
+  emitReferralEvent('whatsapp_click',resourceId,followupId);openWhatsAppWindow(buildWhatsAppUrl(phone,parts.join('\n')));
+}
+function openTemplateWhatsApp(item,action='customize'){
+  if(!item)return;
+  const phone=whatsappPhone('orders');if(!phone){showToast(tx('واتساب قسم الطلبات غير مربوط حالياً.','Orders WhatsApp is not connected yet.'),true);return}
+  const followupId=shortToken('ZRI-'),message=buildTemplateEnquiryMessage({title:item.title[state.lang],code:item.code,price:state.publicConfig.templatePrices?.[item.id],referralCode:state.referralCode,language:state.lang});
+  const actionLine=state.lang==='ar'?`نوع الطلب: ${action==='order'?'طلب قالب':'تخصيص قالب'}`:`Request type: ${action==='order'?'Template request':'Template customization'}`;
+  const text=[message,actionLine,`ZEZO ${tx('رقم المتابعة','follow-up ID')}: ${followupId}`].join('\n');
+  emitReferralEvent('whatsapp_click',item.id,followupId);openWhatsAppWindow(buildWhatsAppUrl(phone,text));
 }
 function setAnalyticsConsent(allowed){
   const revokeId=state.referralVisitorId||localStorage.getItem('zezo-referral-visitor');
@@ -104,8 +122,7 @@ function applyLanguage(){
   $('#languageToggle').innerHTML=state.lang==='ar'?'EN <span>↗</span>':'عربي <span>↗</span>';
   const languageInput=$('#projectForm [name="lang"]');if(languageInput)languageInput.value=state.lang;
   document.title=state.lang==='ar'?'ZEZO — من الفكرة إلى الواقع الرقمي':'ZEZO — Ideas into digital reality';
-  $('#mobileMenu').setAttribute('aria-label',state.lang==='ar'?'فتح القائمة':'Open menu');
-  $('#motionToggle').querySelector('[data-ar]').textContent=state.motion?tx('إعادة الحركة','Enable motion'):tx('تقليل الحركة','Reduce motion');
+  $('#mobileMenu').setAttribute('aria-label',state.lang==='ar'?( $('#mainNav').classList.contains('open')?'إغلاق القائمة':'فتح القائمة' ):( $('#mainNav').classList.contains('open')?'Close menu':'Open menu'));
   $('#motionToggle').querySelector('[data-ar]').textContent=state.motion?tx('إعادة الحركة','Enable motion'):tx('تقليل الحركة','Reduce motion');
   renderServices(); renderWork(); renderPrices(); renderTemplateLibrary(); updateCategoryOptions();
   if(state.dashboard) renderDashboard(state.dashboard,state.dashboardTab);
@@ -306,7 +323,24 @@ function updateCategoryOptions(){
   if(service?.categories.some(c=>c.id===previous))categorySelect.value=previous;
 }
 async function loadPublic(){
-  try{const r=await fetch('/api/public');const data=await r.json();state.stagingMode=Boolean(data.stagingMode)||IS_STAGING_MODE;state.publicConfig={...data,whatsappUrl:data.whatsappUrl||(state.stagingMode?'':DEFAULT_WHATSAPP_URL)};$('#quoteConsentWrap').hidden=!data.aiQuoteReady;$('#firstAdminSetup').hidden=!data.adminSetupAvailable;state.prices=data.prices||[];renderPrices();renderTemplateLibrary();const support=$('#customerSupport');if(state.publicConfig.whatsappUrl){support.href=state.publicConfig.whatsappUrl;support.target='_blank';support.rel='noopener noreferrer';$('#whatsappOrder').disabled=false}else{support.href='#contact';support.removeAttribute('target');$('#whatsappOrder').disabled=true}$('#quoteModeNote').textContent=data.aiQuoteReady?tx('التقدير إرشادي فقط. عند التفعيل، يُرسل وصفك لمعالجته بالذكاء الاصطناعي؛ السعر النهائي بعد المراجعة.','This is an estimate. With AI enabled, your brief is processed by an AI service; the final price follows review.'):tx('الاقتراح الأولي يعمل بقواعد النطاقات الحالية. التفعيل بالذكاء الاصطناعي ينتظر إعداد مفتاحه.','Initial suggestions use the current package rules. AI activation awaits its API key.') }catch{state.stagingMode=IS_STAGING_MODE;state.publicConfig.whatsappUrl=state.stagingMode?'':DEFAULT_WHATSAPP_URL;renderTemplateLibrary();const support=$('#customerSupport');support.href=state.publicConfig.whatsappUrl||'#contact';if(state.publicConfig.whatsappUrl){support.target='_blank';support.rel='noopener noreferrer'}else support.removeAttribute('target');$('#whatsappOrder').disabled=!state.publicConfig.whatsappUrl;showToast(tx('تعذر تحميل الأسعار. شغّل الخادم المحلي.','Could not load prices. Start the local server.'),true)}
+  const support=$('#customerSupport'),orderButton=$('#whatsappOrder');
+  try{
+    const response=await fetch('/api/public'),data=await response.json();
+    if(!response.ok)throw new Error('Public configuration unavailable');
+    state.stagingMode=Boolean(data.stagingMode)||IS_STAGING_MODE;
+    state.publicConfig={...data,customerSupportWhatsappNumber:state.stagingMode?'':data.customerSupportWhatsappNumber||'',ordersWhatsappNumber:state.stagingMode?'':data.ordersWhatsappNumber||''};
+    $('#quoteConsentWrap').hidden=!data.aiQuoteReady;$('#firstAdminSetup').hidden=!data.adminSetupAvailable;$('#firstAdminSetup').open=Boolean(data.adminSetupAvailable);
+    state.prices=data.prices||[];renderPrices();renderTemplateLibrary();
+    const supportUrl=buildWhatsAppUrl(state.publicConfig.customerSupportWhatsappNumber);
+    if(supportUrl){support.href=supportUrl;support.target='_blank';support.rel='noopener noreferrer';support.removeAttribute('aria-disabled')}
+    else{support.href='#contact';support.removeAttribute('target');support.removeAttribute('rel');support.setAttribute('aria-disabled','true')}
+    orderButton.disabled=!buildWhatsAppUrl(state.publicConfig.ordersWhatsappNumber);
+    $('#quoteModeNote').textContent=data.aiQuoteReady?tx('التقدير إرشادي فقط. عند التفعيل، يُرسل وصفك لمعالجته بالذكاء الاصطناعي؛ السعر النهائي بعد المراجعة.','This is an estimate. With AI enabled, your brief is processed by an AI service; the final price follows review.'):tx('الاقتراح الأولي يعمل بقواعد النطاقات الحالية. التفعيل بالذكاء الاصطناعي ينتظر إعداد مفتاحه.','Initial suggestions use the current package rules. AI activation awaits its API key.')
+  }catch{
+    state.stagingMode=IS_STAGING_MODE;state.publicConfig.customerSupportWhatsappNumber='';state.publicConfig.ordersWhatsappNumber='';
+    renderTemplateLibrary();support.href='#contact';support.removeAttribute('target');support.setAttribute('aria-disabled','true');orderButton.disabled=true;
+    showToast(tx('تعذر تحميل الأسعار. شغّل الخادم المحلي.','Could not load prices. Start the local server.'),true)
+  }
 }
 function observeReveals(){
   const nodes=$$('.reveal');
@@ -386,7 +420,7 @@ async function showTracking(trackToken){
   try{const response=await fetch(`/api/track?token=${encodeURIComponent(trackToken)}&lang=${state.lang}`);const data=await response.json();if(!response.ok)throw new Error(data.error||'Tracking link is unavailable');content.innerHTML=`<span class="tracking-status">${esc(data.statusText)}</span><h3>${esc(serviceTitle(data.service))}</h3><p>${tx('أرسلنا لك هذا الرابط لمتابعة تقدم الطلب دون إنشاء حساب.','This private link lets you follow your request without creating an account.')}</p>${data.note?`<div class="notice">${esc(data.note)}</div>`:''}<small>${tx('تاريخ الطلب','Request date')}: ${date(data.createdAt)}</small>`}
   catch(error){content.textContent=error.message}
 }
-function setModal(open){$('#authModal').classList.toggle('open',open);$('#authModal').setAttribute('aria-hidden',String(!open));document.body.style.overflow=open?'hidden':'';if(open){if(!$('#activatePanel').hidden)$('#activateForm input').focus();else if(!$('#firstPasswordChangePanel').hidden)$('#firstPasswordChangeForm input[name=currentPassword]').focus();else if(!$('#mfaSetupPanel').hidden)$('#mfaSetupForm input[name=code]').focus();else if(state.authMode==='client'){const target=$('#clientLoginPanel').hidden?$('#customerChoicePanel [data-customer-view]'):$('#clientLoginForm input[name=username]');target?.focus()}else $('#employeeLoginForm input[name=username]').focus()}}
+function setModal(open){$('#authModal').classList.toggle('open',open);$('#authModal').setAttribute('aria-hidden',String(!open));document.body.style.overflow=open?'hidden':'';if(open){if(!$('#activatePanel').hidden)$('#activateForm input').focus();else if(!$('#firstPasswordChangePanel').hidden)$('#firstPasswordChangeForm input[name=currentPassword]').focus();else if(!$('#mfaSetupPanel').hidden)$('#mfaSetupForm input[name=code]').focus();else if(state.authMode==='client'){const target=$('#clientLoginPanel').hidden?$('#customerChoicePanel [data-customer-view]'):$('#clientLoginForm input[name=username]');target?.focus()}else if(!$('#firstAdminSetup').hidden){$('#firstAdminSetup').open=true;$('#firstAdminSetup input[name=name]').focus()}else $('#employeeLoginForm input[name=username]').focus()}}
 function requireFirstPasswordChange(){ $('#loginPanel').hidden=true;$('#activatePanel').hidden=true;$('#mfaSetupPanel').hidden=true;$('#firstPasswordChangePanel').hidden=false;setModal(true); }
 function dashboardTabForRole(role){return role==='client'?'orders':role==='marketer'?'referral':role==='hr_manager'?'people':role==='marketing_manager'?'marketing':role==='developer'?'development':'overview'}
 function showCustomerView(view='choices'){
@@ -643,7 +677,7 @@ function developerPage(d){
     const decision=p.taskStatus==='offered'?`<div class="lead-edit"><button class="small-button accent" type="button" data-task-decision="accept" data-project-id="${esc(p.id)}">${tx('قبول المهمة','Accept task')}</button><button class="small-button danger" type="button" data-task-decision="decline" data-project-id="${esc(p.id)}">${tx('الاعتذار','Decline')}</button></div>`:'';
     const active=['accepted','in_progress','revision_requested'].includes(p.taskStatus);
     const update=active?`<form class="lead-edit" data-dev-progress="${esc(p.id)}"><label>${tx('حالة التنفيذ','Work status')}<select name="status"><option value="in_progress">${tx('قيد التنفيذ','In progress')}</option><option value="review_requested">${tx('جاهز لمراجعة المدير','Ready for owner review')}</option></select></label><label class="wide">${tx('ملاحظة عن التقدم','Progress note')}<input name="note" maxlength="500" value="${esc(p.taskNote||'')}"></label><button class="small-button accent" type="submit">${tx('تحديث الحالة','Update status')}</button></form><form class="lead-edit" data-dev-file="${esc(p.id)}"><label>${tx('رفع ملف للمراجعة','Upload a file for review')}<input type="file" name="file" required></label><button class="small-button" type="submit">${tx('رفع الملف','Upload file')}</button></form>`:'';
-    const contact=state.publicConfig.whatsappUrl?`${state.publicConfig.whatsappUrl}?text=${encodeURIComponent(tx(`مرحباً، بخصوص مشروع ZEZO رقم ${p.id}`,`Hello, about ZEZO project ${p.id}`))}`:'';
+    const contact=buildWhatsAppUrl(whatsappPhone('support'),tx(`مرحباً، بخصوص مشروع ZEZO رقم ${p.id}`,`Hello, about ZEZO project ${p.id}`));
     return `<details class="dash-card lead-card" data-project-card="${esc(p.id)}" ${p.taskStatus==='offered'?'open':''}><summary class="lead-detail-row"><span><b>${esc(serviceTitle(p.service))} · ${esc(projectCategoryTitle(p))}</b><small>${tx('رقم المشروع','Project ID')}: ${esc(p.id)} · ${date(p.createdAt)}${p.templateName?` · ${esc(p.templateName)}`:''}</small></span><span class="lead-right">${projectStagePill(p.projectStage)}<small>${esc(p.taskStatus||'—')}</small></span></summary><div class="lead-body"><p>${esc(p.requirements)}</p><div class="dash-kpis">${stat(tx('قيمة الاتفاق','Contract value'),money(p.contractAmount||0))}${stat(tx('المبلغ المحصّل المؤهل','Eligible collected amount'),money(p.collectedAmount||0))}${stat(tx('عمولة التنفيذ','Execution commission'),'25%')}${stat(tx('المستحق المتوقع على كامل العقد','Estimate on full contract'),money(p.expectedCommission||0))}${stat(tx('موعد التسليم','Due date'),p.dueDate||'—')}${stat(tx('بداية التنفيذ','Started'),p.projectStartedAt?date(p.projectStartedAt):'—')}</div><div class="lead-detail-row"><span>${tx('مستحق التنفيذ','Execution entitlement')}</span><b>${money(p.commissionAmount||0)} · ${statusPill(p.commissionStatus)}</b></div><p class="subtle-note">${tx('يُحتسب المستحق من المبالغ المحصّلة والمؤهلة بعد اكتمال التنفيذ واعتماد المراجعة؛ مبلغ العقد الكامل أعلاه تقدير فقط.','Entitlement is calculated from eligible collected funds after completion and review; the full-contract estimate above is indicative only.')}</p>${inputs?`<div>${inputs}</div>`:''}${outputs?`<div>${tx('ملفات التسليم','Delivery files')}: ${outputs}</div>`:''}${projectHistory?`<details><summary>${tx('سجل المشروع','Project history')}</summary>${projectHistory}</details>`:''}${p.reviewNote?`<div class="notice">${esc(p.reviewNote)}</div>`:''}${decision}${update}${contact?`<a class="small-button" href="${esc(contact)}" target="_blank" rel="noopener">${tx('تواصل مع خدمة العملاء بخصوص هذا المشروع','Contact support about this project')} ↗</a>`:''}</div></details>`;
   }).join(''):`<div class="empty-state">${tx('لا توجد مهام مسندة إليك حالياً.','No projects have been assigned to you yet.')}</div>`;
   return `${pageTitle(tx('مشاريعي المسندة','My assigned projects'),tx('راجع المتطلبات والقيمة والعمولة والموعد، ثم اقبل المهمة أو اعتذر.','Review the requirements, value, commission, and due date before accepting or declining.'),'DEVELOPER')}${rows}`;
@@ -761,6 +795,8 @@ $('#mfaSetupForm').addEventListener('submit',async event=>{event.preventDefault(
 
 document.addEventListener('change',event=>{if(event.target.matches('#inviteForm [name="role"]')){const label=event.target.form?.querySelector('.owner-mfa-field'),input=label?.querySelector('[name="ownerMfaCode"]'),required=event.target.value==='admin';if(label)label.hidden=!required;if(input){input.required=required;if(!required)input.value=''}}});
 document.addEventListener('click',async event=>{
+  const mobileMenuButton=event.target.closest('#mobileMenu');if(mobileMenuButton){const nav=$('#mainNav'),open=!nav.classList.contains('open');nav.classList.toggle('open',open);mobileMenuButton.setAttribute('aria-expanded',String(open));mobileMenuButton.setAttribute('aria-label',state.lang==='ar'?(open?'إغلاق القائمة':'فتح القائمة'):(open?'Close menu':'Open menu'));return}
+  if(event.target.closest('#mainNav a')){$('#mainNav').classList.remove('open');$('#mobileMenu').setAttribute('aria-expanded','false');$('#mobileMenu').setAttribute('aria-label',state.lang==='ar'?'فتح القائمة':'Open menu')}
   if(!event.target.closest('.notification-wrap')){const popover=$('#notificationPopover');if(popover&&!popover.hidden){popover.hidden=true;$('#notificationBell').setAttribute('aria-expanded','false')}}
   if(event.target.closest('#languageToggle')){state.lang=state.lang==='ar'?'en':'ar';applyLanguage();renderServices();renderWork();renderTemplateLibrary();if(state.currentTemplate)renderTemplatePreview(state.currentTemplate);if(state.dashboard)renderDashboard(state.dashboard,state.dashboardTab);refreshNotificationPreview();return}
   const notificationRead=event.target.closest('[data-notification-read]');if(notificationRead){try{await fetch(`/api/notifications/${encodeURIComponent(notificationRead.dataset.notificationRead)}`,{method:'PATCH'});await refreshNotificationPreview();if(state.dashboardTab==='notifications')await loadNotificationCenter()}catch{}return}
@@ -797,8 +833,8 @@ document.addEventListener('click',async event=>{
   const taskDecision=event.target.closest('[data-task-decision]');if(taskDecision){try{await postJson(`/api/developer/projects/${encodeURIComponent(taskDecision.dataset.projectId)}/decision`,{decision:taskDecision.dataset.taskDecision});await refreshDashboard('development');showToast(taskDecision.dataset.taskDecision==='accept'?tx('قبلت المهمة.','Task accepted.'):tx('تم الاعتذار عن المهمة.','Task declined.'))}catch(e){showToast(e.message,true)}return}
   const copy=event.target.closest('[data-copy-referral]');if(copy){try{await navigator.clipboard.writeText(`${location.origin}${state.dashboard.referralLink}`);showToast(tx('تم نسخ رابطك.','Your link has been copied.'))}catch{showToast(tx('تعذر النسخ؛ حدّد الرابط وانسخه يدوياً.','Could not copy. Select and copy the link manually.'),true)}return}
   if(event.target.closest('#withdrawalRequest')){try{await postJson('/api/marketer/withdrawals',{});await refreshDashboard('referral');showToast(tx('تم إرسال طلب السحب للإدارة.','Withdrawal request sent to management.'))}catch(e){showToast(e.message,true)}return}
-  if(event.target.closest('#whatsappOrder')){if(!state.publicConfig.whatsappUrl){showToast(tx('واتساب غير مربوط بعد؛ ارسل طلبك من النموذج.','WhatsApp is not connected yet; send your enquiry through the form.'),true);return}const data=new FormData($('#projectForm')),followupId=shortToken('ZRI-'),parts=[tx('طلب إلى ZEZO','Enquiry to ZEZO'),`${tx('الخدمة','Service')}: ${$('#serviceSelect').selectedOptions[0]?.textContent||'—'}`,`${tx('التفاصيل','Details')}: ${data.get('details')||'—'}`,`ZEZO ${tx('رقم المتابعة','follow-up ID')}: ${followupId}`,`${tx('رمز الإحالة','Referral code')}: ${state.referralCode||tx('بدون','none')}`];emitReferralEvent('whatsapp_click',$('#serviceSelect').value||'',followupId);window.open(`${state.publicConfig.whatsappUrl}?text=${encodeURIComponent(parts.join('\n'))}`,'_blank','noopener,noreferrer');return}
-  if(event.target.closest('#customerSupport')&&state.publicConfig.whatsappUrl){event.preventDefault();const followupId=shortToken('ZRI-'),parts=[tx('مرحباً ZEZO، أود الاستفسار عن خدماتكم.','Hello ZEZO, I would like to ask about your services.'),`ZEZO ${tx('رقم المتابعة','follow-up ID')}: ${followupId}`,`${tx('رمز الإحالة','Referral code')}: ${state.referralCode||tx('بدون','none')}`];emitReferralEvent('whatsapp_click','',followupId);window.open(`${state.publicConfig.whatsappUrl}?text=${encodeURIComponent(parts.join('\n'))}`,'_blank','noopener,noreferrer');return}
+  if(event.target.closest('#whatsappOrder')){const phone=whatsappPhone('orders');if(!phone){showToast(tx('واتساب قسم الطلبات غير مربوط بعد.','Orders WhatsApp is not connected yet.'),true);return}const data=new FormData($('#projectForm')),followupId=shortToken('ZRI-'),parts=[tx('طلب إلى ZEZO','Enquiry to ZEZO'),`${tx('الخدمة','Service')}: ${$('#serviceSelect').selectedOptions[0]?.textContent||'—'}`,`${tx('التفاصيل','Details')}: ${data.get('details')||'—'}`,`ZEZO ${tx('رقم المتابعة','follow-up ID')}: ${followupId}`];if(state.referralCode)parts.push(`${tx('رمز الإحالة','Referral code')}: ${state.referralCode}`);emitReferralEvent('whatsapp_click',$('#serviceSelect').value||'',followupId);openWhatsAppWindow(buildWhatsAppUrl(phone,parts.join('\n')));return}
+  const supportLink=event.target.closest('#customerSupport');if(supportLink){const phone=whatsappPhone('support');if(!phone){event.preventDefault();showToast(tx('خدمة العملاء عبر واتساب غير متاحة حالياً.','Customer support WhatsApp is unavailable right now.'),true);return}const followupId=shortToken('ZRI-'),parts=[tx('مرحباً ZEZO، أود الاستفسار عن خدماتكم.','Hello ZEZO, I would like to ask about your services.'),`ZEZO ${tx('رقم المتابعة','follow-up ID')}: ${followupId}`];if(state.referralCode)parts.push(`${tx('رمز الإحالة','Referral code')}: ${state.referralCode}`);supportLink.href=buildWhatsAppUrl(phone,parts.join('\n'));emitReferralEvent('whatsapp_click','',followupId);return}
   const userActive=event.target.closest('[data-user-active]');if(userActive){try{await fetch(`/api/admin/team/${encodeURIComponent(userActive.dataset.userActive)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:userActive.dataset.active==='true'})}).then(async r=>{let d=await r.json();if(!r.ok)throw new Error(d.error)});await refreshDashboard(state.dashboard.role==='hr_manager'?'people':'team');showToast(tx('تم تحديث حساب الموظف.','Employee account updated.'))}catch(e){showToast(e.message,true)}return}
   if(event.target.closest('#dashboardLogout')){try{await postJson('/api/auth/logout',{});state.dashboard=null;state.notificationAuthenticated=false;state.notifications=[];state.notificationUnread=0;renderNotificationPreview();setDashboardOpen(false);if(location.pathname==='/team')openAuth('team');showToast(tx('تم تسجيل الخروج.','You are signed out.'))}catch(e){showToast(e.message,true)}return}
 });
@@ -913,7 +949,7 @@ document.addEventListener('input',event=>{if(event.target===$('#templateSearch')
 document.addEventListener('click',async event=>{
   if(event.target.closest('[data-close-template-order]')){closeTemplateOrder();return}
   if(event.target.closest('[data-close-conversation]')){$('#conversationStartModal').classList.remove('open');$('#conversationStartModal').setAttribute('aria-hidden','true');closeConversationModal();return}
-  const channel=event.target.closest('[data-order-channel]');if(channel){const pending=state.pendingTemplate,item=pending&&templateById.get(pending.id);if(channel.dataset.orderChannel==='chat')openTemplateChat();else if(item){closeTemplateOrder();openWhatsAppEnquiry(`${tx('مرحباً ZEZO، أريد الاستفسار عن','Hello ZEZO, I would like to ask about')} ${item.title[state.lang]} · ${tx('طلب قالب','Template request')}: ${pending.action}`,item.id)}return}
+  const channel=event.target.closest('[data-order-channel]');if(channel){const pending=state.pendingTemplate,item=pending&&templateById.get(pending.id);if(channel.dataset.orderChannel==='chat')openTemplateChat();else if(item){closeTemplateOrder();openTemplateWhatsApp(item,pending.action)}return}
   const official=event.target.closest('#conversationOfficialOrder');if(official){const {templateId,templateAction,conversationId}=official.dataset;closeConversationModal();$('#conversationStartModal').classList.remove('open');prepareProjectFromTemplate(templateId,templateAction,conversationId);return}
   const convertConversation=event.target.closest('[data-conversation-convert]');if(convertConversation){try{await postJson(`/api/conversations/${encodeURIComponent(convertConversation.dataset.conversationConvert)}/convert`,{});await refreshDashboard('conversations');showToast(tx('تمت مطالبة العميل بإكمال الطلب من حسابه.','Customer asked to complete the formal request from their account.'))}catch(error){showToast(error.message,true)}return}
   const customerChat=event.target.closest('[data-open-customer-conversation]');if(customerChat){try{const response=await fetch(`/api/conversations/${encodeURIComponent(customerChat.dataset.openCustomerConversation)}`),data=await response.json();if(!response.ok)throw new Error(data.error||'Conversation unavailable');await openCustomerConversation(data.conversation)}catch(error){showToast(error.message,true)}return}
@@ -922,7 +958,7 @@ document.addEventListener('click',async event=>{
   const filter=event.target.closest('[data-template-service]');if(filter){state.templateService=filter.dataset.templateService;renderTemplateLibrary();return}
   const request=event.target.closest('[data-template-request]');if(request){setTemplateRequest(request.dataset.templateRequest,request.dataset.templateAction);return}
   const serviceWhatsapp=event.target.closest('[data-service-whatsapp]');if(serviceWhatsapp){const service=services.find(item=>item.id===serviceWhatsapp.dataset.serviceWhatsapp);openWhatsAppEnquiry(`${tx('مرحباً ZEZO، أريد الاستفسار عن خدمة','Hello ZEZO, I would like to ask about the service')} ${service?.title[state.lang]||''}.`,`service-${service?.id||''}`);return}
-  const templateWhatsapp=event.target.closest('[data-template-whatsapp]');if(templateWhatsapp){const item=templateById.get(templateWhatsapp.dataset.templateWhatsapp);openWhatsAppEnquiry(`${tx('مرحباً ZEZO، أريد الاستفسار عن','Hello ZEZO, I would like to ask about')} ${item?.title[state.lang]||tx('هذا القالب','this template')}.`,item?.id||'');return}
+  const templateWhatsapp=event.target.closest('[data-template-whatsapp]');if(templateWhatsapp){const item=templateById.get(templateWhatsapp.dataset.templateWhatsapp);openTemplateWhatsApp(item,'customize');return}
   if(event.target.closest('[data-template-idea]')){event.preventDefault();startDifferentIdea();return}
   if(event.target.closest('#templatePreviewLanguage')){state.lang=state.lang==='ar'?'en':'ar';document.documentElement.lang=state.lang;document.documentElement.dir=state.lang==='ar'?'rtl':'ltr';renderTemplatePreview(state.currentTemplate);return}
   if(event.target.closest('[data-demo-add]')){state.templateCart++;$$('#demoCartCount').forEach(el=>el.textContent=String(state.templateCart));templateNotice(tx('أُضيف العنصر إلى السلة التجريبية.','Added to the demo cart.'));return}

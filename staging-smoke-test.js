@@ -12,6 +12,8 @@ process.env.ZEZO_STAGING_ACCESS_PASSWORD = accessPassword;
 process.env.ZEZO_DATA_DIR = dataDir;
 process.env.NODE_ENV = 'production';
 process.env.ZEZO_WHATSAPP_NUMBER = '+971500000000';
+process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP = '+971500000001';
+process.env.ZEZO_ORDERS_WHATSAPP = '+971500000002';
 process.env.ZEZO_PUBLIC_URL = 'https://wrong-live-host.example';
 process.env.RESEND_API_KEY = 'test-only-never-used';
 process.env.ZEZO_FROM_EMAIL = 'test@example.test';
@@ -68,6 +70,8 @@ try {
   const settings = publicConfig.json();
   assert.equal(settings.stagingMode, true);
   assert.equal(settings.whatsappUrl, '', 'test environment never opens the live WhatsApp contact');
+  assert.equal(settings.customerSupportWhatsappNumber, '', 'staging hides the customer support WhatsApp number');
+  assert.equal(settings.ordersWhatsappNumber, '', 'staging hides the order desk WhatsApp number');
   assert.equal(settings.emailReady, false, 'test environment never sends email');
   assert.equal(settings.aiQuoteReady, false, 'test environment never calls an AI provider');
   assert.equal(settings.adminSetupAvailable, true);
@@ -89,5 +93,5 @@ try {
   console.log('PASS — isolated staging data, required access password, noindex headers and robots.txt, visible staging banner, disabled email/AI/WhatsApp integrations, secure first Owner setup, and setup lock after creation.');
 } finally {
   await rm(dataDir, { recursive: true, force: true });
-  for (const key of ['ZEZO_STAGING','ZEZO_STAGING_ACCESS_PASSWORD','ZEZO_DATA_DIR','NODE_ENV','ZEZO_WHATSAPP_NUMBER','ZEZO_PUBLIC_URL','RESEND_API_KEY','ZEZO_FROM_EMAIL','ZEZO_NOTIFICATION_EMAIL','OPENAI_API_KEY','OPENAI_MODEL']) delete process.env[key];
+  for (const key of ['ZEZO_STAGING','ZEZO_STAGING_ACCESS_PASSWORD','ZEZO_DATA_DIR','NODE_ENV','ZEZO_WHATSAPP_NUMBER','ZEZO_CUSTOMER_SUPPORT_WHATSAPP','ZEZO_ORDERS_WHATSAPP','ZEZO_PUBLIC_URL','RESEND_API_KEY','ZEZO_FROM_EMAIL','ZEZO_NOTIFICATION_EMAIL','OPENAI_API_KEY','OPENAI_MODEL']) delete process.env[key];
 }
