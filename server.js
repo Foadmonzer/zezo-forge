@@ -1,13 +1,13 @@
 import { createServer } from 'node:http';
 import { createReadStream, readFileSync } from 'node:fs';
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
-import { extname, join, normalize, basename, isAbsolute, resolve } from 'node:path';
+import { extname, join, normalize, basename, dirname, isAbsolute, resolve } from 'node:path';
 import { randomBytes, scryptSync, timingSafeEqual, createHash, createHmac } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { templateCatalog, templateById } from './public/template-catalog.js';
 import { buildWhatsAppUrl, normalizeWhatsAppNumber } from './public/whatsapp.js';
 
-const ROOT = fileURLToPath(new URL('.', import.meta.url));
+const ROOT = dirname(fileURLToPath(import.meta.url));
 const STAGING_MODE = process.env.ZEZO_STAGING === 'true';
 const STAGING_ACCESS_PASSWORD = STAGING_MODE ? String(process.env.ZEZO_STAGING_ACCESS_PASSWORD || '') : '';
 if (STAGING_MODE && STAGING_ACCESS_PASSWORD.length < 16) throw new Error('ZEZO staging requires a temporary access password of at least 16 characters.');

@@ -9,6 +9,7 @@
 /data/*.tmp
 /data/server*.log
 data-preview*/
+data-next*/
 data-staging*/
 data-staging-recovery/
 *.log
@@ -18,6 +19,9 @@ data-staging-recovery/
 
 # Generated and dependency files
 node_modules/
+.next/
+src/generated/prisma/
+*.tsbuildinfo
 coverage/
 dist/
 artifacts/
