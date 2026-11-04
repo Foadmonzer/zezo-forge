@@ -28,6 +28,21 @@ model UserAccount {
   sessions         AuthSession[]
   withdrawals      WithdrawalRequest[] @relation("WithdrawalOwner")
   reviewedWithdrawals WithdrawalRequest[] @relation("WithdrawalReviewer")
+  developedRequests ProjectRequest[] @relation("RequestDeveloper")
+  developedProjects Project[] @relation("ProjectDeveloper")
+  assignments ProjectAssignment[] @relation("AssignmentDeveloper")
+  sentMessages ConversationMessage[] @relation("MessageSender")
+  commissions Commission[] @relation("CommissionOwner")
+  walletTransactions WalletTransaction[]
+  financeEntries FinanceLedgerEntry[] @relation("FinanceEmployee")
+  rankRequests RankRequest[] @relation("RankOwner")
+  reviewedRankRequests RankRequest[] @relation("RankReviewer")
+  referralLinks ReferralLink[]
+  referralEvents ReferralEvent[]
+  referralAttributions ReferralAttribution[]
+  notifications SystemNotification[]
+  auditEntries AuditEntry[]
+  storedAttachments StoredAttachment[]
 
   @@index([role, active])
   @@map("user_accounts")
@@ -48,6 +63,14 @@ model ProjectRequest {
   updatedAt    DateTime @updatedAt
   customer     UserAccount? @relation("RequestCustomer", fields: [customerId], references: [id], onDelete: SetNull)
   referrer     UserAccount? @relation("RequestReferrer", fields: [referrerId], references: [id], onDelete: SetNull)
+  developer    UserAccount? @relation("RequestDeveloper", fields: [developerId], references: [id], onDelete: SetNull)
+  project      Project?
+  payments     Payment[]
+  commissions  Commission[]
+  walletTransactions WalletTransaction[]
+  financeEntries FinanceLedgerEntry[]
+  referralEvents ReferralEvent[]
+  referralAttributions ReferralAttribution[]
 
   @@index([customerId, createdAt])
   @@index([referrerId, status])
@@ -65,6 +88,9 @@ model Project {
   data        Json     @db.JsonB
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+  request     ProjectRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  developer   UserAccount? @relation("ProjectDeveloper", fields: [developerId], references: [id], onDelete: SetNull)
+  assignments ProjectAssignment[]
 
   @@index([developerId, stage])
   @@map("projects")
@@ -80,6 +106,8 @@ model ProjectAssignment {
   data               Json     @db.JsonB
   assignedAt         DateTime @default(now())
   respondedAt        DateTime?
+  project            Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  developer          UserAccount @relation("AssignmentDeveloper", fields: [developerId], references: [id], onDelete: Restrict)
 
   @@index([developerId, state])
   @@index([projectId, state])
@@ -112,8 +140,11 @@ model ConversationMessage {
   senderId       String?
   body           String
   attachmentId   String?
+  data           Json     @default("{}") @db.JsonB
   createdAt      DateTime @default(now())
   conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender         UserAccount? @relation("MessageSender", fields: [senderId], references: [id], onDelete: SetNull)
+  attachment     StoredAttachment? @relation(fields: [attachmentId], references: [id], onDelete: SetNull)
 
   @@index([conversationId, createdAt])
   @@map("conversation_messages")
@@ -142,6 +173,8 @@ model Payment {
   idempotencyKey String?  @unique
   data           Json     @db.JsonB
   createdAt      DateTime @default(now())
+  request        ProjectRequest @relation(fields: [requestId], references: [id], onDelete: Restrict)
+  commissions    Commission[] @relation("CommissionSourcePayment")
 
   @@index([requestId, status])
   @@map("payments")
@@ -159,6 +192,9 @@ model Commission {
   sourcePaymentId String?
   data            Json     @db.JsonB
   createdAt       DateTime @default(now())
+  user            UserAccount @relation("CommissionOwner", fields: [userId], references: [id], onDelete: Restrict)
+  request         ProjectRequest @relation(fields: [requestId], references: [id], onDelete: Restrict)
+  sourcePayment   Payment? @relation("CommissionSourcePayment", fields: [sourcePaymentId], references: [id], onDelete: SetNull)
 
   @@unique([userId, requestId, kind])
   @@index([userId, status])
@@ -176,6 +212,8 @@ model WalletTransaction {
   idempotencyKey String?  @unique
   data           Json     @db.JsonB
   createdAt      DateTime @default(now())
+  user           UserAccount @relation(fields: [userId], references: [id], onDelete: Restrict)
+  request        ProjectRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
 
   @@index([userId, status, createdAt])
   @@map("wallet_transactions")
@@ -192,6 +230,8 @@ model FinanceLedgerEntry {
   idempotencyKey String?  @unique
   data           Json     @db.JsonB
   createdAt      DateTime @default(now())
+  employee       UserAccount? @relation("FinanceEmployee", fields: [employeeId], references: [id], onDelete: SetNull)
+  request        ProjectRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
 
   @@index([type, status, createdAt])
   @@index([employeeId, createdAt])
@@ -242,6 +282,8 @@ model RankRequest {
   data             Json     @db.JsonB
   createdAt        DateTime @default(now())
   reviewedAt       DateTime?
+  user             UserAccount @relation("RankOwner", fields: [userId], references: [id], onDelete: Restrict)
+  reviewer         UserAccount? @relation("RankReviewer", fields: [reviewedBy], references: [id], onDelete: SetNull)
 
   @@index([userId, state])
   @@index([state, createdAt])
@@ -271,6 +313,7 @@ model ReferralLink {
   active    Boolean  @default(true)
   createdAt DateTime @default(now())
   data      Json     @db.JsonB
+  user      UserAccount @relation(fields: [userId], references: [id], onDelete: Restrict)
 
   @@index([userId, month])
   @@map("referral_links")
@@ -284,8 +327,11 @@ model ReferralEvent {
   visitorHash String?
   resourceId  String?
   requestId   String?
+  idempotencyKey String? @unique
   createdAt   DateTime @default(now())
   data        Json     @db.JsonB
+  user        UserAccount? @relation(fields: [userId], references: [id], onDelete: SetNull)
+  request     ProjectRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
 
   @@index([userId, eventType, createdAt])
   @@index([requestId, eventType])
@@ -297,12 +343,27 @@ model ReferralAttribution {
   userId    String
   requestId String?
   code      String
+  visitorHash String @unique
+  expiresAt DateTime
   createdAt DateTime @default(now())
   data      Json     @db.JsonB
+  user      UserAccount @relation(fields: [userId], references: [id], onDelete: Restrict)
+  request   ProjectRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
 
   @@index([userId, createdAt])
   @@index([requestId])
   @@map("referral_attributions")
+}
+
+model RateLimitBucket {
+  key             String   @id
+  count           Int
+  windowStartedAt DateTime
+  expiresAt       DateTime
+  updatedAt       DateTime @updatedAt
+
+  @@index([expiresAt])
+  @@map("rate_limit_buckets")
 }
 
 model CRMRecord {
@@ -324,6 +385,7 @@ model SystemNotification {
   readAt    DateTime?
   data      Json     @db.JsonB
   createdAt DateTime @default(now())
+  user      UserAccount @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, readAt, createdAt])
   @@map("system_notifications")
@@ -336,6 +398,7 @@ model AuditEntry {
   targetId  String?
   data      Json     @db.JsonB
   createdAt DateTime @default(now())
+  actor     UserAccount? @relation(fields: [actorId], references: [id], onDelete: SetNull)
 
   @@index([actorId, createdAt])
   @@index([targetId, createdAt])
@@ -381,6 +444,8 @@ model StoredAttachment {
   sizeBytes   Int
   content     Bytes
   createdAt   DateTime @default(now())
+  messages    ConversationMessage[]
+  owner       UserAccount? @relation(fields: [ownerId], references: [id], onDelete: SetNull)
 
   @@index([ownerId, createdAt])
   @@map("stored_attachments")

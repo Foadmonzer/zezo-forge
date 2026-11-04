@@ -2,6 +2,7 @@ import { Readable, Writable } from 'node:stream';
 import type { IncomingHttpHeaders } from 'node:http';
 import type { NextRequest } from 'next/server';
 import { handle, init } from '../../../server.js';
+import { postgresConfigured } from '../../../src/server/postgres-runtime.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -39,9 +40,8 @@ function initLocalRuntime() {
 }
 
 async function dispatch(request: NextRequest) {
-  // The current domain runtime persists its store and uploads to local disk.
-  // Block serverless writes until the PostgreSQL/object-storage adapter lands.
-  if (process.env.VERCEL === '1') {
+  // Never let a serverless deployment fall back to ephemeral JSON or local files.
+  if (process.env.VERCEL === '1' && !postgresConfigured()) {
     return Response.json(
       { error: 'ZEZO API is not ready for serverless storage yet. Configure the PostgreSQL migration before enabling Vercel requests.' },
       { status: 503, headers: { 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow' } }
@@ -57,8 +57,11 @@ async function dispatch(request: NextRequest) {
   legacyRequest.method = request.method;
   legacyRequest.url = `${requestUrl.pathname}${requestUrl.search}`;
   legacyRequest.headers = Object.fromEntries(request.headers.entries()) as IncomingHttpHeaders;
+  const forwardedFor = process.env.VERCEL === '1'
+    ? request.headers.get('x-vercel-forwarded-for') || request.headers.get('x-forwarded-for')
+    : process.env.ZEZO_TRUST_PROXY === '1' ? request.headers.get('x-forwarded-for') : null;
   legacyRequest.socket = {
-    remoteAddress: request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || '127.0.0.1',
+    remoteAddress: forwardedFor?.split(',')[0]?.trim() || '127.0.0.1',
     encrypted: requestUrl.protocol === 'https:' || request.headers.get('x-forwarded-proto') === 'https'
   };
 

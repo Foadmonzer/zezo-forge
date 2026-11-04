@@ -163,7 +163,7 @@ function renderTemplateLibrary(){
 function setTemplateRequest(id,action){
   const item=templateById.get(id);if(!item)return;
   state.pendingTemplate={id:item.id,action};$('#templateOrderTitle').textContent=item.title[state.lang];$('#templateOrderPrice').textContent=templatePriceText(item);$('#templateOrderModal').classList.add('open');$('#templateOrderModal').setAttribute('aria-hidden','false');document.body.style.overflow='hidden';return;
-  document.body.classList.remove('template-preview-mode');
+  (document.getElementById('zezo-legacy-root')||document.body).classList.remove('template-preview-mode');
   const service=$('#serviceSelect'),category=$('#categorySelect');
   service.value=item.service;updateCategoryOptions();category.value=item.category;
   $('#projectForm [name="templateId"]').value=item.id;$('#projectForm [name="templateAction"]').value=action;
@@ -171,7 +171,7 @@ function setTemplateRequest(id,action){
   $('#contact').scrollIntoView({behavior:'smooth'});$('#projectForm [name="name"]').focus();
 }
 function prepareProjectFromTemplate(id,action='order',conversationId=''){
-  const item=templateById.get(id);if(!item)return;document.body.classList.remove('template-preview-mode');$('#serviceSelect').value=item.service;updateCategoryOptions();$('#categorySelect').value=item.category;$('#projectForm [name="templateId"]').value=item.id;$('#projectForm [name="templateAction"]').value=action;$('#projectForm [name="conversationId"]').value=conversationId;
+  const item=templateById.get(id);if(!item)return;(document.getElementById('zezo-legacy-root')||document.body).classList.remove('template-preview-mode');$('#serviceSelect').value=item.service;updateCategoryOptions();$('#categorySelect').value=item.category;$('#projectForm [name="templateId"]').value=item.id;$('#projectForm [name="templateAction"]').value=action;$('#projectForm [name="conversationId"]').value=conversationId;
   $('#detailsField').value=tx(`القالب المختار: ${item.title.ar}\nالطلب: ${action==='customize'?'تخصيص القالب':'تنفيذ هذا القالب'}\n\nأرغب بمناقشة التعديلات والمحتوى المطلوب.`,`Selected template: ${item.title.en}\nRequest: ${action==='customize'?'Customize this template':'Build from this template'}\n\nI would like to discuss the content and changes needed.`);$('#contact').scrollIntoView({behavior:'smooth'});$('#detailsField').focus();
 }
 function closeTemplateOrder(){const modal=$('#templateOrderModal');modal?.classList.remove('open');modal?.setAttribute('aria-hidden','true');document.body.style.overflow=''}
@@ -186,7 +186,7 @@ async function openCustomerConversation(conversation){state.activeConversationId
 async function refreshCustomerConversation(){if(!state.activeConversationId)return;const response=await fetch(`/api/conversations/${encodeURIComponent(state.activeConversationId)}`),data=await response.json();if(!response.ok)throw new Error(data.error||'Conversation unavailable');renderCustomerConversation(data.conversation)}
 function openTemplateChat(){const pending=state.pendingTemplate,item=pending&&templateById.get(pending.id);if(!item)return;closeTemplateOrder();$('#conversationStartForm [name="message"]').value=tx(`مرحباً، أريد الاستفسار عن قالب ${item.title.ar} وطلب ${pending.action==='customize'?'تخصيصه':'تنفيذه'}.`,`Hello, I would like to ask about ${item.title.en} and request ${pending.action==='customize'?'customization':'setup'}.`);$('#conversationStartTitle').textContent=item.title[state.lang];$('#conversationStartForm').dataset.templateId=item.id;$('#conversationStartForm').dataset.action=pending.action;$('#conversationStartModal').classList.add('open');$('#conversationStartModal').setAttribute('aria-hidden','false');document.body.style.overflow='hidden'}
 function startDifferentIdea(){
-  document.body.classList.remove('template-preview-mode');$('#serviceSelect').value='ideas';updateCategoryOptions();$('#categorySelect').value='discovery';$('#projectForm [name="templateId"]').value='';$('#projectForm [name="templateAction"]').value='';
+  (document.getElementById('zezo-legacy-root')||document.body).classList.remove('template-preview-mode');$('#serviceSelect').value='ideas';updateCategoryOptions();$('#categorySelect').value='discovery';$('#projectForm [name="templateId"]').value='';$('#projectForm [name="templateAction"]').value='';
   $('#detailsField').value=tx('لدي فكرة مختلفة عن النماذج المعروضة، وأرغب بمناقشة احتياجي.','I have an idea outside the listed templates and would like to discuss it.');
   $('#contact').scrollIntoView({behavior:'smooth'});$('#projectForm [name="name"]').focus();
 }
@@ -296,7 +296,7 @@ function mountTemplateDemo(root,item){
   if(item.service==='ideas')return mountIdeasDemo(demoRoot,item,helpers);
 }
 function renderTemplatePreview(item){
-  state.currentTemplate=item;document.body.classList.add('template-preview-mode');state.templateCart=0;
+  state.currentTemplate=item;(document.getElementById('zezo-legacy-root')||document.body).classList.add('template-preview-mode');state.templateCart=0;
   const root=$('#templatePreviewApp');
   root.innerHTML='<div class="template-preview-shell" style="--tpl-accent:'+item.accent+';--tpl-surface:'+item.surface+';--tpl-bg:'+item.surface+';direction:'+(state.lang==='ar'?'rtl':'ltr')+'"><header class="template-preview-bar"><a href="/#templates">← '+tx('مكتبة النماذج','Template library')+'</a><span>ZEZO FORGE / DEMO</span><a class="template-request-top" href="/?templateRequest='+encodeURIComponent(item.id)+'&templateAction=order#contact">'+tx('أريد مشروعاً مثل هذا','I want a project like this')+' ↗</a><button id="templatePreviewLanguage">'+(state.lang==='ar'?'EN':'عربي')+'</button></header><main class="template-preview-main"><div class="template-preview-meta"><span>'+esc(item.code)+' · '+esc(item.service.toUpperCase())+' / '+esc(item.id)+'</span><b>'+tx('نموذج قابل للتجربة','Interactive concept')+'</b></div><h1>'+esc(item.title[state.lang])+'</h1><p class="template-preview-description">'+esc(item.description[state.lang])+'</p><div class="template-preview-content">'+templateDemoContent(item)+'</div><div class="template-preview-safety">'+esc(item.features[state.lang].join(' · '))+'<span>'+tx('بيانات المعاينة تجريبية؛ لا تُرسل ولا تُباع.','Demo data only; nothing is submitted or sold.')+'</span></div><div id="templatePreviewNotice" class="preview-toast" aria-live="polite"></div><div class="template-preview-actions"><a class="small-button" href="/?templateRequest='+encodeURIComponent(item.id)+'&templateAction=order#contact">'+tx('اطلب هذا القالب','Request this template')+'</a><a class="small-button accent" href="/?templateRequest='+encodeURIComponent(item.id)+'&templateAction=customize#contact">'+tx('تخصيص القالب','Customize this template')+'</a></div></main></div>';
   mountTemplateDemo(root,item);

@@ -1,11 +1,14 @@
 import { createServer } from 'node:http';
 import { createReadStream, readFileSync } from 'node:fs';
+import { Writable } from 'node:stream';
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { extname, join, normalize, basename, dirname, isAbsolute, resolve } from 'node:path';
 import { randomBytes, scryptSync, timingSafeEqual, createHash, createHmac } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { templateCatalog, templateById } from './public/template-catalog.js';
 import { buildWhatsAppUrl, normalizeWhatsAppNumber } from './public/whatsapp.js';
+import { currentPostgresClient, postgresConfigured, withPostgresTransaction } from './src/server/postgres-runtime.js';
+import { deleteReferralTrackingForVisitor, loadNormalizedStore, persistNormalizedStore } from './src/server/postgres-store.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const STAGING_MODE = process.env.ZEZO_STAGING === 'true';
@@ -232,7 +235,36 @@ function referralMetricsFor(userId) {
   return {visits:new Set(events.filter(event=>event.type==='visit').map(event=>event.visitorHash).filter(Boolean)).size,serviceViews:types('service_view'),templateViews:types('template_view'),whatsappClicks:types('whatsapp_click'),inquiries:types('inquiry_confirmed'),requests:orders.length,quoteAcceptances:types('quote_accepted'),sales:new Set(events.filter(event=>event.type==='qualified_sale'&&event.leadId).map(event=>event.leadId)).size,currentCode};
 }
 
+async function loadPostgresStore(client) {
+  const nextStore = await loadNormalizedStore(client, defaultStore);
+  store = nextStore;
+
+  sessions.clear();
+  const sessionResult = await client.query('SELECT id, "userId", "expiresAt" FROM auth_sessions WHERE "expiresAt" > NOW()');
+  for (const row of sessionResult.rows) sessions.set(row.id, { userId: row.userId, expires: new Date(row.expiresAt).getTime() });
+}
+
+async function persistPostgresStore(client) {
+  await persistNormalizedStore(client, store);
+
+  const activeSessions = [...sessions.entries()].filter(([, session]) => session.expires > Date.now());
+  await client.query('DELETE FROM auth_sessions WHERE NOT (id = ANY($1::text[]))', [activeSessions.map(([sessionId]) => sessionId)]);
+  for (const [sessionId, session] of activeSessions) {
+    await client.query(
+      'INSERT INTO auth_sessions (id, "userId", "expiresAt", data) VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT (id) DO UPDATE SET "userId" = EXCLUDED."userId", "expiresAt" = EXCLUDED."expiresAt", data = EXCLUDED.data',
+      [sessionId, session.userId, new Date(session.expires), '{}']
+    );
+  }
+}
+
+const sessionKey = sessionId => createHash('sha256').update(String(sessionId || '')).digest('hex');
+
 async function persist() {
+  if (postgresConfigured()) {
+    const client = currentPostgresClient();
+    if (client) return persistPostgresStore(client);
+    return withPostgresTransaction(async transactionClient => persistPostgresStore(transactionClient));
+  }
   const snapshot = JSON.stringify(store, null, 2);
   persistQueue = persistQueue.then(async () => {
     const tmp = `${DB_FILE}.tmp`;
@@ -248,6 +280,18 @@ async function persist() {
   await persistQueue;
 }
 async function init() {
+  if (postgresConfigured()) {
+    return withPostgresTransaction(async client => {
+      await loadPostgresStore(client);
+      const firstAdminAvailable = await initStore();
+      await persistPostgresStore(client);
+      return firstAdminAvailable;
+    });
+  }
+  return initStore();
+}
+
+async function initStore() {
   let migratedSetupFields = false;
   let migratedTemplateAvailability = false;
   let migratedTemplatePricing = false;
@@ -256,11 +300,13 @@ async function init() {
   let migratedClientData = false;
   let migratedNotifications = false;
   let migratedCrm = false;
-  await mkdir(UPLOAD_DIR, { recursive: true });
-  try { store = JSON.parse(await readFile(DB_FILE, 'utf8')); }
-  catch (e) {
-    if (e.code !== 'ENOENT') throw e;
-    store = defaultStore();
+  if (!postgresConfigured()) await mkdir(UPLOAD_DIR, { recursive: true });
+  if (!store) {
+    try { store = JSON.parse(await readFile(DB_FILE, 'utf8')); }
+    catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+      store = defaultStore();
+    }
   }
   store.users ??= []; store.leads ??= []; store.conversations ??= []; store.audit ??= []; if(!Array.isArray(store.notifications)){store.notifications=[];migratedNotifications=true;} store.payments ??= []; store.campaigns ??= [];
   if(!Array.isArray(store.crmLeads)){store.crmLeads=[];migratedCrm=true;}
@@ -362,7 +408,7 @@ async function init() {
   const financeMigrated=ledgerSizeBefore!==store.financeLedger.length;
   const rankRequestsCreated = syncAllRankRequests();
   for(const lead of store.leads){const linked=(store.crmLeads||[]).some(row=>row.orderIds?.includes(lead.id)||row.id===lead.crmLeadId);ensureCrmCaseForOrder(lead);if(!linked)migratedCrm=true;}
-  if(recoveredMail || migratedSetupFields || migratedWithdrawals || migratedTemplateAvailability || migratedTemplatePricing || migratedPermissionData || migratedClientData || migratedNotifications || migratedCrm || referralLinksCreated || referralDataCleaned || rankRequestsCreated.length || financeMigrated || store.users.some(referralEnabled)) await persist();
+  if(postgresConfigured() || recoveredMail || migratedSetupFields || migratedWithdrawals || migratedTemplateAvailability || migratedTemplatePricing || migratedPermissionData || migratedClientData || migratedNotifications || migratedCrm || referralLinksCreated || referralDataCleaned || rankRequestsCreated.length || financeMigrated || store.users.some(referralEnabled)) await persist();
   for (const request of rankRequestsCreated) await queueRankRequestMail(request);
   return firstAdminSetupAvailable();
 }
@@ -764,8 +810,9 @@ function stagingLoginPage(message = '') {
 const cookie = (key, value, maxAge, req) => `${key}=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax${requestIsSecure(req) ? '; Secure' : ''}`;
 function sessionUser(req) {
   const sid = cookieValue(req, 'zezo_session');
-  const session = sessions.get(sid);
-  if (!session || session.expires < Date.now()) { if (sid) sessions.delete(sid); return null; }
+  const key = sessionKey(sid);
+  const session = sessions.get(key);
+  if (!session || session.expires < Date.now()) { if (sid) sessions.delete(key); return null; }
   const user = store.users.find(u => u.id === session.userId && u.active);
   return user ? { user, sid } : null;
 }
@@ -895,30 +942,79 @@ function notifyConversation(conversation,kind,actor=null){
 }
 function validPassword(value) { return typeof value === 'string' && value.length >= 12 && value.length <= 200; }
 function validTemporaryPassword(value) { return typeof value === 'string' && value.length >= 9 && value.length <= 200; }
-function rateAllowed(key) {
+const rateLimitNames = new Map([
+  [stagingLoginAttempts, 'staging-login'], [loginAttempts, 'login'], [leadAttempts, 'public-enquiry'],
+  [quoteAttempts, 'quote'], [clientRegistrationAttempts, 'client-registration'], [passwordResetAttempts, 'password-reset'],
+  [conversationAttempts, 'conversation']
+]);
+async function postgresRateAllowed(bucket, key, max, windowMs) {
+  const client = currentPostgresClient();
+  if (!client) return null;
+  const digest = hash(`zezo-rate:${bucket}:${key}`);
+  const result = await client.query(
+    'INSERT INTO rate_limit_buckets (key, count, "windowStartedAt", "expiresAt", "updatedAt") VALUES ($1, 1, NOW(), NOW() + ($2 * INTERVAL \'1 millisecond\'), NOW()) ON CONFLICT (key) DO UPDATE SET count = CASE WHEN rate_limit_buckets."expiresAt" <= NOW() THEN 1 ELSE rate_limit_buckets.count + 1 END, "windowStartedAt" = CASE WHEN rate_limit_buckets."expiresAt" <= NOW() THEN NOW() ELSE rate_limit_buckets."windowStartedAt" END, "expiresAt" = CASE WHEN rate_limit_buckets."expiresAt" <= NOW() THEN NOW() + ($2 * INTERVAL \'1 millisecond\') ELSE rate_limit_buckets."expiresAt" END, "updatedAt" = NOW() RETURNING count',
+    [digest, windowMs]
+  );
+  return Number(result.rows[0]?.count || 0) <= max;
+}
+async function clearRateLimit(bucket, key) {
+  const client = currentPostgresClient();
+  if (client) await client.query('DELETE FROM rate_limit_buckets WHERE key = $1', [hash(`zezo-rate:${bucket}:${key}`)]);
+}
+async function rateAllowed(key) {
+  const shared = await postgresRateAllowed('login', key, 8, 15 * 60_000);
+  if (shared !== null) return shared;
   const item = loginAttempts.get(key);
   if (!item || item.until < Date.now()) { loginAttempts.set(key, { count: 1, until: Date.now() + 15 * 60_000 }); return true; }
   item.count += 1; return item.count <= 8;
 }
-function rateAllowedFor(map,key,max,windowMs) {
+async function rateAllowedFor(map,key,max,windowMs) {
+  const shared = await postgresRateAllowed(rateLimitNames.get(map) || 'shared', key, max, windowMs);
+  if (shared !== null) return shared;
   const item=map.get(key);
   if(!item||item.until<Date.now()){map.set(key,{count:1,until:Date.now()+windowMs});return true;}
   item.count+=1;return item.count<=max;
 }
-function publicRateAllowed(key) {
+async function publicRateAllowed(key) {
+  const shared = await postgresRateAllowed('public-enquiry', key, 8, 60 * 60_000);
+  if (shared !== null) return shared;
   const item = leadAttempts.get(key);
   if (!item || item.until < Date.now()) { leadAttempts.set(key, { count: 1, until: Date.now() + 60 * 60_000 }); return true; }
   item.count += 1; return item.count <= 8;
 }
-function saveUpload(file) {
+async function saveUpload(file, ownerId = null) {
   if (!file) return Promise.resolve(null);
   const ext = extname(file.filename).toLowerCase();
   const allowed = { '.pdf': ['application/pdf', '%PDF-'], '.png': ['image/png', '\x89PNG'], '.jpg': ['image/jpeg', '\xff\xd8\xff'], '.jpeg': ['image/jpeg', '\xff\xd8\xff'], '.webp': ['image/webp', 'RIFF'] };
   const rule = allowed[ext];
   const prefix = rule ? file.content.subarray(0, Buffer.byteLength(rule[1])).toString('binary') : '';
   if (!rule || file.content.length > 4 * 1024 * 1024 || prefix !== rule[1]) return Promise.reject(Object.assign(new Error('الملف غير مدعوم أو يتجاوز 4MB / Unsupported file or over 4MB'), { status: 400 }));
+  if (postgresConfigured()) {
+    const attachmentId = `att_${randomBytes(18).toString('hex')}`;
+    const persistAttachment = async client => client.query(
+      'INSERT INTO stored_attachments (id, "ownerId", "fileName", "contentType", "sizeBytes", content) VALUES ($1, $2, $3, $4, $5, $6)',
+      [attachmentId, ownerId || null, clean(file.filename, 120), rule[0], file.content.length, file.content]
+    );
+    const client = currentPostgresClient();
+    if (client) await persistAttachment(client);
+    else await withPostgresTransaction(persistAttachment);
+    return { storedName: attachmentId, attachmentId, storage: 'postgres', originalName: clean(file.filename, 120), type: rule[0], size: file.content.length };
+  }
   const storedName = `${randomBytes(18).toString('hex')}${ext}`;
   return writeFile(join(UPLOAD_DIR, storedName), file.content, { flag: 'wx', mode: 0o600 }).then(() => ({ storedName, originalName: clean(file.filename, 120), type: rule[0], size: file.content.length }));
+}
+async function serveUpload(res, file, headers) {
+  if (postgresConfigured()) {
+    const client = currentPostgresClient();
+    if (!client) throw new Error('Protected attachment access requires an active PostgreSQL request transaction.');
+    const result = await client.query('SELECT "fileName", "contentType", "sizeBytes", content FROM stored_attachments WHERE id = $1', [file.attachmentId || file.storedName]);
+    if (!result.rowCount) return json(res, 404, { error: 'الملف غير موجود / File not found' }, headers);
+    const row = result.rows[0];
+    res.writeHead(200, { ...headers, 'Content-Type': row.contentType, 'Content-Length': row.sizeBytes, 'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(row.fileName)}`, 'Cache-Control': 'private, no-store' });
+    return res.end(row.content);
+  }
+  res.writeHead(200, { ...headers, 'Content-Type': file.type, 'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(file.originalName)}`, 'Cache-Control': 'private, no-store' });
+  return createReadStream(join(UPLOAD_DIR, file.storedName)).pipe(res);
 }
 function normalizedDetails(value) { return clean(value, 3000).toLowerCase().replace(/\s+/g, ' '); }
 function findDuplicateLead(candidate) {
@@ -1182,6 +1278,44 @@ function cancelWithdrawalForLead(lead, actor = null) {
 }
 
 async function handle(req, res) {
+  if (!postgresConfigured()) return handleRequest(req, res);
+  const path = new URL(req.url, `http://localhost:${PORT}`).pathname;
+  if (!path.startsWith('/api/')) {
+    return withPostgresTransaction(async client => {
+      await loadPostgresStore(client);
+      const referralLinksCreated = ensureMonthlyReferralLinks();
+      if (referralLinksCreated) await persistPostgresStore(client);
+      return handleRequest(req, res);
+    });
+  }
+
+  const buffered = new Writable({ write(chunk, _encoding, callback) { chunks.push(Buffer.from(chunk)); callback(); } });
+  const chunks = [];
+  buffered.statusCode = 200;
+  buffered.headersSent = false;
+  buffered.responseHeaders = {};
+  buffered.writeHead = function writeHead(status, headers = {}) {
+    this.statusCode = status;
+    this.responseHeaders = headers;
+    this.headersSent = true;
+    return this;
+  };
+  const finished = new Promise((resolve, reject) => {
+    buffered.once('finish', resolve);
+    buffered.once('error', reject);
+  });
+  await withPostgresTransaction(async client => {
+    await loadPostgresStore(client);
+    ensureMonthlyReferralLinks();
+    await handleRequest(req, buffered);
+    if (!buffered.writableFinished) await finished;
+    await persistPostgresStore(client);
+  });
+  res.writeHead(buffered.statusCode, buffered.responseHeaders);
+  return res.end(Buffer.concat(chunks));
+}
+
+async function handleRequest(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const path = decodeURIComponent(url.pathname);
   const security = {
@@ -1196,7 +1330,7 @@ async function handle(req, res) {
   }
   if (STAGING_MODE && req.method === 'POST' && path === '/__staging/login') {
     const attemptKey = req.socket.remoteAddress || 'unknown';
-    if (!rateAllowedFor(stagingLoginAttempts, attemptKey, 12, 15 * 60_000)) {
+    if (!await rateAllowedFor(stagingLoginAttempts, attemptKey, 12, 15 * 60_000)) {
       res.writeHead(429, { ...security, 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Retry-After': '900' });
       return res.end(stagingLoginPage('محاولات كثيرة. انتظر قليلاً ثم حاول مجدداً.'));
     }
@@ -1234,7 +1368,7 @@ async function handle(req, res) {
     return res.end('ZEZO Forge staging access required.');
   }
   if (path.startsWith('/api/')) {
-    if (req.method === 'GET' && path === '/api/health') return json(res, 200, { ok: true, app: 'ZEZO', storage: 'local-json', staging: STAGING_MODE }, security);
+    if (req.method === 'GET' && path === '/api/health') return json(res, 200, { ok: true, app: 'ZEZO', storage: postgresConfigured() ? 'postgresql' : 'local-json', staging: STAGING_MODE }, security);
     if (req.method === 'GET' && path === '/api/public') {
       const legacyPhone = process.env.ZEZO_WHATSAPP_NUMBER;
       const customerSupportPhone = STAGING_MODE ? '' : normalizeWhatsAppNumber(process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP !== undefined ? process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP : legacyPhone);
@@ -1243,13 +1377,13 @@ async function handle(req, res) {
       return json(res, 200, { prices: store.settings.prices.filter(price=>price.active!==false), templatePrices: store.settings.templatePrices || {}, templateInclusions:store.settings.templateInclusions||{}, templateActive:store.settings.templateActive||{}, commissionConfigured: store.settings.commissionPercent != null, customerSupportWhatsappNumber:customerSupportPhone, ordersWhatsappNumber:ordersPhone, customerSupportWhatsappUrl:buildWhatsAppUrl(customerSupportPhone), ordersWhatsappUrl:ordersUrl, whatsappUrl:ordersUrl, emailReady: emailReady() && adminEmailReady(), aiQuoteReady:!STAGING_MODE&&Boolean(process.env.OPENAI_API_KEY&&process.env.OPENAI_MODEL), adminSetupAvailable:firstAdminSetupAvailable(), stagingMode:STAGING_MODE }, security);
     }
     if(req.method==='POST'&&path==='/api/conversations'){
-      if(!rateAllowedFor(conversationAttempts,`create:${req.socket.remoteAddress||'unknown'}`,15,60*60_000))return json(res,429,{error:'وصلنا الحد المؤقت للمحادثات. حاول لاحقاً / Conversation limit reached. Try again later.'},security);
+      if(!await rateAllowedFor(conversationAttempts,`create:${req.socket.remoteAddress||'unknown'}`,15,60*60_000))return json(res,429,{error:'وصلنا الحد المؤقت للمحادثات. حاول لاحقاً / Conversation limit reached. Try again later.'},security);
       let b={},file=null;if((req.headers['content-type']||'').toLowerCase().startsWith('multipart/form-data')){const parsed=parseMultipart(await bodyBuffer(req),req.headers['content-type']);b=parsed.fields;file=parsed.file;}else b=await jsonBody(req);const templateId=clean(b.templateId,80),template=templateById.get(templateId),message=clean(b.message,2000),auth=sessionUser(req);
       if(auth&&auth.user.role!=='client')return json(res,403,{error:'إنشاء محادثة قالب متاح للعميل فقط / Template conversations are for customers'},security);
       if(!template||store.settings.templateActive?.[templateId]===false||message.length<5)return json(res,400,{error:'اختر قالباً متاحاً واكتب استفسارك / Choose an available template and enter your question'},security);
       let guest=guestSessionValue(req),headers={};if(!auth&&!guest){guest=token(32);headers['Set-Cookie']=cookie('zezo_guest',guest,30*24*60*60,req);}
       const referralCode=clean(b.referralCode||url.searchParams.get('ref'),40),resolved=referralForRequest(req,{...b,referralCode}),conv={id:id('chat'),createdAt:now(),updatedAt:now(),templateId:template.id,templateName:template.title.ar,templateService:template.service,templateCategory:template.category,source:clean(b.source,40)||'template_catalog',department:'orders',status:'new',clientId:auth?.user.role==='client'?auth.user.id:null,guestSessionHash:auth?null:hash(guest),assignedUserId:null,referralCode:resolved?.code||'',referralLinkId:resolved?.link?.id||null,referralUserId:resolved?.user?.id||null,leadId:null,messages:[],quote:null,agreedPriceSnapshot:null};
-      const attachment=await saveUpload(file),first=appendConversationMessage(conv,{senderType:conv.clientId?'client':'guest',senderId:conv.clientId||'',text:message,attachment});store.conversations.unshift(conv);
+      const attachment=await saveUpload(file,conv.clientId),first=appendConversationMessage(conv,{senderType:conv.clientId?'client':'guest',senderId:conv.clientId||'',text:message,attachment});store.conversations.unshift(conv);
       if(conv.referralUserId)recordReferralEvent({userId:conv.referralUserId,code:conv.referralCode,linkId:conv.referralLinkId,type:'inquiry_confirmed',resourceId:conv.id,idempotencyKey:`conversation_inquiry:${conv.id}`});
       audit(auth?.user||null,'template_conversation_created',conv.id,`${conv.templateId}; referral=${conv.referralCode||'none'}`);notifyConversation(conv,'created',auth?.user||null);await persist();
       return json(res,201,{ok:true,conversation:safeConversation(conv,false),messageId:first.id}, {...security,...headers});
@@ -1272,14 +1406,14 @@ async function handle(req, res) {
       if(req.method==='GET'&&action.startsWith('files/')){
         if(!customerCanSeeConversation(req,auth,conversation))return json(res,404,{error:'الملف غير موجود / File not found'},security);
         const index=Number(conversationRoute[3]),all=(conversation.messages||[]).flatMap(message=>message.attachments||[]),file=all[index];if(!Number.isInteger(index)||!file)return json(res,404,{error:'الملف غير موجود / File not found'},security);
-        res.writeHead(200,{...security,'Content-Type':file.type,'Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(file.originalName)}`,'Cache-Control':'private, no-store'});return createReadStream(join(UPLOAD_DIR,file.storedName)).pipe(res);
+        return serveUpload(res,file,security);
       }
       if(req.method==='POST'&&action==='messages'){
         let b={},file=null;if((req.headers['content-type']||'').toLowerCase().startsWith('multipart/form-data')){const parsed=parseMultipart(await bodyBuffer(req),req.headers['content-type']);b=parsed.fields;file=parsed.file;}else b=await jsonBody(req);
         const text=clean(b.message,2000);if(text.length<1&&!file)return json(res,400,{error:'اكتب رسالة أو أرفق ملفاً صالحاً / Enter a message or attach a valid file'},security);
         if(staff){if(!conversationAccess(auth.user,conversation,'conversations.read')||!requirePermission(auth,res,'conversations.reply',{assigneeId:conversation.assignedUserId||'',ownerId:conversation.clientId||'',department:conversation.department||'orders'}))return;}
         else if(!customerCanSeeConversation(req,auth,conversation))return json(res,404,{error:'المحادثة غير موجودة / Conversation not found'},security);
-        const attachment=await saveUpload(file),senderType=staff?'staff':auth?'client':'guest',message=appendConversationMessage(conversation,{senderType,senderId:auth?.user.id||'',text,attachment});
+        const attachment=await saveUpload(file,auth?.user.id||null),senderType=staff?'staff':auth?'client':'guest',message=appendConversationMessage(conversation,{senderType,senderId:auth?.user.id||'',text,attachment});
         if(staff&&conversation.status==='waiting_customer')conversation.status='in_progress';else if(!staff&&conversation.status==='waiting_customer')conversation.status='in_progress';
         audit(auth?.user||null,'conversation_message_sent',conversation.id,`${senderType}; ${message.id}; attachment=${Boolean(attachment)}`);notifyConversation(conversation,'message',auth?.user||null);await persist();return json(res,201,{ok:true,conversation:safeConversation(conversation,auth?.user.role==='admin')},security);
       }
@@ -1320,7 +1454,7 @@ async function handle(req, res) {
       return json(res,405,{error:'العملية غير مدعومة / Method not allowed'},security);
     }
     if (req.method === 'POST' && path === '/api/referral-events') {
-      if(!rateAllowedFor(quoteAttempts,`referral:${req.socket.remoteAddress||'unknown'}`,300,60*60_000))return json(res,429,{error:'حاول لاحقاً / Try again later'},security);
+      if(!await rateAllowedFor(quoteAttempts,`referral:${req.socket.remoteAddress||'unknown'}`,300,60*60_000))return json(res,429,{error:'حاول لاحقاً / Try again later'},security);
       const b=await jsonBody(req),code=clean(b.code,40),type=clean(b.type,32),visitorId=clean(b.visitorId,80),eventId=clean(b.eventId,80);
       const allowedTypes=['visit','service_view','template_view','whatsapp_click'];
       if(!allowedTypes.includes(type)||!code||!visitorId||!eventId||!/^[-_a-zA-Z0-9]{12,80}$/.test(visitorId)||!/^[-_a-zA-Z0-9]{12,80}$/.test(eventId))return json(res,400,{error:'حدث الإحالة غير صالح / Invalid referral event'},security);
@@ -1339,6 +1473,7 @@ async function handle(req, res) {
       const visitorHash=hash(visitorId),beforeEvents=store.referralEvents.length,beforeAttributions=store.referralAttributions.length;
       store.referralEvents=store.referralEvents.filter(event=>!(event.visitorHash===visitorHash&&['visit','service_view','template_view','whatsapp_click'].includes(event.type)));
       store.referralAttributions=store.referralAttributions.filter(row=>row.visitorHash!==visitorHash);
+      if(postgresConfigured())await deleteReferralTrackingForVisitor(visitorHash);
       if(beforeEvents!==store.referralEvents.length||beforeAttributions!==store.referralAttributions.length)await persist();
       return json(res,202,{ok:true},security);
     }
@@ -1389,7 +1524,7 @@ async function handle(req, res) {
       recordLeadMilestone(lead,'quote_accepted',auth.user);syncCrmCaseForOrder(lead,auth.user);audit(auth.user,'quote_acceptance_recorded',lead.id,'Customer acceptance confirmed manually');await persist();return json(res,201,{ok:true,quoteAcceptedAt:lead.quoteAcceptedAt},security);
     }
     if (req.method === 'POST' && path === '/api/quote') {
-      const key=req.socket.remoteAddress||'unknown';if(!rateAllowedFor(quoteAttempts,key,15,60*60_000))return json(res,429,{error:'حاول تقدير فكرتك مرة أخرى بعد قليل / Please try again later'},security);
+      const key=req.socket.remoteAddress||'unknown';if(!await rateAllowedFor(quoteAttempts,key,15,60*60_000))return json(res,429,{error:'حاول تقدير فكرتك مرة أخرى بعد قليل / Please try again later'},security);
       const b=await jsonBody(req),brief=clean(b.brief,800);
       if(brief.length<8) return json(res,400,{error:'اكتب وصفاً أوضح قليلاً للفكرة / Add a little more detail about the idea'},security);
       if(process.env.OPENAI_API_KEY&&process.env.OPENAI_MODEL&&b.consentAi!==true)return json(res,400,{error:'وافق على إرسال الوصف إلى خدمة الذكاء الاصطناعي أو أوقف التفعيل / Consent to AI processing or disable AI'},security);
@@ -1520,19 +1655,19 @@ async function handle(req, res) {
       if (store.users.some(u=>u.role==='admin'&&u.active)) return json(res,409,{error:'تم إنشاء حساب المدير مسبقاً / Initial administrator already exists'},security);
       if (!canSetUpFirstAdmin()) return json(res,403,{error:'إنشاء المدير الأول متاح في المعاينة المحلية فقط / First administrator setup is available only in local development'},security);
       const setupKey=`first-admin:${req.socket.remoteAddress||'unknown'}`;
-      if (!rateAllowed(setupKey)) return json(res,429,{error:'محاولات كثيرة. حاول بعد 15 دقيقة / Too many attempts; try again in 15 minutes'},security);
+      if (!await rateAllowed(setupKey)) return json(res,429,{error:'محاولات كثيرة. حاول بعد 15 دقيقة / Too many attempts; try again in 15 minutes'},security);
       const name = clean(b.name,80), username = clean(b.username,40).toLowerCase();
       if (name.length < 2 || !/^[a-z0-9._-]{3,40}$/.test(username) || !validTemporaryPassword(b.password)) return json(res,400,{error:'أدخل اسماً واسم مستخدم صالحاً وكلمة مرور مؤقتة من 9 خانات على الأقل / Use a valid name, username, and a temporary password of at least 9 characters'},security);
       const record = passwordRecord(b.password);
       const admin = { id:id('usr'), name, username, role:'admin', active:true, mustChangePassword:true, createdAt:now(), ...record };
-      store.users.push(admin); loginAttempts.delete(setupKey); audit(admin,'admin_setup','account','First administrator created; temporary password must be changed'); await persist();
-      const sid=token(); sessions.set(sid,{userId:admin.id,expires:Date.now()+SESSION_TTL});
+       store.users.push(admin); loginAttempts.delete(setupKey); await clearRateLimit('login', setupKey); audit(admin,'admin_setup','account','First administrator created; temporary password must be changed'); await persist();
+      const sid=token(); sessions.set(sessionKey(sid),{userId:admin.id,expires:Date.now()+SESSION_TTL});
       return json(res,201,{user:publicUser(admin)}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
     }
     if (req.method === 'POST' && path === '/api/client/register') {
       const b=await jsonBody(req),ip=req.socket.remoteAddress||'unknown';
       const email=normalizeEmail(b.email),name=clean(b.name,100),password=String(b.password||'');
-      if(!rateAllowedFor(clientRegistrationAttempts,ip,8,60*60_000))return json(res,429,{error:'محاولات تسجيل كثيرة. حاول لاحقاً / Too many registration attempts. Try again later.'},security);
+      if(!await rateAllowedFor(clientRegistrationAttempts,ip,8,60*60_000))return json(res,429,{error:'محاولات تسجيل كثيرة. حاول لاحقاً / Too many registration attempts. Try again later.'},security);
       if(name.length<2||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||!validPassword(password)||String(b.confirmPassword||'')!==password)return json(res,400,{error:'أكمل الاسم والبريد، وتأكد من تطابق كلمتي المرور (12 خانة على الأقل) / Enter your name and email, and make sure both passwords match (12+ characters).'},security);
       if(store.users.some(user=>normalizeEmail(user.email)===email||user.username===email))return json(res,409,{error:'يوجد حساب بهذا البريد. سجّل الدخول بدلاً من إنشاء حساب جديد / An account already exists for this email. Please sign in.'},security);
       const attribution=referralForRequest(req,b),createdAt=now(),verificationToken=emailReady()?token(32):'';
@@ -1542,7 +1677,7 @@ async function handle(req, res) {
       if(verificationToken){user.emailVerificationHash=hash(verificationToken);user.emailVerificationExpires=Date.now()+24*60*60_000;}
       store.users.push(user);audit(user,'client_registered',user.id,user.referralCode?`Referral ${user.referralCode}`:'');await persist();
       if(verificationToken){const verifyUrl=`${siteBase(req)}/?verifyEmail=${encodeURIComponent(verificationToken)}`;await queueMail({to:email,kind:'client_email_verification',subject:'تأكيد بريد حساب ZEZO',text:`مرحباً ${name}،\n\nأكد بريدك لتفعيل حسابك في ZEZO خلال 24 ساعة:\n${verifyUrl}\n\nإذا لم تنشئ هذا الحساب، تجاهل الرسالة.`});void processMailQueue();return json(res,201,{verificationRequired:true,emailQueued:emailReady()},security);}
-      const sid=token();sessions.set(sid,{userId:user.id,expires:Date.now()+SESSION_TTL});
+      const sid=token();sessions.set(sessionKey(sid),{userId:user.id,expires:Date.now()+SESSION_TTL});
       return json(res,201,{user:publicUser(user),verificationRequired:false,emailConfigured:false}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
     }
     if(req.method==='POST'&&path==='/api/auth/verify-email'){
@@ -1550,12 +1685,12 @@ async function handle(req, res) {
       const user=store.users.find(row=>row.role==='client'&&row.emailVerificationHash===hash(verificationToken)&&Number(row.emailVerificationExpires)>Date.now());
       if(!user)return json(res,400,{error:'رابط تأكيد البريد غير صالح أو منتهي / Verification link is invalid or expired'},security);
       user.emailVerificationHash=null;user.emailVerificationExpires=0;user.emailVerified=true;user.active=true;user.emailVerifiedAt=now();audit(user,'client_email_verified',user.id);await persist();
-      const sid=token();sessions.set(sid,{userId:user.id,expires:Date.now()+SESSION_TTL});
+      const sid=token();sessions.set(sessionKey(sid),{userId:user.id,expires:Date.now()+SESSION_TTL});
       return json(res,200,{user:publicUser(user)}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
     }
     if(req.method==='POST'&&path==='/api/auth/forgot-password'){
       const b=await jsonBody(req),email=normalizeEmail(b.email),ip=req.socket.remoteAddress||'unknown',user=store.users.find(row=>row.active&&normalizeEmail(row.email)===email);
-      if(!rateAllowedFor(passwordResetAttempts,ip,8,60*60_000))return json(res,429,{error:'محاولات كثيرة. حاول لاحقاً / Too many reset requests. Try again later.'},security);
+      if(!await rateAllowedFor(passwordResetAttempts,ip,8,60*60_000))return json(res,429,{error:'محاولات كثيرة. حاول لاحقاً / Too many reset requests. Try again later.'},security);
       if(user&&emailReady()){const resetToken=token(32);user.passwordResetHash=hash(resetToken);user.passwordResetExpires=Date.now()+60*60_000;await persist();const resetUrl=`${siteBase(req)}/?resetPassword=${encodeURIComponent(resetToken)}`;await queueMail({to:user.email,kind:'account_password_reset',subject:'إعادة تعيين كلمة مرور ZEZO',text:`استخدم الرابط خلال ساعة لإعادة تعيين كلمة المرور:\n${resetUrl}\n\nإذا لم تطلب ذلك، تجاهل الرسالة.`});void processMailQueue();}
       return json(res,202,{ok:true,message:'إذا كان البريد مرتبطاً بحساب نشط وخدمة البريد مفعّلة، فستصلك رسالة بالخطوات.'},security);
     }
@@ -1565,15 +1700,15 @@ async function handle(req, res) {
       if(Number(user.passwordResetExpires)<=Date.now()){user.passwordResetHash=null;user.passwordResetExpires=0;await persist();return json(res,400,{error:'انتهت صلاحية رابط إعادة التعيين / Password reset link has expired'},security);}
       if(!validPassword(b.password))return json(res,400,{error:'كلمة المرور يجب أن تكون 12 خانة على الأقل / Password must contain at least 12 characters'},security);
       Object.assign(user,passwordRecord(String(b.password)));user.passwordResetHash=null;user.passwordResetExpires=0;user.mustChangePassword=false;audit(user,'password_reset',user.id);for(const [sid,session] of sessions)if(session.userId===user.id)sessions.delete(sid);await persist();
-      const sid=token();sessions.set(sid,{userId:user.id,expires:Date.now()+SESSION_TTL});return json(res,200,{user:publicUser(user)}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
+      const sid=token();sessions.set(sessionKey(sid),{userId:user.id,expires:Date.now()+SESSION_TTL});return json(res,200,{user:publicUser(user)}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
     }
     if (req.method === 'POST' && path === '/api/auth/login') {
       const b=await jsonBody(req); const username=clean(b.username,150).toLowerCase(); const key=`${req.socket.remoteAddress}:${username}`;
-      if (!rateAllowed(key)) return json(res,429,{error:'محاولات كثيرة. جرّب بعد 15 دقيقة / Too many attempts; try again in 15 minutes'},security);
+      if (!await rateAllowed(key)) return json(res,429,{error:'محاولات كثيرة. جرّب بعد 15 دقيقة / Too many attempts; try again in 15 minutes'},security);
       const user=store.users.find(u=>u.username===username&&u.active);
       if (!user || !passwordMatches(String(b.password||''),user) || !accountTypes[b.accountType]?.includes(user.role)) return json(res,401,{error:'اسم المستخدم أو كلمة المرور غير صحيحة لهذا النوع من الدخول / Incorrect username or password for this sign-in type'},security);
       if(sensitiveManagementRole(user.role)&&user.mfaEnabledAt&&!validTotp(user.mfaSecret,b.mfaCode))return json(res,401,{error:'أدخل رمز تطبيق المصادقة الحالي / Enter the current authenticator code',mfaRequired:true},security);
-      loginAttempts.delete(key); const sid=token(); sessions.set(sid,{userId:user.id,expires:Date.now()+SESSION_TTL}); audit(user,'login',user.id); await persist();
+       loginAttempts.delete(key); await clearRateLimit('login', key); const sid=token(); sessions.set(sessionKey(sid),{userId:user.id,expires:Date.now()+SESSION_TTL}); audit(user,'login',user.id); await persist();
       return json(res,200,{user:publicUser(user)}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
     }
     if(req.method==='GET'&&path==='/api/auth/mfa/setup'){
@@ -1591,7 +1726,7 @@ async function handle(req, res) {
       return json(res,200,{ok:true,user:publicUser(auth.user)},security);
     }
     if (req.method === 'POST' && path === '/api/auth/logout') {
-      const sid=cookieValue(req,'zezo_session'); const auth=sessionUser(req); if(auth) audit(auth.user,'logout',auth.user.id); sessions.delete(sid); await persist();
+      const sid=cookieValue(req,'zezo_session'); const auth=sessionUser(req); if(auth) audit(auth.user,'logout',auth.user.id); sessions.delete(sessionKey(sid)); await persist();
       return json(res,200,{ok:true}, {...security,'Set-Cookie':cookie('zezo_session','',0,req)});
     }
     if (req.method === 'POST' && path === '/api/auth/password') {
@@ -1629,7 +1764,7 @@ async function handle(req, res) {
       if(Number(user.activationExpires)<=Date.now()){user.activationHash=null;user.activationExpires=0;user.inviteStatus='expired';await persist();return json(res,400,{error:'انتهت صلاحية الدعوة / Invitation has expired'},security);}
       if (!validPassword(b.password)) return json(res,400,{error:'كلمة المرور يجب أن تكون 12 خانة على الأقل / Password must be at least 12 characters'},security);
       Object.assign(user,passwordRecord(b.password)); user.activationHash=null; user.activationExpires=0; user.inviteStatus='accepted';user.inviteAcceptedAt=now();user.active=true; ensureMonthlyReferralLinks(); audit(user,'account_activated',user.id); await persist();
-      const sid=token(); sessions.set(sid,{userId:user.id,expires:Date.now()+SESSION_TTL});
+      const sid=token(); sessions.set(sessionKey(sid),{userId:user.id,expires:Date.now()+SESSION_TTL});
       return json(res,200,{user:publicUser(user)}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
     }
     if(req.method==='POST'&&/^\/api\/client\/orders\/[^/]+\/quote-accept$/.test(path)){
@@ -1664,11 +1799,11 @@ async function handle(req, res) {
       const auth=requireAuth(req,res,['client']);if(!auth)return;const pathParts=path.split('/'),orderId=pathParts[4],kind=pathParts[6],indexText=pathParts[7],lead=store.leads.find(row=>row.id===orderId&&row.clientId===auth.user.id);if(!lead)return json(res,404,{error:'الملف غير موجود / File not found'},security);
       const index=Number(indexText),canSeeDeliverables=lead.developerReviewStatus==='approved'&&['ready_delivery','waiting_client_review','delivered','completed'].includes(lead.projectStage||''),file=kind==='customer_upload'?lead.attachments?.[index]:canSeeDeliverables?lead.developerAttachments?.[index]:null;
       if(!file)return json(res,404,{error:'الملف غير موجود / File not found'},security);
-      res.writeHead(200,{...security,'Content-Type':file.type,'Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(file.originalName)}`,'Cache-Control':'private, no-store'});return createReadStream(join(UPLOAD_DIR,file.storedName)).pipe(res);
+      return serveUpload(res,file,security);
     }
     if (req.method === 'POST' && path === '/api/leads') {
       const auth=requireAuth(req,res,['client']);if(!auth)return;
-      if(!publicRateAllowed(req.socket.remoteAddress||'unknown')) return json(res,429,{error:'وصلنا الحد المؤقت للطلبات من هذا الاتصال. حاول لاحقاً / Too many enquiries from this connection. Please try again later.'},security);
+      if(!await publicRateAllowed(req.socket.remoteAddress||'unknown')) return json(res,429,{error:'وصلنا الحد المؤقت للطلبات من هذا الاتصال. حاول لاحقاً / Too many enquiries from this connection. Please try again later.'},security);
       let b, file;
       if ((req.headers['content-type']||'').toLowerCase().startsWith('multipart/form-data')) { const parsed=parseMultipart(await bodyBuffer(req),req.headers['content-type']); b=parsed.fields; file=parsed.file; }
       else b=await jsonBody(req);
@@ -1683,7 +1818,7 @@ async function handle(req, res) {
       if(conversationId&&(!linkedConversation||!(linkedConversation.clientId===auth.user.id||(!linkedConversation.clientId&&guest&&linkedConversation.guestSessionHash===hash(guest)))))return json(res,403,{error:'لا يمكن ربط الطلب بهذه المحادثة / This conversation cannot be linked to your request'},security);
       if(linkedConversation&&(linkedConversation.leadId||linkedConversation.status==='converted'))return json(res,409,{error:'هذه المحادثة مرتبطة بطلب رسمي مسبقاً / This conversation already has an official request'},security);
       if(linkedConversation?.templateId&&linkedConversation.templateId!==requestedTemplateId)return json(res,400,{error:'القالب لا يطابق المحادثة / Template does not match the conversation'},security);
-      const attachment=await saveUpload(file); const existingClientReferral=auth.user.referralUserId?referralLinkForCode(auth.user.referralCode||''):null;const conversationReferral=linkedConversation?.referralCode?referralLinkForCode(linkedConversation.referralCode):null;const resolvedReferral=existingClientReferral||conversationReferral||referralForRequest(req,b);const ref=resolvedReferral?.code||resolvedReferral?.user?.currentReferralCode||resolvedReferral?.user?.referralCode||'';let refUser=resolvedReferral?.user||null;
+      const attachment=await saveUpload(file,auth.user.id); const existingClientReferral=auth.user.referralUserId?referralLinkForCode(auth.user.referralCode||''):null;const conversationReferral=linkedConversation?.referralCode?referralLinkForCode(linkedConversation.referralCode):null;const resolvedReferral=existingClientReferral||conversationReferral||referralForRequest(req,b);const ref=resolvedReferral?.code||resolvedReferral?.user?.currentReferralCode||resolvedReferral?.user?.referralCode||'';let refUser=resolvedReferral?.user||null;
       const selfReferral=Boolean(refUser&&((refUser.email&&normalizeEmail(refUser.email)===email)||(refUser.phone&&normalizePhone(refUser.phone)===phone)));
       if(selfReferral){audit(null,'self_referral_blocked',refUser.id,'Matching employee email or phone');refUser=null;}
       const trackingToken=token(32), createdAt=now(), service=clean(b.service,60), category=clean(b.category,80),acceptedQuote=linkedConversation?.quote?.status==='accepted'?linkedConversation.agreedPriceSnapshot:null,initialStatus=acceptedQuote?'waiting_payment':'new';
@@ -2005,7 +2140,7 @@ async function handle(req, res) {
       const auth=requireAuth(req,res,['developer']);if(!auth)return;const leadId=path.split('/').at(-2),lead=store.leads.find(l=>l.id===leadId&&l.developerUserId===auth.user.id);
       if(!lead||!['accepted','in_progress','revision_requested','review_requested'].includes(lead.developerTaskStatus))return json(res,404,{error:'المشروع غير متاح لرفع الملفات / Project is not available for uploads'},security);
       if(!(req.headers['content-type']||'').toLowerCase().startsWith('multipart/form-data'))return json(res,400,{error:'أرسل الملف بصيغة multipart / Submit the file as multipart form data'},security);
-      const parsed=parseMultipart(await bodyBuffer(req),req.headers['content-type']),attachment=await saveUpload(parsed.file);if(!attachment)return json(res,400,{error:'اختر ملفاً قبل الرفع / Choose a file to upload'},security);
+      const parsed=parseMultipart(await bodyBuffer(req),req.headers['content-type']),attachment=await saveUpload(parsed.file,auth.user.id);if(!attachment)return json(res,400,{error:'اختر ملفاً قبل الرفع / Choose a file to upload'},security);
       lead.developerAttachments??=[];lead.developerAttachments.push({...attachment,uploadedBy:auth.user.username,uploadedAt:now()});audit(auth.user,'developer_file_uploaded',lead.id,attachment.originalName);await persist();return json(res,201,{files:lead.developerAttachments.map(a=>({name:a.originalName,size:a.size}))},security);
     }
     if(req.method==='PATCH'&&path.startsWith('/api/admin/developer-projects/')&&path.endsWith('/review')){
@@ -2021,7 +2156,7 @@ async function handle(req, res) {
     if(req.method==='GET'&&path.startsWith('/api/developer/attachment/')){
       const auth=requireAuth(req,res,['admin','developer']);if(!auth)return;const [leadId,indexText]=path.split('/').slice(-2),lead=store.leads.find(l=>l.id===leadId);
       if(!lead||(auth.user.role==='developer'&&lead.developerUserId!==auth.user.id))return json(res,404,{error:'الملف غير موجود / File not found'},security);const file=lead.developerAttachments?.[Number(indexText)];if(!file)return json(res,404,{error:'الملف غير موجود / File not found'},security);
-      res.writeHead(200,{...security,'Content-Type':file.type,'Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(file.originalName)}`,'Cache-Control':'private, no-store'});return createReadStream(join(UPLOAD_DIR,file.storedName)).pipe(res);
+      return serveUpload(res,file,security);
     }
     if (req.method === 'POST' && path === '/api/admin/payment') {
       const auth=requireAuth(req,res,['admin']); if(!auth)return; const b=await jsonBody(req); const lead=store.leads.find(l=>l.id===b.leadId);
@@ -2123,7 +2258,7 @@ async function handle(req, res) {
     if (req.method === 'GET' && path.startsWith('/api/admin/attachment/')) {
       const auth=requireAuth(req,res,['admin','marketing_manager','hr_manager','developer']); if(!auth)return; const [leadId,indexText]=path.split('/').slice(-2); const lead=store.leads.find(l=>l.id===leadId); if(auth.user.role==='developer'&&(!lead||lead.developerUserId!==auth.user.id||!['accepted','in_progress','review_requested','approved','revision_requested'].includes(lead.developerTaskStatus)))return json(res,404,{error:'الملف غير موجود / File not found'},security); const a=lead?.attachments[Number(indexText)];
       if(!a) return json(res,404,{error:'الملف غير موجود'},security);
-      res.writeHead(200,{...security,'Content-Type':a.type,'Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(a.originalName)}`,'Cache-Control':'private, no-store'}); return createReadStream(join(UPLOAD_DIR,a.storedName)).pipe(res);
+      return serveUpload(res,a,security);
     }
     return json(res,404,{error:'Not found'},security);
   }

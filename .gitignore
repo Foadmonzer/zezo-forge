@@ -20,6 +20,7 @@ data-staging-recovery/
 # Generated and dependency files
 node_modules/
 .next/
+.next-*/
 src/generated/prisma/
 *.tsbuildinfo
 coverage/
