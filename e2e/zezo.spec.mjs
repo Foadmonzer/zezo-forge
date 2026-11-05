@@ -308,7 +308,10 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await assign.locator('[name="developerUserId"]').selectOption(developer.id);
   await assign.locator('[name="developerDueDate"]').fill('2026-12-15');
   await assign.locator('button[type="submit"]').click();
+  await expect(leadCard).toContainText('Synthetic developer', { timeout: 30_000 });
+  await leadCard.evaluate(element => { element.open = true; });
   const payment = leadCard.locator(`[data-payment-form="${leadId}"]`);
+  await expect(payment).toBeVisible();
   await payment.locator('[name="amount"]').fill('200');
   await payment.locator('[name="note"]').fill('Synthetic manual payment; no funds moved.');
   await payment.locator('[name="verified"]').check();
@@ -322,14 +325,17 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   const project = devPage.locator(`[data-project-card="${leadId}"]`);
   await expect(project).toBeVisible();
   await project.locator('[data-task-decision="accept"]').click();
-  await project.locator(`[data-dev-progress="${leadId}"] [name="status"]`).selectOption('review_requested');
-  await project.locator(`[data-dev-progress="${leadId}"] [name="note"]`).fill('Synthetic delivery sent for review.');
-  await project.locator(`[data-dev-progress="${leadId}"] button[type="submit"]`).click();
+  await project.evaluate(element => { element.open = true; });
+  await expect(project.locator(`[data-dev-file="${leadId}"]`)).toBeVisible();
   await project.locator(`[data-dev-file="${leadId}"] input[type="file"]`).setInputFiles({
     name: 'synthetic-delivery.txt', mimeType: 'text/plain', buffer: Buffer.from('Synthetic browser-only delivery file.')
   });
   await project.locator(`[data-dev-file="${leadId}"] button[type="submit"]`).click();
-  await expect(project).toContainText('ملف');
+  await expect(project).toContainText('synthetic-delivery.txt', { timeout: 30_000 });
+  await project.evaluate(element => { element.open = true; });
+  await project.locator(`[data-dev-progress="${leadId}"] [name="status"]`).selectOption('review_requested');
+  await project.locator(`[data-dev-progress="${leadId}"] [name="note"]`).fill('Synthetic delivery sent for review.');
+  await project.locator(`[data-dev-progress="${leadId}"] button[type="submit"]`).click();
   await workspaceViewportMatrix(devPage, 'development', 'developer', testInfo);
   await devPage.close();
 
@@ -339,6 +345,8 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   if (!(await refreshedLead.evaluate(element => element.open))) await refreshedLead.locator(':scope > summary').click();
   await refreshedLead.locator(`[data-developer-review="${leadId}"] [name="decision"]`).selectOption('approved');
   await refreshedLead.locator(`[data-developer-review="${leadId}"] button[type="submit"]`).click();
+  await expect(refreshedLead).toContainText('approved', { timeout: 30_000 });
+  await refreshedLead.evaluate(element => { element.open = true; });
   await refreshedLead.locator(`[data-project-stage-form="${leadId}"] [name="stage"]`).selectOption('completed');
   await refreshedLead.locator(`[data-project-stage-form="${leadId}"] button[type="submit"]`).click();
   await expect(refreshedLead).toContainText('25%');
