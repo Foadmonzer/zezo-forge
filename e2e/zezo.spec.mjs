@@ -305,10 +305,14 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await leadCard.locator('[data-lead-edit] [name="contractAmount"]').first().fill('200');
   await leadCard.locator('[data-lead-edit] button[type="submit"]').first().click();
   const assign = leadCard.locator(`[data-developer-assign="${leadId}"]`);
+  const executionPanel = leadCard.locator('.lead-body details.dash-card').filter({ has: assign });
+  await expect(executionPanel).toBeVisible();
+  await executionPanel.evaluate(element => { element.open = true; });
   await assign.locator('[name="developerUserId"]').selectOption(developer.id);
   await assign.locator('[name="developerDueDate"]').fill('2026-12-15');
   await assign.locator('button[type="submit"]').click();
-  await expect(leadCard).toContainText('Synthetic developer', { timeout: 30_000 });
+  // Wait for the persisted task status; the developer name also exists in the option list before assignment.
+  await expect(leadCard).toContainText('offered', { timeout: 30_000 });
   await leadCard.evaluate(element => { element.open = true; });
   const payment = leadCard.locator(`[data-payment-form="${leadId}"]`);
   await expect(payment).toBeVisible();
