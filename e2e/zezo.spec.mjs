@@ -185,12 +185,14 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
     } }));
     const activationApi = await playwrightRequest.newContext({ baseURL });
     const activation = await json(await activationApi.post('/api/auth/activate', { data: { token: invite.activationToken, password } }));
-    if (['hr_manager', 'marketing_manager'].includes(role)) {
+    let mfaSecret = '';
+    if (['hr_manager', 'marketing_manager', 'order_manager'].includes(role)) {
       const mfa = await json(await activationApi.get('/api/auth/mfa/setup'));
+      mfaSecret = mfa.secret;
       await json(await activationApi.post('/api/auth/mfa/enable', { data: { code: totp(mfa.secret) } }));
     }
     await activationApi.dispose();
-    return { id: activation.user.id, username, password };
+    return { id: activation.user.id, username, password, mfaSecret };
   }
 
   const orderManager = await createEmployee('order_manager');
@@ -248,7 +250,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   // An Owner assigns the conversation. The Order Manager responds and drafts a quote through the UI.
   await json(await ownerApi.patch(`/api/conversations/${encodeURIComponent(conversationId)}`, { data: { assignedUserId: orderManager.id } }));
   const orderPage = await browser.newPage({ viewport: { width: 1366, height: 900 } });
-  await loginThroughUI(orderPage, { username: orderManager.username, password: orderManager.password, accountType: 'management' });
+  await loginThroughUI(orderPage, { username: orderManager.username, password: orderManager.password, accountType: 'management', mfaCode: totp(orderManager.mfaSecret) });
   await orderPage.locator('[data-dash-tab="conversations"]').click();
   const staffConversation = orderPage.locator('details.conversation-staff-card').filter({ hasText: 'مطعم السعادة' });
   await expect(staffConversation).toBeVisible();
@@ -381,7 +383,7 @@ test('interactive demos perform their core local actions without external servic
   await page.locator('[data-ld="view"][data-view="list"]').click();
   await expect(page.locator('.ld-list-view')).toBeVisible();
   await page.locator('[data-ld-form="task"] [name="title"]').fill('Synthetic QA browser task');
-  await page.locator('[data-ld-form="task"] button[type="submit"]').click();
+  await page.locator('[data-ld-form="task"] .ld-primary').click();
   await expect(page.locator('.ld-kanban')).toContainText('Synthetic QA browser task');
 
   await page.goto('/?preview=ai-helio-desk');
