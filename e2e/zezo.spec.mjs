@@ -366,13 +366,15 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   const devFileForm = project.locator(`[data-dev-file="${leadId}"]`);
   await expect(devFileForm).toBeVisible();
   await devFileForm.locator('input[type="file"]').setInputFiles({
-    name: 'synthetic-delivery.txt', mimeType: 'text/plain', buffer: Buffer.from('Synthetic browser-only delivery file.')
+    name: 'synthetic-delivery.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('%PDF-1.4\n% Synthetic browser-only delivery file.\n')
   });
   await waitForDeveloperDashboardWrite(`/api/developer/projects/${encodeURIComponent(leadId)}/files`, () =>
     devFileForm.locator('button[type="submit"]').click(), 'POST'
   );
   await project.evaluate(element => { element.open = true; });
-  await expect(project).toContainText('synthetic-delivery.txt', { timeout: 30_000 });
+  await expect(project).toContainText('synthetic-delivery.pdf', { timeout: 30_000 });
   const devProgress = project.locator(`[data-dev-progress="${leadId}"]`);
   await expect(devProgress).toBeVisible();
   await devProgress.locator('[name="status"]').selectOption('review_requested');
