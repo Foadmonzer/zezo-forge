@@ -90,7 +90,6 @@ jobs:
         run: ./e2e/node_modules/.bin/playwright install --with-deps
       - name: Migrate isolated browser-test database
         run: pnpm exec prisma migrate deploy
-      - run: pnpm build
       - name: Run browser tests across engines, viewports, templates, and synthetic roles
         run: node e2e/node_modules/@playwright/test/cli.js test --config=e2e/playwright.config.mjs
       - name: Upload screenshots and Playwright traces
