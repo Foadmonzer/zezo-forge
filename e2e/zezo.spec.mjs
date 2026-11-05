@@ -233,7 +233,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await page.locator('#dashboardLogout').click();
   await expect(page.locator('#dashboardBackdrop.open')).toHaveCount(0);
   await page.locator('.login-open').click();
-  await page.locator('[data-customer-view="login"]').click();
+  await page.locator('#customerChoicePanel [data-customer-view="login"]').click();
   await page.locator('#clientLoginForm [name="username"]').fill(`e2e_customer_${suffix}@example.test`);
   await page.locator('#clientLoginForm [name="password"]').fill(customerPassword);
   await page.locator('#clientLoginForm button[type="submit"]').click();
@@ -364,7 +364,7 @@ test('interactive demos perform their core local actions without external servic
   await restaurant.locator('[data-web="view"][data-view="checkout"]').click();
   await restaurant.locator('[data-web-form="checkout"] .zfx-primary').click();
   await expect(restaurant.locator('.zfx-success')).toBeVisible();
-  await restaurant.locator('[data-web="view"][data-view="admin"]').click();
+  await restaurant.locator('.zfx-success .zfx-primary[data-view="admin"]').click();
   await expect(restaurant.locator('.zfx-record')).toHaveCount(1);
 
   await page.goto('/?preview=web-luma-clinic');
