@@ -16,6 +16,7 @@
     "db:migrate:deploy": "prisma migrate deploy",
     "test:smoke": "node smoke-test.js",
     "test:staging": "node staging-smoke-test.js",
+    "test:staging-auth": "node staging-auth-smoke-test.js",
     "test:postgres": "node postgres-smoke-test.js && node postgres-api-smoke-test.js",
     "test": "node smoke-test.js && node staging-smoke-test.js"
   },

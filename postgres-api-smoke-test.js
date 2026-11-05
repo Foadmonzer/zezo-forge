@@ -209,7 +209,16 @@ try {
   }
   const marketerHome = await request('GET', '/api/dashboard', { cookie: employees.marketer.cookie });
   assert(Boolean(marketerHome.data.referralLink) && marketerHome.data.users === undefined, 'Marketer dashboard exposed team data or omitted its own referral link.');
+  const hrPaymentDenied = await request('POST', '/api/admin/payment', {
+    body: { leadId: 'synthetic-not-found', amount: 1, kind: 'payment', verified: true, idempotencyKey: `denied_${testSuffix}` }, cookie: employees.hr_manager.cookie
+  });
+  assert(hrPaymentDenied.status === 403, 'HR manager was able to access the owner-only payment endpoint.');
+  const marketerInviteDenied = await request('POST', '/api/admin/invite', {
+    body: { name: 'Unauthorized synthetic invite', username: `bad_${testSuffix}`, email: `bad_${testSuffix}@example.test`, role: 'admin' }, cookie: employees.marketer.cookie
+  });
+  assert(marketerInviteDenied.status === 403, 'Marketer was able to create a staff invitation.');
   results.push('secure employee invitations, activation, and role-specific dashboards for order manager, HR, marketer, and developer');
+  results.push('server-side denial of owner-only payments for HR and staff invitations for marketers');
 
   const visitorId = `phase3visitor${testSuffix}`;
   const trackedVisit = await request('POST', '/api/referral-events', {
@@ -261,6 +270,29 @@ try {
   assert(customerAttachment.status === 200 && customerAttachment.bytes.equals(attachmentBytes), 'Customer could not download the stored conversation attachment.');
   const marketerAttachment = await request('GET', `/api/conversations/${syntheticConversationId}/files/0`, { cookie: employees.marketer.cookie });
   assert(marketerAttachment.status === 404, 'Unassigned marketer downloaded a protected customer attachment.');
+  const exactLimitAttachment = Buffer.alloc(4 * 1024 * 1024, 0x61);
+  exactLimitAttachment.write('%PDF-1.7\n');
+  const exactLimitUpload = await request('POST', `/api/conversations/${syntheticConversationId}/messages`, {
+    ...multipartForm({ message: 'Synthetic maximum-size attachment boundary test.' }, { name: 'synthetic-limit.pdf', type: 'application/pdf', content: exactLimitAttachment }, `zezo_limit_${testSuffix}`),
+    cookie: customerCookie
+  });
+  assert(exactLimitUpload.status === 201, `A valid 4 MB synthetic attachment was rejected with ${exactLimitUpload.status}.`);
+  const limitAttachmentRow = await client.query('SELECT "sizeBytes" FROM stored_attachments WHERE "fileName" = $1', ['synthetic-limit.pdf']);
+  assert(limitAttachmentRow.rowCount === 1 && Number(limitAttachmentRow.rows[0].sizeBytes) === 4 * 1024 * 1024, 'The exact 4 MB attachment was not persisted correctly.');
+  const oversizeAttachment = Buffer.alloc(4 * 1024 * 1024 + 1, 0x61);
+  oversizeAttachment.write('%PDF-1.7\n');
+  let oversizeStatus = 0;
+  try {
+    const oversizeUpload = await request('POST', `/api/conversations/${syntheticConversationId}/messages`, {
+      ...multipartForm({ message: 'Synthetic oversized attachment boundary test.' }, { name: 'synthetic-oversize.pdf', type: 'application/pdf', content: oversizeAttachment }, `zezo_oversize_${testSuffix}`),
+      cookie: customerCookie
+    });
+    oversizeStatus = oversizeUpload.status;
+  } catch (error) { oversizeStatus = error.status || 500; }
+  assert(oversizeStatus === 400, `An attachment larger than 4 MB should be rejected, got ${oversizeStatus}.`);
+  const oversizedRow = await client.query('SELECT count(*)::int AS count FROM stored_attachments WHERE "fileName" = $1', ['synthetic-oversize.pdf']);
+  assert(Number(oversizedRow.rows[0].count) === 0, 'Oversized attachment bytes were persisted.');
+  results.push('BYTEA attachment access controls plus exact 4 MB accepted / 4 MB + 1 byte rejected boundary');
   const quote = await request('POST', `/api/conversations/${syntheticConversationId}/quote`, {
     body: { amount: 200, scope: 'Single landing page with the agreed demo layout.', included: 'One responsive page and contact details.' }, cookie: ownerCookie
   });
@@ -304,9 +336,36 @@ try {
     body: { leadId: syntheticLeadId, amount: 200, kind: 'payment', verified: true, idempotencyKey }, cookie: ownerCookie
   });
   assert(duplicatePayment.status === 200 && duplicatePayment.data.duplicate === true, 'Payment idempotency did not return the existing payment.');
+  const concurrentDuplicates = await Promise.all(Array.from({ length: 8 }, () => request('POST', '/api/admin/payment', {
+    body: { leadId: syntheticLeadId, amount: 200, kind: 'payment', verified: true, idempotencyKey }, cookie: ownerCookie
+  })));
+  assert(concurrentDuplicates.every(result => result.status === 200 && result.data.duplicate === true), 'Concurrent duplicate payment requests were not idempotent.');
+  const duplicateRows = await client.query('SELECT count(*)::int AS count FROM payments WHERE "requestId" = $1 AND "idempotencyKey" = $2', [syntheticLeadId, idempotencyKey]);
+  assert(Number(duplicateRows.rows[0].count) === 1, 'Concurrent payment requests created more than one payment row.');
+  const developerFile = Buffer.from('%PDF-1.4 synthetic project delivery');
+  const developerUpload = await request('POST', `/api/developer/projects/${syntheticLeadId}/files`, {
+    ...multipartForm({}, { name: 'synthetic-delivery.pdf', type: 'application/pdf', content: developerFile }, `zezo_delivery_${testSuffix}`),
+    cookie: employees.developer.cookie
+  });
+  assert(developerUpload.status === 201, `Developer could not upload synthetic delivery (${developerUpload.status}).`);
+  const developerSubmit = await request('PATCH', `/api/developer/projects/${syntheticLeadId}`, {
+    body: { status: 'review_requested', note: 'Synthetic delivery submitted for review.' }, cookie: employees.developer.cookie
+  });
+  assert(developerSubmit.status === 200, `Developer could not submit the delivery for review (${developerSubmit.status}).`);
+  const ownerReview = await request('POST', `/api/admin/projects/${syntheticLeadId}/review`, {
+    body: { decision: 'approved', note: 'Synthetic QA review passed.' }, cookie: ownerCookie
+  });
+  assert(ownerReview.status === 200 && ownerReview.data.project?.reviewNote === 'Synthetic QA review passed.', `Owner delivery review failed with ${ownerReview.status}.`);
+  const projectCompletion = await request('PATCH', `/api/admin/projects/${syntheticLeadId}/stage`, {
+    body: { stage: 'completed', note: 'Synthetic project delivered.' }, cookie: ownerCookie
+  });
+  assert(projectCompletion.status === 200, `Owner could not complete the synthetic project (${projectCompletion.status}).`);
+  const developerFinalDashboard = await request('GET', '/api/dashboard', { cookie: employees.developer.cookie });
+  const completedDeveloperProject = developerFinalDashboard.data.projects?.find(project => project.id === syntheticLeadId);
+  assert(Number(completedDeveloperProject?.commissionAmount) === 50 && Number(completedDeveloperProject?.developerCommissionRate) === 25, 'Developer execution commission was not calculated as 25% of the 200 ILS verified collection.');
   const marketerAfterPayment = await request('GET', '/api/dashboard', { cookie: employees.marketer.cookie });
   assert(marketerAfterPayment.data.leads?.some(row => row.id === syntheticLeadId && Number(row.commissionAmount) === 30), 'Rookie marketing commission was not persisted at 15% of the paid 200 ILS project.');
-  results.push('developer assignment with 25% expected execution fee, paid project, 15% marketer commission, and payment idempotency');
+  results.push('concurrent duplicate payment requests remain idempotent; project delivery review and completion calculate 25% developer (50 ILS) and 15% marketer (30 ILS) separately');
 
   const storedConversation = await client.query('SELECT count(*)::int AS count FROM conversations WHERE id = $1', [syntheticConversationId]);
   const storedMessages = await client.query('SELECT count(*)::int AS count FROM conversation_messages WHERE "conversationId" = $1', [syntheticConversationId]);

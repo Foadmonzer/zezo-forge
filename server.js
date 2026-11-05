@@ -8,13 +8,13 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { templateCatalog, templateById } from './public/template-catalog.js';
 import { buildWhatsAppUrl, normalizeWhatsAppNumber } from './public/whatsapp.js';
 import { currentPostgresClient, postgresConfigured, withPostgresTransaction } from './src/server/postgres-runtime.js';
+import { createStagingSession, isStagingSessionValid, STAGING_ACCESS_COOKIE, STAGING_SESSION_TTL_SECONDS, stagingPasswordMatches } from './src/server/staging-auth.js';
 import { deleteReferralTrackingForVisitor, loadNormalizedStore, persistNormalizedStore } from './src/server/postgres-store.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const STAGING_MODE = process.env.ZEZO_STAGING === 'true';
 const STAGING_ACCESS_PASSWORD = STAGING_MODE ? String(process.env.ZEZO_STAGING_ACCESS_PASSWORD || '') : '';
 if (STAGING_MODE && STAGING_ACCESS_PASSWORD.length < 16) throw new Error('ZEZO staging requires a temporary access password of at least 16 characters.');
-const STAGING_ACCESS_PASSWORD_HASH = STAGING_MODE ? createHash('sha256').update(STAGING_ACCESS_PASSWORD).digest() : null;
 if (!STAGING_MODE) try {
   const envText = readFileSync(join(ROOT, '.env'), 'utf8');
   for (const line of envText.split(/\r?\n/)) {
@@ -84,7 +84,6 @@ const defaultStore = () => ({
 let store;
 let persistQueue = Promise.resolve();
 const sessions = new Map();
-const stagingSessions = new Map();
 const stagingLoginAttempts = new Map();
 const loginAttempts = new Map();
 const leadAttempts = new Map();
@@ -799,10 +798,7 @@ function cookieValue(req, key) {
 }
 function stagingAuthorized(req) {
   if (!STAGING_MODE) return true;
-  const sessionId = cookieValue(req, 'zezo_staging_access');
-  const session = stagingSessions.get(sessionId);
-  if (!session || session.expiresAt <= Date.now()) { if (sessionId) stagingSessions.delete(sessionId); return false; }
-  return true;
+  return isStagingSessionValid(cookieValue(req, STAGING_ACCESS_COOKIE));
 }
 function stagingLoginPage(message = '') {
   return '<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow,noarchive"><title>دخول بيئة اختبار ZEZO</title><style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#05070a;color:#edf3ff;font-family:Segoe UI,Tahoma,Arial,sans-serif;padding:24px}.card{width:min(100%,430px);padding:34px;border:1px solid #233149;background:linear-gradient(145deg,#0d1521,#080b10);box-shadow:0 24px 80px #0009}.brand{color:#a3ff12;font-size:12px;letter-spacing:.2em;font-weight:800}.planet{color:#0066ff}.eyebrow{margin:28px 0 8px;color:#91a1b8;font-size:12px;letter-spacing:.08em}.card h1{margin:0 0 10px;font-size:28px}.card p{margin:0 0 24px;color:#9ba9bb;line-height:1.8;font-size:14px}label{display:block;font-size:13px;margin-bottom:9px}input{width:100%;height:48px;border:1px solid #31415a;background:#05070a;color:#fff;padding:0 14px;font-size:16px;direction:ltr;text-align:left}input:focus{outline:2px solid #0066ff;border-color:transparent}button{width:100%;margin-top:16px;height:48px;border:0;background:#a3ff12;color:#071006;font-weight:800;font-size:14px;cursor:pointer}button:hover{filter:brightness(1.06)}.error{padding:10px 12px;margin:0 0 16px;border:1px solid #743d43;color:#ffb5bb;background:#35151a;font-size:13px}.foot{margin-top:22px!important;margin-bottom:0!important;font-size:11px!important;color:#728099!important}</style><main class="card"><div class="brand">ZEZO<span class="planet">.</span> / STAGING</div><div class="eyebrow">PRIVATE TEST ENVIRONMENT</div><h1>دخول بيئة الاختبار</h1><p>أدخل كلمة المرور التي ظهرت في نافذة تشغيل ZEZO على جهازك.</p>' + (message ? '<div class="error" role="alert">' + message + '</div>' : '') + '<form method="post" action="/__staging/login"><label for="password">كلمة مرور المعاينة</label><input id="password" name="password" type="password" autocomplete="current-password" maxlength="200" required autofocus><button type="submit">دخول آمن ↗</button></form><p class="foot">بيانات تجريبية مستقلة. لا تستخدم بيانات حقيقية.</p></main></html>';
@@ -1280,6 +1276,9 @@ function cancelWithdrawalForLead(lead, actor = null) {
 async function handle(req, res) {
   if (!postgresConfigured()) return handleRequest(req, res);
   const path = new URL(req.url, `http://localhost:${PORT}`).pathname;
+  // Health checks disclose no store data or mutable state. Keep them outside the
+  // compatibility-store transaction so probes do not queue behind business writes.
+  if (req.method === 'GET' && path === '/api/health') return handleRequest(req, res);
   if (!path.startsWith('/api/')) {
     return withPostgresTransaction(async client => {
       await loadPostgresStore(client);
@@ -1340,21 +1339,17 @@ async function handleRequest(req, res) {
       return res.end(stagingLoginPage('تعذر قراءة كلمة المرور. حاول مرة أخرى.'));
     }
     const submittedPassword = new URLSearchParams(raw.toString('utf8')).get('password') || '';
-    const submittedHash = createHash('sha256').update(submittedPassword).digest();
-    if (!timingSafeEqual(submittedHash, STAGING_ACCESS_PASSWORD_HASH)) {
+    if (!stagingPasswordMatches(submittedPassword)) {
       res.writeHead(401, { ...security, 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
       return res.end(stagingLoginPage('كلمة المرور غير صحيحة.'));
     }
-    const sessionId = randomBytes(32).toString('base64url');
-    const maxAge = 12 * 60 * 60;
-    stagingSessions.set(sessionId, { expiresAt: Date.now() + maxAge * 1000 });
-    const accessCookie = 'zezo_staging_access=' + sessionId + '; Path=/; Max-Age=' + maxAge + '; HttpOnly; SameSite=Strict' + (requestIsSecure(req) ? '; Secure' : '');
+    const sessionId = createStagingSession();
+    const accessCookie = STAGING_ACCESS_COOKIE + '=' + encodeURIComponent(sessionId) + '; Path=/; Max-Age=' + STAGING_SESSION_TTL_SECONDS + '; HttpOnly; SameSite=Strict' + (requestIsSecure(req) ? '; Secure' : '');
     res.writeHead(303, { ...security, Location: '/', 'Set-Cookie': accessCookie, 'Cache-Control': 'no-store' });
     return res.end();
   }
   if (STAGING_MODE && path === '/__staging/logout') {
-    stagingSessions.delete(cookieValue(req, 'zezo_staging_access'));
-    const clearCookie = 'zezo_staging_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict' + (requestIsSecure(req) ? '; Secure' : '');
+    const clearCookie = STAGING_ACCESS_COOKIE + '=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict' + (requestIsSecure(req) ? '; Secure' : '');
     res.writeHead(303, { ...security, Location: '/', 'Set-Cookie': clearCookie, 'Cache-Control': 'no-store' });
     return res.end();
   }
