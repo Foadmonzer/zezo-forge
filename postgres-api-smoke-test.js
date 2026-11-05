@@ -379,7 +379,7 @@ try {
     ]);
     if (quoteWhileLocked?.done && quoteWhileLocked.value.status === 201) {
       const staffAcceptance = await request('POST', `/api/conversations/${syntheticConversationId}/accept-quote`, { cookie: employees.order_manager.cookie });
-      assert.equal(staffAcceptance.status, 403, 'An Order Manager must not accept a quote on behalf of the customer.');
+      assert(staffAcceptance.status === 403, 'An Order Manager must not accept a quote on behalf of the customer.');
       acceptWhileLocked = await Promise.race([
         request('POST', `/api/conversations/${syntheticConversationId}/accept-quote`, { cookie: customerCookie }).then(value => ({ done: true, value })),
         new Promise(resolve => setTimeout(() => resolve({ done: false }), 1500))
