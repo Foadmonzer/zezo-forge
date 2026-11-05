@@ -1,14 +1,13 @@
 name: ZEZO PR CI
 
-on:
-  pull_request:
+on: [pull_request, push]
 
 permissions:
   contents: read
 
 jobs:
   verify-pr-2:
-    if: github.event.pull_request.number == 2 && github.event.pull_request.head.ref == 'codex/nextjs-migration-20261104'
+    if: (github.event_name == 'pull_request' && github.event.pull_request.number == 2 && github.event.pull_request.head.ref == 'codex/nextjs-migration-20261104') || (github.event_name == 'push' && github.ref == 'refs/heads/codex/nextjs-migration-20261104')
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -51,7 +50,7 @@ jobs:
       - run: pnpm build
 
   browser-e2e-pr-2:
-    if: github.event.pull_request.number == 2 && github.event.pull_request.head.ref == 'codex/nextjs-migration-20261104'
+    if: (github.event_name == 'pull_request' && github.event.pull_request.number == 2 && github.event.pull_request.head.ref == 'codex/nextjs-migration-20261104') || (github.event_name == 'push' && github.ref == 'refs/heads/codex/nextjs-migration-20261104')
     runs-on: ubuntu-latest
     timeout-minutes: 35
     env:
@@ -105,3 +104,4 @@ jobs:
             artifacts/playwright-report
           if-no-files-found: warn
           retention-days: 14
+
