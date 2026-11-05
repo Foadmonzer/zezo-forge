@@ -49,3 +49,59 @@ jobs:
           BENCH_CONCURRENCY: 6
         run: node scripts/run-ci-postgres.mjs
       - run: pnpm build
+
+  browser-e2e-pr-2:
+    if: github.event.pull_request.number == 2 && github.event.pull_request.head.ref == 'codex/nextjs-migration-20261104'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      DATABASE_URL: postgresql://zezo_ci@127.0.0.1:5432/zezo_ci
+      ZEZO_DATA_DIR: ${{ runner.temp }}/zezo-browser-e2e-data
+      ZEZO_STAGING: 'false'
+      NODE_ENV: production
+      PLAYWRIGHT_BASE_URL: http://127.0.0.1:3000
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: zezo_ci
+          POSTGRES_DB: zezo_ci
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zezo_ci -d zezo_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Install pinned browser test runner
+        run: |
+          npm install --prefix e2e --package-lock-only --ignore-scripts --no-audit --no-fund
+          npm ci --prefix e2e --ignore-scripts --no-audit --no-fund
+      - name: Install Chromium, Firefox, and WebKit with system dependencies
+        run: ./e2e/node_modules/.bin/playwright install --with-deps
+      - name: Migrate isolated browser-test database
+        run: pnpm exec prisma migrate deploy
+      - run: pnpm build
+      - name: Run browser tests across engines, viewports, templates, and synthetic roles
+        run: node e2e/node_modules/@playwright/test/cli.js test --config=e2e/playwright.config.mjs
+      - name: Upload screenshots and Playwright traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zezo-playwright-${{ github.run_number }}
+          path: |
+            artifacts/playwright-results
+            artifacts/playwright-report
+          if-no-files-found: warn
+          retention-days: 14

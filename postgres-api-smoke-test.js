@@ -34,6 +34,7 @@ function assert(condition, message) {
 }
 
 async function request(method, path, { body, rawBody, contentType = 'application/json', cookie = '' } = {}) {
+  const startedAt = performance.now();
   const requestBytes = rawBody !== undefined ? Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody) : body === undefined ? null : Buffer.from(JSON.stringify(body));
   const req = Readable.from(requestBytes?.length ? [requestBytes] : []);
   req.method = method;
@@ -62,7 +63,7 @@ async function request(method, path, { body, rawBody, contentType = 'application
   const text = Buffer.concat(res.chunks).toString('utf8');
   let data = {};
   try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
-  return { status: res.statusCode, headers: res.responseHeaders, data, bytes: Buffer.concat(res.chunks) };
+  return { status: res.statusCode, headers: res.responseHeaders, data, bytes: Buffer.concat(res.chunks), durationMs: performance.now() - startedAt };
 }
 
 function multipartForm(fields, file, boundary) {
@@ -497,8 +498,21 @@ try {
     body: { leadId: syntheticLeadId, amount: 200, kind: 'payment', verified: true, idempotencyKey }, cookie: ownerCookie
   })));
   assert(concurrentDuplicates.every(result => result.status === 200 && result.data.duplicate === true), 'Concurrent duplicate payment requests were not idempotent.');
+  const paymentLatency = concurrentDuplicates.map(result => result.durationMs).sort((a, b) => a - b);
+  const percentile = fraction => Number(paymentLatency[Math.max(0, Math.ceil(fraction * paymentLatency.length) - 1)].toFixed(1));
+  const paymentConcurrency = {
+    route: 'POST /api/admin/payment', requests: concurrentDuplicates.length,
+    p50Ms: percentile(0.5), p95Ms: percentile(0.95), maxMs: Number(paymentLatency.at(-1).toFixed(1)),
+    nonDuplicateResponses: concurrentDuplicates.filter(result => !result.data.duplicate).length,
+    errors: concurrentDuplicates.filter(result => result.status !== 200).length
+  };
   const duplicateRows = await client.query('SELECT count(*)::int AS count FROM payments WHERE "requestId" = $1 AND "idempotencyKey" = $2', [syntheticLeadId, idempotencyKey]);
   assert(Number(duplicateRows.rows[0].count) === 1, 'Concurrent payment requests created more than one payment row.');
+  const normalizedCommissions = await client.query('SELECT kind, "ratePercent"::float8 AS rate, amount::float8 AS amount FROM commissions WHERE "requestId" = $1 ORDER BY kind', [syntheticLeadId]);
+  assert(normalizedCommissions.rowCount === 2, 'A project must retain one marketing and one developer commission record.');
+  assert(normalizedCommissions.rows.some(row => row.kind === 'referral' && row.rate === 15 && row.amount === 30), 'The normalized Rookie commission row is missing or incorrect.');
+  assert(normalizedCommissions.rows.some(row => row.kind === 'developer' && row.rate === 25 && row.amount === 50), 'The normalized developer commission row is missing or incorrect.');
+  console.log(`[FINANCE_CONCURRENCY] ${JSON.stringify(paymentConcurrency)}`);
   const developerFile = Buffer.from('%PDF-1.4 synthetic project delivery');
   const developerUpload = await request('POST', `/api/developer/projects/${syntheticLeadId}/files`, {
     ...multipartForm({}, { name: 'synthetic-delivery.pdf', type: 'application/pdf', content: developerFile }, `zezo_delivery_${testSuffix}`),
@@ -522,7 +536,7 @@ try {
   assert(Number(completedDeveloperProject?.commissionAmount) === 50 && Number(completedDeveloperProject?.developerCommissionRate) === 25, 'Developer execution commission was not calculated as 25% of the 200 ILS verified collection.');
   const marketerAfterPayment = await request('GET', '/api/dashboard', { cookie: employees.marketer.cookie });
   assert(marketerAfterPayment.data.leads?.some(row => row.id === syntheticLeadId && Number(row.commissionAmount) === 30), 'Rookie marketing commission was not persisted at 15% of the paid 200 ILS project.');
-  results.push('concurrent duplicate payment requests remain idempotent; project delivery review and completion calculate 25% developer (50 ILS) and 15% marketer (30 ILS) separately');
+  results.push(`concurrent duplicate payment requests remain idempotent (p50 ${paymentConcurrency.p50Ms}ms / p95 ${paymentConcurrency.p95Ms}ms; one payment row); normalized project commissions retain 25% developer (50 ILS) and 15% marketer (30 ILS) separately`);
 
   const storedConversation = await client.query('SELECT count(*)::int AS count FROM conversations WHERE id = $1', [syntheticConversationId]);
   const storedMessages = await client.query('SELECT count(*)::int AS count FROM conversation_messages WHERE "conversationId" = $1', [syntheticConversationId]);
