@@ -55,7 +55,7 @@ jobs:
     timeout-minutes: 35
     env:
       DATABASE_URL: postgresql://zezo_ci@127.0.0.1:5432/zezo_ci
-      ZEZO_DATA_DIR: ${{ runner.temp }}/zezo-browser-e2e-data
+      ZEZO_DATA_DIR: ${{ github.workspace }}/../zezo-browser-e2e-data
       ZEZO_STAGING: 'false'
       NODE_ENV: production
       PLAYWRIGHT_BASE_URL: http://127.0.0.1:3000
