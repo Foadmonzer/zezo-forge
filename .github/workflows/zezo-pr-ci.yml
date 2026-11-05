@@ -52,9 +52,12 @@ jobs:
   browser-e2e-pr-2:
     if: (github.event_name == 'pull_request' && github.event.pull_request.number == 2 && github.event.pull_request.head.ref == 'codex/nextjs-migration-20261104') || (github.event_name == 'push' && github.ref == 'refs/heads/codex/nextjs-migration-20261104')
     runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.64.1-noble
+      options: --ipc=host
     timeout-minutes: 35
     env:
-      DATABASE_URL: postgresql://zezo_ci@127.0.0.1:5432/zezo_ci
+      DATABASE_URL: postgresql://zezo_ci@postgres:5432/zezo_ci
       ZEZO_DATA_DIR: ${{ github.workspace }}/../zezo-browser-e2e-data
       ZEZO_STAGING: 'false'
       PLAYWRIGHT_BASE_URL: http://127.0.0.1:3000
@@ -86,8 +89,8 @@ jobs:
         run: |
           npm install --prefix e2e --package-lock-only --ignore-scripts --no-audit --no-fund
           npm ci --prefix e2e --ignore-scripts --no-audit --no-fund
-      - name: Install Chromium, Firefox, and WebKit with system dependencies
-        run: ./e2e/node_modules/.bin/playwright install --with-deps
+      - name: Verify pinned Playwright browsers are available
+        run: node -e "const { chromium, firefox, webkit } = require('./e2e/node_modules/playwright'); for (const browser of [chromium, firefox, webkit]) require('fs').accessSync(browser.executablePath())"
       - name: Migrate isolated browser-test database
         run: pnpm exec prisma migrate deploy
       - name: Run browser tests across engines, viewports, templates, and synthetic roles
