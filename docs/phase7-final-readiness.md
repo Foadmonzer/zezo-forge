@@ -32,7 +32,7 @@
   |---|---:|---:|
   | Login | 431.5 / 842.6 | 239.6 / 244.1 |
   | Conversations | 147.5 / 281.3 | 5.0 / 7.8 |
-  | Generic dashboard | 191.7 / 330.7 | 6.6 / 11.1 |
+  | Client dashboard | 191.7 / 330.7 | 6.6 / 11.1 |
   | Order Manager dashboard | 140.5 / 275.9 | 8.6 / 10.5 |
   | Owner dashboard | 140.5 / 281.8 | 29.7 / 37.2 |
   | Marketer dashboard | 142.9 / 269.8 | 7.7 / 10.9 |
