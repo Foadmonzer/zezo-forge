@@ -302,9 +302,9 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   const leadCard = ownerPage.locator(`[data-lead-card="${leadId}"]`);
   await expect(leadCard).toBeVisible();
   if (!(await leadCard.evaluate(element => element.open))) await leadCard.locator(':scope > summary').click();
-  const waitForOwnerDashboardWrite = async (path, action) => {
+  const waitForOwnerDashboardWrite = async (path, action, method = 'PATCH') => {
     const mutation = ownerPage.waitForResponse(response =>
-      new URL(response.url()).pathname === path && response.request().method() === 'PATCH'
+      new URL(response.url()).pathname === path && response.request().method() === method
     );
     const refresh = ownerPage.waitForResponse(response =>
       new URL(response.url()).pathname === '/api/dashboard' &&
@@ -313,7 +313,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
     );
     await action();
     const response = await mutation;
-    if (!response.ok()) throw new Error(`Owner update failed: ${response.status()} ${path}`);
+    if (!response.ok()) throw new Error(`Owner update failed: ${response.status()} ${method} ${path}`);
     await refresh;
   };
   await leadCard.locator('[data-lead-edit] [name="contractAmount"]').first().fill('200');
@@ -336,7 +336,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await payment.locator('[name="amount"]').fill('200');
   await payment.locator('[name="note"]').fill('Synthetic manual payment; no funds moved.');
   await payment.locator('[name="verified"]').check();
-  await payment.locator('button[type="submit"]').click();
+  await waitForOwnerDashboardWrite('/api/admin/payment', () => payment.locator('button[type="submit"]').click(), 'POST');
   await expect(leadCard).toContainText('200');
 
   // Developer accepts, submits synthetic delivery; Owner reviews and completes it.
@@ -345,18 +345,41 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await devPage.locator('[data-dash-tab="development"]').click();
   const project = devPage.locator(`[data-project-card="${leadId}"]`);
   await expect(project).toBeVisible();
-  await project.locator('[data-task-decision="accept"]').click();
+  const waitForDeveloperDashboardWrite = async (path, action, method) => {
+    const mutation = devPage.waitForResponse(response =>
+      new URL(response.url()).pathname === path && response.request().method() === method
+    );
+    const refresh = devPage.waitForResponse(response =>
+      new URL(response.url()).pathname === '/api/dashboard' &&
+      response.request().method() === 'GET' &&
+      response.ok()
+    );
+    await action();
+    const response = await mutation;
+    if (!response.ok()) throw new Error(`Developer update failed: ${response.status()} ${method} ${path}`);
+    await refresh;
+  };
+  await waitForDeveloperDashboardWrite(`/api/developer/projects/${encodeURIComponent(leadId)}/decision`, () =>
+    project.locator('[data-task-decision="accept"]').click(), 'POST'
+  );
   await project.evaluate(element => { element.open = true; });
-  await expect(project.locator(`[data-dev-file="${leadId}"]`)).toBeVisible();
-  await project.locator(`[data-dev-file="${leadId}"] input[type="file"]`).setInputFiles({
+  const devFileForm = project.locator(`[data-dev-file="${leadId}"]`);
+  await expect(devFileForm).toBeVisible();
+  await devFileForm.locator('input[type="file"]').setInputFiles({
     name: 'synthetic-delivery.txt', mimeType: 'text/plain', buffer: Buffer.from('Synthetic browser-only delivery file.')
   });
-  await project.locator(`[data-dev-file="${leadId}"] button[type="submit"]`).click();
-  await expect(project).toContainText('synthetic-delivery.txt', { timeout: 30_000 });
+  await waitForDeveloperDashboardWrite(`/api/developer/projects/${encodeURIComponent(leadId)}/files`, () =>
+    devFileForm.locator('button[type="submit"]').click(), 'POST'
+  );
   await project.evaluate(element => { element.open = true; });
-  await project.locator(`[data-dev-progress="${leadId}"] [name="status"]`).selectOption('review_requested');
-  await project.locator(`[data-dev-progress="${leadId}"] [name="note"]`).fill('Synthetic delivery sent for review.');
-  await project.locator(`[data-dev-progress="${leadId}"] button[type="submit"]`).click();
+  await expect(project).toContainText('synthetic-delivery.txt', { timeout: 30_000 });
+  const devProgress = project.locator(`[data-dev-progress="${leadId}"]`);
+  await expect(devProgress).toBeVisible();
+  await devProgress.locator('[name="status"]').selectOption('review_requested');
+  await devProgress.locator('[name="note"]').fill('Synthetic delivery sent for review.');
+  await waitForDeveloperDashboardWrite(`/api/developer/projects/${encodeURIComponent(leadId)}`, () =>
+    devProgress.locator('button[type="submit"]').click(), 'PATCH'
+  );
   await workspaceViewportMatrix(devPage, 'development', 'developer', testInfo);
   await devPage.close();
 
@@ -365,11 +388,15 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   const refreshedLead = ownerPage.locator(`[data-lead-card="${leadId}"]`);
   if (!(await refreshedLead.evaluate(element => element.open))) await refreshedLead.locator(':scope > summary').click();
   await refreshedLead.locator(`[data-developer-review="${leadId}"] [name="decision"]`).selectOption('approved');
-  await refreshedLead.locator(`[data-developer-review="${leadId}"] button[type="submit"]`).click();
+  await waitForOwnerDashboardWrite(`/api/admin/projects/${encodeURIComponent(leadId)}/review`, () =>
+    refreshedLead.locator(`[data-developer-review="${leadId}"] button[type="submit"]`).click(), 'POST'
+  );
+  if (!(await refreshedLead.evaluate(element => element.open))) await refreshedLead.locator(':scope > summary').click();
   await expect(refreshedLead).toContainText('approved', { timeout: 30_000 });
-  await refreshedLead.evaluate(element => { element.open = true; });
   await refreshedLead.locator(`[data-project-stage-form="${leadId}"] [name="stage"]`).selectOption('completed');
-  await refreshedLead.locator(`[data-project-stage-form="${leadId}"] button[type="submit"]`).click();
+  await waitForOwnerDashboardWrite(`/api/admin/projects/${encodeURIComponent(leadId)}/stage`, () =>
+    refreshedLead.locator(`[data-project-stage-form="${leadId}"] button[type="submit"]`).click()
+  );
   await expect(refreshedLead).toContainText('25%');
   await workspaceViewportMatrix(ownerPage, 'requests', 'owner-projects', testInfo);
 
