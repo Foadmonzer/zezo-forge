@@ -37,6 +37,28 @@ export async function queryPostgres(sql, values = []) {
   return client ? client.query(sql, values) : getPool().query(sql, values);
 }
 
+// Short transactions for normalized, row-scoped repositories. Unlike the legacy
+// compatibility transaction, these do not enter the process-wide queue or take
+// the company-state advisory lock. Callers must keep their work bounded and rely
+// on row locks/unique constraints for any conflicting business operation.
+export async function withPostgresScopedTransaction(work) {
+  const activeClient = currentPostgresClient();
+  if (activeClient) return work(activeClient);
+
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const result = await transactionStorage.run(client, () => work(client));
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 export async function consumeRateLimitBucket(bucket, key, max, windowMs) {
   const digest = createHash('sha256').update(`zezo-rate:${bucket}:${key}`).digest('hex');
   if (postgresConfigured()) {
@@ -54,6 +76,13 @@ export async function consumeRateLimitBucket(bucket, key, max, windowMs) {
     : { count: current.count + 1, expiresAt: current.expiresAt };
   fallbackRateBuckets.set(digest, next);
   return next.count <= max;
+}
+
+export async function deleteRateLimitBucket(bucket, key) {
+  const digest = createHash('sha256').update(`zezo-rate:${bucket}:${key}`).digest('hex');
+  if (!postgresConfigured()) return false;
+  const result = await getPool().query('DELETE FROM rate_limit_buckets WHERE key = $1', [digest]);
+  return (result.rowCount || 0) > 0;
 }
 
 export async function closePostgresPool() {

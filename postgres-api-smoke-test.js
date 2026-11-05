@@ -282,6 +282,26 @@ try {
 
   const ownerConversations = await request('GET', '/api/conversations', { cookie: ownerCookie });
   assert(ownerConversations.status === 200 && ownerConversations.data.conversations?.some(row => row.id === syntheticConversationId), 'Owner could not read the persisted customer conversation.');
+  const conversationLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await conversationLockHolder.connect();
+  let coreConversationReads;
+  try {
+    await conversationLockHolder.query('BEGIN');
+    await conversationLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+    coreConversationReads = await Promise.race([
+      Promise.all([
+        request('GET', '/api/conversations', { cookie: ownerCookie }),
+        request('GET', `/api/conversations/${syntheticConversationId}`, { cookie: ownerCookie })
+      ]).then(values => ({ done: true, values })),
+      new Promise(resolve => setTimeout(() => resolve({ done: false }), 1000))
+    ]);
+  } finally {
+    await conversationLockHolder.query('ROLLBACK').catch(() => {});
+    await conversationLockHolder.end();
+  }
+  assert(coreConversationReads?.done && coreConversationReads.values[0].status === 200 && coreConversationReads.values[0].data.conversations?.some(row => row.id === syntheticConversationId) && coreConversationReads.values[1].status === 200,
+    'Authenticated conversation list/detail reads still wait on the global advisory lock or lost their access checks.');
+  results.push('authenticated conversation list and detail reads bypass the global advisory lock while preserving authorization');
   const ownerReply = await request('POST', `/api/conversations/${syntheticConversationId}/messages`, {
     body: { message: 'Synthetic ZEZO reply saved for the database integration test.' }, cookie: ownerCookie
   });
@@ -363,6 +383,26 @@ try {
   assert(orderDashboard.status === 200 && orderDashboard.data.orders?.some(row => row.id === syntheticLeadId), 'Official order was not available after reloading from PostgreSQL.');
   const ownerAfterOrder = await request('GET', '/api/dashboard', { cookie: ownerCookie });
   assert(ownerAfterOrder.status === 200 && ownerAfterOrder.data.leads?.some(row => row.id === syntheticLeadId), 'Owner could not read the persisted official order.');
+  const crmLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await crmLockHolder.connect();
+  let crmWhileLocked;
+  try {
+    await crmLockHolder.query('BEGIN');
+    await crmLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+    crmWhileLocked = await Promise.race([
+      Promise.all([
+        request('GET', '/api/crm', { cookie: ownerCookie }),
+        request('GET', '/api/dashboard', { cookie: customerCookie })
+      ]).then(values => ({ done: true, values })),
+      new Promise(resolve => setTimeout(() => resolve({ done: false }), 1000))
+    ]);
+  } finally {
+    await crmLockHolder.query('ROLLBACK').catch(() => {});
+    await crmLockHolder.end();
+  }
+  assert(crmWhileLocked?.done && crmWhileLocked.values[0].status === 200 && crmWhileLocked.values[0].data.items?.some(row => row.orders?.some(order => order.id === syntheticLeadId)) && crmWhileLocked.values[1].status === 200 && crmWhileLocked.values[1].data.orders?.some(row => row.id === syntheticLeadId),
+    'Targeted CRM or client dashboard read waited on the global advisory lock or omitted the persisted order.');
+  results.push('Owner CRM and client dashboard read normalized records without the global advisory lock');
   results.push('official customer order linked to conversation and visible through CRM dashboards');
 
   const assignment = await request('PATCH', `/api/projects/${syntheticLeadId}/assignment`, {
@@ -371,6 +411,24 @@ try {
   assert(assignment.status === 200, `Owner could not assign the synthetic project (${assignment.status}).`);
   const developerDashboard = await request('GET', '/api/dashboard', { cookie: employees.developer.cookie });
   assert(developerDashboard.status === 200 && developerDashboard.data.projects?.some(project => project.id === syntheticLeadId), 'Developer did not see the assigned project.');
+  const employeeLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await employeeLockHolder.connect();
+  let developerDashboardWhileLocked;
+  try {
+    await employeeLockHolder.query('BEGIN');
+    await employeeLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+    developerDashboardWhileLocked = await Promise.race([
+      request('GET', '/api/dashboard', { cookie: employees.developer.cookie }).then(value => ({ done: true, value })),
+      new Promise(resolve => setTimeout(() => resolve({ done: false }), 1000))
+    ]);
+  } finally {
+    await employeeLockHolder.query('ROLLBACK').catch(() => {});
+    await employeeLockHolder.end();
+  }
+  assert(developerDashboardWhileLocked?.done && developerDashboardWhileLocked.value.status === 200 && developerDashboardWhileLocked.value.data.projects?.some(project => project.id === syntheticLeadId),
+    'Developer dashboard still waited on the global advisory lock or lost the assigned project.');
+  assert(!developerDashboardWhileLocked.value.data.projects?.some(project => project.id !== syntheticLeadId), 'Developer dashboard exposed another employee project.');
+  results.push('developer dashboard reads scoped project, commission, wallet, and referral data without the global advisory lock');
   const developerDecision = await request('POST', `/api/developer/projects/${syntheticLeadId}/decision`, {
     body: { decision: 'accept', note: 'Synthetic acceptance for the database test.' }, cookie: employees.developer.cookie
   });

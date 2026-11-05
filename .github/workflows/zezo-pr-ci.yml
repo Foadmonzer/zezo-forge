@@ -1,0 +1,54 @@
+name: ZEZO PR CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-pr-2:
+    if: github.event.pull_request.number == 2 && github.event.pull_request.head.ref == 'codex/nextjs-migration-20261104'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: zezo_ci
+          POSTGRES_DB: zezo_ci
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zezo_ci -d zezo_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test:smoke
+      - run: pnpm test:staging
+      - run: pnpm test:staging-auth
+      - run: pnpm exec prisma validate
+      - name: Migrate and test on isolated PostgreSQL
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: 5432
+          PGUSER: zezo_ci
+          PGDATABASE: zezo_ci
+        run: node scripts/run-ci-postgres.mjs
+      - name: Compare core read paths under synthetic concurrency
+        env:
+          BENCH_SAMPLES: 12
+          BENCH_CONCURRENCY: 6
+        run: node postgres-core-read-benchmark.js
+      - run: pnpm build

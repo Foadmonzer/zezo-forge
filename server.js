@@ -7,10 +7,11 @@ import { randomBytes, scryptSync, timingSafeEqual, createHash, createHmac } from
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { templateCatalog, templateById } from './public/template-catalog.js';
 import { buildWhatsAppUrl, normalizeWhatsAppNumber } from './public/whatsapp.js';
-import { currentPostgresClient, postgresConfigured, withPostgresTransaction } from './src/server/postgres-runtime.js';
+import { consumeRateLimitBucket, currentPostgresClient, deleteRateLimitBucket, postgresConfigured, withPostgresTransaction } from './src/server/postgres-runtime.js';
 import { createStagingSession, isStagingSessionValid, STAGING_ACCESS_COOKIE, STAGING_SESSION_TTL_SECONDS, stagingPasswordMatches } from './src/server/staging-auth.js';
 import { deleteReferralTrackingForVisitor, loadNormalizedStore, persistNormalizedStore } from './src/server/postgres-store.js';
 import { loadPublicRuntimeSnapshot, loadPublicTrackRecord } from './src/server/public-read-repository.js';
+import { claimGuestConversations, findLoginAccount, loadClientDashboardData, loadConversationViews, loadCrmRecordsForViewer, loadCrmRelatedRows, loadEmployeeDashboardData, loadReferralEventsForUsers, loadSessionAccount, storeLoginSessionAndAudit } from './src/server/core-read-repository.js';
 import { claimNextOutboxMessage, completeOutboxMessage } from './src/server/outbox-repository.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -865,6 +866,193 @@ function requireAuth(req, res, allowed = allRoles) {
   if (!allowed.includes(auth.user.role)) { json(res, 403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }); return null; }
   return auth;
 }
+async function directPostgresSessionUser(req) {
+  const sid = cookieValue(req, 'zezo_session');
+  if (!sid) return null;
+  const session = await loadSessionAccount(sessionKey(sid));
+  return session ? { user: session.user, sid } : null;
+}
+function directRequireAuth(req, res, user, allowed = allRoles) {
+  if (!user) { json(res, 401, { error: 'سجّل الدخول للمتابعة / Please sign in to continue' }, responseSecurityHeaders()); return false; }
+  const route = new URL(req.url, 'http://localhost').pathname;
+  if (user.mustChangePassword && !['/api/auth/password','/api/auth/logout'].includes(route)) {
+    json(res, 428, { error: 'غيّر كلمة المرور المؤقتة أولاً / Change the temporary password first', mustChangePassword: true }, responseSecurityHeaders()); return false;
+  }
+  if (sensitiveManagementRole(user.role) && !user.mfaEnabledAt && !['/api/auth/mfa/setup','/api/auth/mfa/enable','/api/auth/password','/api/auth/logout'].includes(route)) {
+    json(res, 428, { error: 'أكمل إعداد التحقق بخطوتين قبل استخدام مساحة الإدارة / Complete two-step verification setup before using the management workspace', mfaSetupRequired: true }, responseSecurityHeaders()); return false;
+  }
+  if (!allowed.includes(user.role)) { json(res, 403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }, responseSecurityHeaders()); return false; }
+  return true;
+}
+function directCrmAggregate(records, events, { from = '', to = '', service = '' } = {}) {
+  let selectedEvents = events;
+  if (service) selectedEvents = selectedEvents.filter(event =>
+    (['service_view', 'whatsapp_click'].includes(event.type) && event.resourceId === service) ||
+    (event.type === 'template_view' && templateById.get(event.resourceId)?.service === service)
+  );
+  const count = status => records.filter(row => row.status === status).length;
+  const sales = new Set(records.filter(row => row.status === 'completed_sale').flatMap(row => row.orderIds || []));
+  const requests = new Set(records.flatMap(row => row.orderIds || []));
+  const services = {};
+  for (const record of records) if (record.service) services[record.service] = (services[record.service] || 0) + 1;
+  const responseMinutes = records.map(row => {
+    const first = (row.history || []).find(item => item.kind === 'status_changed' && ['contacted', 'interested', 'follow_up'].includes(item.status));
+    return first ? Math.max(0, (Date.parse(first.at) - Date.parse(row.createdAt)) / 60000) : null;
+  }).filter(Number.isFinite);
+  const distinctVisits = new Set(selectedEvents.filter(event => service ? ['service_view', 'template_view', 'whatsapp_click'].includes(event.type) : event.type === 'visit').map(event => event.visitorHash).filter(Boolean));
+  const typeCount = type => selectedEvents.filter(event => event.type === type).length;
+  const fromTime = from ? Date.parse(`${from}T00:00:00.000Z`) : -Infinity;
+  const toTime = to ? Date.parse(`${to}T23:59:59.999Z`) : Infinity;
+  return {
+    total: records.length, visits: distinctVisits.size, serviceViews: typeCount('service_view'), templateViews: typeCount('template_view'),
+    whatsappClicks: typeCount('whatsapp_click'), confirmedEnquiries: records.filter(row => row.status !== 'duplicate' && !row.mergedInto).length,
+    newEnquiries: count('new_enquiry'), awaitingContact: records.filter(row => ['awaiting_contact', 'new_enquiry'].includes(row.status)).length,
+    followUps: records.filter(row => row.status === 'follow_up' && row.followUpAt).length,
+    quotes: records.filter(row => ['quote_pending', 'quote_sent', 'quote_accepted'].includes(row.status)).length,
+    quoteAcceptances: typeCount('quote_accepted'), orders: requests.size, sales: sales.size,
+    conversionRate: requests.size ? Math.round(sales.size / requests.size * 1000) / 10 : 0,
+    averageFirstResponseMinutes: responseMinutes.length ? Math.round(responseMinutes.reduce((sum, value) => sum + value, 0) / responseMinutes.length) : null,
+    topServices: Object.entries(services).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([serviceName, total]) => ({ service: serviceName, count: total })),
+    duplicates: records.filter(row => row.duplicateCandidates?.length || row.status === 'duplicate').length,
+    overdueFollowUps: records.filter(row => row.followUpAt && Date.parse(row.followUpAt) < Date.now() && !['completed_sale', 'cancelled', 'not_interested', 'duplicate'].includes(row.status)).length
+  };
+}
+async function handlePostgresCoreRead(req, res, path) {
+  if (!stagingAuthorized(req)) return false;
+  const security = responseSecurityHeaders();
+  if (req.method === 'POST' && path === '/api/auth/login') {
+    const body = await jsonBody(req);
+    const username = clean(body.username, 150).toLowerCase();
+    const key = `${req.socket.remoteAddress || 'unknown'}:${username}`;
+    if (!await consumeRateLimitBucket('login', key, 8, 15 * 60_000)) {
+      json(res, 429, { error: 'محاولات كثيرة. جرّب بعد 15 دقيقة / Too many attempts; try again in 15 minutes' }, security); return true;
+    }
+    const user = await findLoginAccount(username);
+    if (!user || !passwordMatches(String(body.password || ''), user) || !accountTypes[body.accountType]?.includes(user.role)) {
+      json(res, 401, { error: 'اسم المستخدم أو كلمة المرور غير صحيحة لهذا النوع من الدخول / Incorrect username or password for this sign-in type' }, security); return true;
+    }
+    if (sensitiveManagementRole(user.role) && user.mfaEnabledAt && !validTotp(user.mfaSecret, body.mfaCode)) {
+      json(res, 401, { error: 'أدخل رمز تطبيق المصادقة الحالي / Enter the current authenticator code', mfaRequired: true }, security); return true;
+    }
+    const sid = token(), at = now(), expiresAt = new Date(Date.now() + SESSION_TTL);
+    await storeLoginSessionAndAudit({ sessionHash: sessionKey(sid), user, expiresAt, auditId: id('evt'), at });
+    loginAttempts.delete(key);
+    await deleteRateLimitBucket('login', key);
+    json(res, 200, { user: publicUser(user) }, { ...security, 'Set-Cookie': cookie('zezo_session', sid, SESSION_TTL / 1000, req) });
+    return true;
+  }
+
+  if (req.method === 'GET' && path === '/api/dashboard') {
+    const auth = await directPostgresSessionUser(req);
+    if (auth?.user.role === 'client') {
+      if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
+      const guest = guestSessionValue(req);
+      if (guest) await claimGuestConversations(auth.user.id, hash(guest), now());
+      const [clientData, conversations] = await Promise.all([
+        loadClientDashboardData(auth.user.id),
+        loadConversationViews(auth.user)
+      ]);
+      const orders = clientData.leads.map(lead => safeClientOrder(lead, clientData.payments));
+      json(res, 200, {
+        role: 'client', user: publicUser(auth.user), profile: clientProfile(auth.user), orders, conversations,
+        mailConfigured: emailReady()
+      }, security);
+      return true;
+    }
+    if (['marketer', 'developer'].includes(auth?.user.role)) {
+      if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
+      const data = await loadEmployeeDashboardData(auth.user.id);
+      // dashboardFor is a synchronous, read-only serializer for these two roles.
+      // Swap in the scoped snapshot only during that synchronous call so another
+      // request can never observe or mutate this temporary view.
+      const previousStore = store;
+      try {
+        store = { ...defaultStore(), ...data, users: [auth.user] };
+        json(res, 200, dashboardFor(auth.user), security);
+      } finally {
+        store = previousStore;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  if (req.method === 'GET' && path === '/api/conversations') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, allRoles)) return true;
+    const guest = auth.user.role === 'client' ? guestSessionValue(req) : '';
+    if (guest) await claimGuestConversations(auth.user.id, hash(guest), now());
+    const scope = effectivePermission(auth.user, 'conversations.read');
+    const conversations = await loadConversationViews(auth.user, { permissionScope: scope, department: auth.user.department || roleDepartment(auth.user.role) });
+    json(res, 200, { conversations }, security);
+    return true;
+  }
+
+  const singleConversation = req.method === 'GET' && /^\/api\/conversations\/[^/]+$/.test(path);
+  if (singleConversation) {
+    const auth = await directPostgresSessionUser(req);
+    const guest = guestSessionValue(req);
+    let user = auth?.user;
+    if (user?.role === 'client' && guest) await claimGuestConversations(user.id, hash(guest), now());
+    if (!user && guest) user = { id: '', role: 'guest' };
+    if (!user) { json(res, 404, { error: 'المحادثة غير موجودة / Conversation not found' }, security); return true; }
+    const conversationId = path.split('/').at(-1);
+    const rows = await loadConversationViews(user, {
+      conversationId, guestHash: guest ? hash(guest) : '',
+      permissionScope: user.role === 'admin' ? 'all' : effectivePermission(user, 'conversations.read'),
+      department: user.department || roleDepartment(user.role)
+    });
+    if (!rows.length) { json(res, 404, { error: 'المحادثة غير موجودة / Conversation not found' }, security); return true; }
+    json(res, 200, { conversation: rows[0] }, security);
+    return true;
+  }
+
+  if (req.method === 'GET' && path === '/api/crm') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, ['admin', 'marketing_manager', 'hr_manager', 'marketer', 'developer'])) return true;
+    const user = auth.user;
+    const from = clean(new URL(req.url, `http://localhost:${PORT}`).searchParams.get('from'), 10);
+    const to = clean(new URL(req.url, `http://localhost:${PORT}`).searchParams.get('to'), 10);
+    const status = clean(new URL(req.url, `http://localhost:${PORT}`).searchParams.get('status'), 32);
+    const employee = clean(new URL(req.url, `http://localhost:${PORT}`).searchParams.get('employee'), 80);
+    const service = clean(new URL(req.url, `http://localhost:${PORT}`).searchParams.get('service'), 60);
+    const search = clean(new URL(req.url, `http://localhost:${PORT}`).searchParams.get('q'), 120).toLowerCase();
+    if (user.role === 'admin' || user.role === 'marketing_manager') {
+      const permissionScope = effectivePermission(user, 'orders.manage');
+      if (user.role !== 'admin' && !permissionDefinitions['orders.manage']?.includes(permissionScope)) {
+        json(res, 403, { error: 'لا تملك صلاحية إدارة سجلات العملاء / You cannot manage CRM records' }, security); return true;
+      }
+      if ((from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) || (to && !/^\d{4}-\d{2}-\d{2}$/.test(to)) || (status && !crmStatuses.includes(status)) || (service && !Object.hasOwn(serviceCategories, service))) {
+        json(res, 400, { error: 'فلاتر CRM غير صالحة / Invalid CRM filters' }, security); return true;
+      }
+    }
+    const filters = (user.role === 'admin' || user.role === 'marketing_manager') ? { from, to, status, employee, service, search } : {};
+    const scope = effectivePermission(user, 'orders.manage');
+    const records = await loadCrmRecordsForViewer({ user, scope, filters });
+    const referralUsers = [...new Set(records.map(row => row.referralUserId).filter(Boolean))];
+    const events = await loadReferralEventsForUsers(referralUsers, (user.role === 'admin' || user.role === 'marketing_manager') ? { from, to } : {});
+    if (user.role === 'hr_manager' || user.role === 'marketer' || user.role === 'developer') {
+      json(res, 200, { scope: user.role === 'hr_manager' ? 'aggregate' : 'own_referrals', summary: directCrmAggregate(records, events) }, security);
+      return true;
+    }
+    const related = await loadCrmRelatedRows(records);
+    const items = records.map(record => ({
+      ...record,
+      orders: (record.orderIds || []).map(id => related.orders.get(id)).filter(Boolean).map(order => ({
+        id: order.id, status: order.status, service: order.service, category: order.category, createdAt: order.createdAt,
+        contractAmount: order.contractAmount, paidTotal: order.paidTotal, quoteAccepted: Boolean(order.quoteAcceptedAt),
+        referralUserId: order.referralUserId || null, referralName: related.users.get(order.referralUserId)?.name || '',
+        referralCode: order.referralCode || '', isDuplicate: Boolean(order.isDuplicate)
+      })),
+      assignedName: related.users.get(record.assignedUserId)?.name || '',
+      referrerName: related.users.get(record.referralUserId)?.name || '',
+      whatsappUrl: !STAGING_MODE && isE164Phone(record.phone) ? `https://wa.me/${record.phone.replace(/\D/g, '')}` : ''
+    }));
+    json(res, 200, { scope: 'team', summary: directCrmAggregate(records, events, { from, to, service }), filtered: records.length, items: items.slice(0, 500), filters: { from, to, status, employee, service, q: search } }, security);
+    return true;
+  }
+  return false;
+}
 async function bodyBuffer(req) {
   const declared = Number(req.headers['content-length'] || 0);
   if (declared > MAX_BODY) throw Object.assign(new Error('حجم الطلب أكبر من المسموح (6MB)'), { status: 413 });
@@ -1165,7 +1353,7 @@ function safeDeveloperProject(lead) {
     attachments:(lead.attachments||[]).map(a=>({name:a.originalName,size:a.size})),
     developerAttachments:(lead.developerAttachments||[]).map(a=>({name:a.originalName,size:a.size})) };
 }
-function safeClientOrder(lead){
+function safeClientOrder(lead,paymentRows=store.payments){
   const canSeeDeliverables=lead.developerReviewStatus==='approved'&&['ready_delivery','waiting_client_review','delivered','completed'].includes(lead.projectStage||'');
   return {
     id:lead.id,createdAt:lead.createdAt,language:lead.language||'ar',name:lead.name,email:lead.email,phone:lead.clientWhatsappPhone||lead.phone||'',
@@ -1175,7 +1363,7 @@ function safeClientOrder(lead){
     templateId:lead.templateId||'',templateName:lead.templateName||'',templateAction:lead.templateAction||'',
     paymentStatus:Number(lead.paidTotal||0)<=0?'unpaid':Number(lead.paidTotal||0)<Number(lead.contractAmount||0)?'partial':'collected',
     paidTotal:Number(lead.paidTotal||0),balanceDue:money(Math.max(0,Number(lead.contractAmount||0)-Number(lead.paidTotal||0))),
-    payments:store.payments.filter(payment=>payment.leadId===lead.id).map(payment=>({id:payment.id,at:payment.at||payment.createdAt,kind:payment.kind,amount:Number(payment.amount||0)})),
+    payments:paymentRows.filter(payment=>payment.leadId===lead.id).map(payment=>({id:payment.id,at:payment.at||payment.createdAt,kind:payment.kind,amount:Number(payment.amount||0)})),
     history:(lead.statusHistory||[{status:lead.status,at:lead.createdAt,note:''}]).map(item=>({status:item.status,at:item.at,note:item.note||''})),
     files:[...(lead.attachments||[]).map(a=>({name:a.originalName,size:a.size,kind:'customer_upload'})),...(canSeeDeliverables?(lead.developerAttachments||[]).map((a,index)=>({name:a.originalName,size:a.size,kind:'deliverable',index})):[])],
     canAcceptQuote:lead.status==='proposal'&&Number.isFinite(Number(lead.contractAmount))&&Number(lead.contractAmount)>=0&&!lead.quoteAcceptedAt
@@ -1261,7 +1449,7 @@ function dashboardFor(user) {
     team:canViewEmployees?store.users.filter(u=>roles.includes(u.role)&&u.role!=='admin'&&hasPermission(user,'employees.read',{ownerId:u.id,department:u.department||roleDepartment(u.role)})).map(publicUser):[],leads:permissionEnabled(user,'orders.manage')?allLeads.filter(l=>hasPermission(user,'orders.manage',{assigneeId:l.orderManagerUserId||'',ownerId:l.clientId||'',department:'orders'})).map(l=>safeOrderLead(l,true)):[],conversations:store.conversations.filter(item=>conversationAccess(user,item,'conversations.read')).map(item=>safeConversation(item,false)),conversationAssignees:conversationAssigneesFor(user),campaigns:store.campaigns
   };}
   if(user.role==='order_manager')return {role:user.role,user:publicUser(user),currentPermissions:Object.fromEntries(Object.keys(permissionDefinitions).map(key=>[key,effectivePermission(user,key)])),orders:permissionEnabled(user,'orders.manage')?allLeads.filter(l=>hasPermission(user,'orders.manage',{assigneeId:l.orderManagerUserId||'',ownerId:l.clientId||'',department:'orders'})).map(l=>safeOrderLead(l,true)):[],conversations:store.conversations.filter(item=>conversationAccess(user,item,'conversations.read')).map(item=>safeConversation(item,false)),conversationAssignees:conversationAssigneesFor(user)};
-  if(user.role==='client')return {role:'client',user:publicUser(user),profile:clientProfile(user),orders:allLeads.filter(lead=>lead.clientId===user.id).map(safeClientOrder),conversations:store.conversations.filter(item=>item.clientId===user.id).map(item=>safeConversation(item,false)),mailConfigured:emailReady()};
+  if(user.role==='client')return {role:'client',user:publicUser(user),profile:clientProfile(user),orders:allLeads.filter(lead=>lead.clientId===user.id).map(lead=>safeClientOrder(lead)),conversations:store.conversations.filter(item=>item.clientId===user.id).map(item=>safeConversation(item,false)),mailConfigured:emailReady()};
   const referrals = allLeads.filter(l => l.referralUserId === user.id);
   const wallet=walletFor(user.id);
   const referralMetrics=referralMetricsFor(user.id);
@@ -1340,6 +1528,10 @@ async function handle(req, res) {
     const lang = url.searchParams.get('lang') === 'en' ? 'en' : 'ar';
     return json(res, 200, { createdAt: lead.createdAt, service: lead.service, status: lead.status, statusText: publicStatusLabels[lead.status]?.[lang] || publicStatusLabels.new[lang], note: lead.publicStatusNote || '' }, responseSecurityHeaders());
   }
+  const normalizedReadHandled = process.env.ZEZO_BENCH_LEGACY_CORE_READS === 'true'
+    ? false
+    : await handlePostgresCoreRead(req, res, path);
+  if (normalizedReadHandled) return;
   if (!path.startsWith('/api/')) {
     return withPostgresTransaction(async client => {
       await loadPostgresStore(client);
