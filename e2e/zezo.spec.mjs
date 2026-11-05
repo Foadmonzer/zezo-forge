@@ -302,18 +302,35 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   const leadCard = ownerPage.locator(`[data-lead-card="${leadId}"]`);
   await expect(leadCard).toBeVisible();
   if (!(await leadCard.evaluate(element => element.open))) await leadCard.locator(':scope > summary').click();
+  const waitForOwnerDashboardWrite = async (path, action) => {
+    const mutation = ownerPage.waitForResponse(response =>
+      new URL(response.url()).pathname === path && response.request().method() === 'PATCH'
+    );
+    const refresh = ownerPage.waitForResponse(response =>
+      new URL(response.url()).pathname === '/api/dashboard' &&
+      response.request().method() === 'GET' &&
+      response.ok()
+    );
+    await action();
+    const response = await mutation;
+    if (!response.ok()) throw new Error(`Owner update failed: ${response.status()} ${path}`);
+    await refresh;
+  };
   await leadCard.locator('[data-lead-edit] [name="contractAmount"]').first().fill('200');
-  await leadCard.locator('[data-lead-edit] button[type="submit"]').first().click();
+  await waitForOwnerDashboardWrite(`/api/admin/leads/${encodeURIComponent(leadId)}`, () =>
+    leadCard.locator('[data-lead-edit] button[type="submit"]').first().click()
+  );
+  if (!(await leadCard.evaluate(element => element.open))) await leadCard.locator(':scope > summary').click();
   const assign = leadCard.locator(`[data-developer-assign="${leadId}"]`);
-  const executionPanel = leadCard.locator('.lead-body details.dash-card').filter({ has: assign });
-  await expect(executionPanel).toBeVisible();
-  await executionPanel.evaluate(element => { element.open = true; });
+  await expect(assign).toBeVisible();
   await assign.locator('[name="developerUserId"]').selectOption(developer.id);
   await assign.locator('[name="developerDueDate"]').fill('2026-12-15');
-  await assign.locator('button[type="submit"]').click();
+  await waitForOwnerDashboardWrite(`/api/projects/${encodeURIComponent(leadId)}/assignment`, () =>
+    assign.locator('button[type="submit"]').click()
+  );
   // Wait for the persisted task status; the developer name also exists in the option list before assignment.
   await expect(leadCard).toContainText('offered', { timeout: 30_000 });
-  await leadCard.evaluate(element => { element.open = true; });
+  if (!(await leadCard.evaluate(element => element.open))) await leadCard.locator(':scope > summary').click();
   const payment = leadCard.locator(`[data-payment-form="${leadId}"]`);
   await expect(payment).toBeVisible();
   await payment.locator('[name="amount"]').fill('200');
