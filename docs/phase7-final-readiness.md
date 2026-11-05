@@ -16,11 +16,31 @@
 
 - Owner, HR, and Marketing Manager dashboard responses still use `loadNormalizedStore` for a consistent read-only snapshot before their existing role serializer. They no longer block behind or rewrite through the global transaction, but they still read a broad set of normalized tables. Replacing that final broad read with per-panel repositories remains a performance task and should be driven by the CI benchmark measurements.
 - Official project request writes, payments, commissions, wallet, and withdrawal mutations still use the compatibility transaction. Their global serialization/idempotency protections were not weakened in this phase. Further write-path migration needs separate row-level repositories and concurrency tests.
-- Local PostgreSQL was unavailable: Docker CLI was present but there was no reachable Docker Engine, and no local PostgreSQL service was installed/listening. PostgreSQL integration and benchmark results therefore depend on the PR CI run.
+- Local PostgreSQL was unavailable: Docker CLI was present but there was no reachable Docker Engine, and no local PostgreSQL service was installed/listening. PostgreSQL integration and benchmark tests ran successfully in the isolated PR CI PostgreSQL 16 service instead.
 - A local production build was attempted three ways but did not finish in this OneDrive workspace: the default `.next` cleanup hit `EPERM`; a separate Turbopack output directory could not create its dependency junction without permission; Webpack hit `EBUSY` reading a pnpm-cached Next.js file. The clean GitHub Actions build is the authoritative build check for this branch.
 - Visual browser QA and the requested 375/390/768/1366/1440 viewport sweep were not completed. A local Next dev server announced readiness on port 4188 but exited with an `EPERM` while cleaning `.next/dev/node_modules`; the Edge automation surface rejected browser visibility. No real phone was tested.
 - The public 40-template catalog is covered by existing smoke checks for all 40 identifiers, their JPEG assets, service counts, and default 200 ILS prices. That is not equivalent to manually opening and interacting with all 40 templates in a browser.
 - No public HTTPS Staging or Production environment was created. No real email or payment integration was enabled.
+
+## Verification on PR CI
+
+- GitHub Actions run **42063923761** passed on `a7c1483a00d69fdd28bc084a190015a85559f8c2`. It applied all five migrations, passed schema/API/Outbox tests, ran the benchmark, and completed the Next.js production build.
+- PostgreSQL API coverage included Owner setup/MFA/session, customer registration/login/logout, role invitations/dashboards, permission denials, referral consent deletion, assigned conversations and manager scopes, read paths while the global lock was held, protected BYTEA upload/download limits, quote creation and acceptance (including rejection of staff acceptance and duplicate customer acceptance), order/CRM linkage, idempotent payments, project completion, and separate 25% developer and 15% marketer commissions. Email was not sent; synthetic data only.
+- Benchmark used an isolated PostgreSQL 16 database, 12 synthetic customer users plus Owner/Order Manager/Marketer accounts, and 12 synthetic conversations, orders, and CRM rows. It ran 6 concurrent requests over two waves with zero request errors. Results are in-process test measurements, not production capacity estimates:
+
+  | Route | Before p50 / p95 (ms) | Updated path p50 / p95 (ms) |
+  |---|---:|---:|
+  | Login | 431.5 / 842.6 | 239.6 / 244.1 |
+  | Conversations | 147.5 / 281.3 | 5.0 / 7.8 |
+  | Generic dashboard | 191.7 / 330.7 | 6.6 / 11.1 |
+  | Order Manager dashboard | 140.5 / 275.9 | 8.6 / 10.5 |
+  | Owner dashboard | 140.5 / 281.8 | 29.7 / 37.2 |
+  | Marketer dashboard | 142.9 / 269.8 | 7.7 / 10.9 |
+  | CRM | 143.2 / 283.3 | 3.8 / 4.9 |
+
+- The local test run also passed TypeScript, Prisma validation, application smoke, staging, staging-auth, JavaScript syntax checks, and `git diff --check`.
+- The CI production build passed. Local build and interactive viewport review remain blocked by OneDrive/Next.js filesystem access behavior; exact viewport and physical-device checks are still outstanding.
+- Quote create/accept was functionally tested while another connection held the global advisory lock, but quote mutation latency was not part of the p50/p95 benchmark. Order/payment writes still use the serialized compatibility path.
 
 ## Staging plan (not deployed)
 
