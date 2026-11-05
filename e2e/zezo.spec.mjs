@@ -131,7 +131,7 @@ test('all 40 catalog templates open and both request actions route to the correc
     await page.goto(`/?preview=${encodeURIComponent(id)}`);
     const shell = page.locator('#templatePreviewApp .template-preview-shell');
     await expect(shell, `${id} preview`).toBeVisible();
-    await expect(shell.locator('h1')).not.toBeEmpty();
+    await expect(shell.locator('h1').first()).not.toBeEmpty();
     const order = shell.locator('.template-preview-actions a').nth(0);
     const customize = shell.locator('.template-preview-actions a').nth(1);
     await expect(order).toHaveAttribute('href', new RegExp(`templateRequest=${id}.*templateAction=order`));
@@ -352,14 +352,26 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
 test('interactive demos perform their core local actions without external services', async ({ page, browserName }) => {
   test.skip(browserName !== 'chromium', 'Representative local demo interactions run once in Chromium.');
   await page.goto('/?preview=web-copper-table');
-  await page.locator('[data-demo-add]').first().click();
-  await expect(page.locator('#demoCartCount')).toHaveText('1');
+  const restaurant = page.locator('[data-zfx-web="web-copper-table"]');
+  await restaurant.locator('[data-web="add"]').first().click();
+  await expect(restaurant.locator('.zfx-bag b')).toHaveText('1');
+  await restaurant.locator('[data-web="view"][data-view="cart"]').click();
+  await expect(restaurant.locator('.zfx-cart-line')).toHaveCount(1);
+  await restaurant.locator('[data-web="view"][data-view="checkout"]').click();
+  await restaurant.locator('[data-web-form="checkout"] button[type="submit"]').click();
+  await expect(restaurant.locator('.zfx-success')).toBeVisible();
+  await restaurant.locator('[data-web="view"][data-view="admin"]').click();
+  await expect(restaurant.locator('.zfx-record')).toHaveCount(1);
 
   await page.goto('/?preview=web-luma-clinic');
-  await expect(page.locator('#demoBooking')).toBeVisible();
-  await page.locator('#demoBooking input[type="date"]').fill('2026-12-01');
-  await page.locator('#demoBooking button[type="submit"]').click();
-  await expect(page.locator('#templatePreviewNotice')).toContainText('تجريبي');
+  await page.locator('[data-ld="clinic-step"]').first().click();
+  await page.locator('[data-ld="specialty"]').first().click();
+  await page.locator('[data-ld="doctor"]').first().click();
+  await page.locator('[data-ld-form="clinic-date"] input[name="date"]').fill('2026-12-01');
+  await page.locator('[data-ld-form="clinic-date"] button[type="submit"]').click();
+  await page.locator('[data-ld="clinic-time"]').first().click();
+  await page.locator('[data-ld="confirm-booking"]').click();
+  await expect(page.locator('.ld-clinic-confirmed')).toBeVisible();
 
   await page.goto('/?preview=app-daygrid');
   await page.locator('[data-ld="view"][data-view="list"]').click();
@@ -371,7 +383,8 @@ test('interactive demos perform their core local actions without external servic
   await page.goto('/?preview=ai-helio-desk');
   await page.locator('.ld-chat-form textarea[name="prompt"]').fill('What courses are available?');
   await page.locator('.ld-chat-form button[type="submit"]').click();
-  await expect(page.locator('.ld-message-list')).toContainText('sample', { ignoreCase: true });
+  await expect(page.locator('.ld-message.user')).toContainText('What courses are available?');
+  await expect(page.locator('.ld-message-list .ld-message')).toHaveCount(3);
 
   await page.goto('/?preview=idea-business-canvas');
   const planner = page.locator('#demoPlanner');
@@ -380,3 +393,4 @@ test('interactive demos perform their core local actions without external servic
   await planner.locator('button[type="submit"]').click();
   await expect(page.locator('#templatePreviewNotice')).toContainText('حُفظت');
 });
+
