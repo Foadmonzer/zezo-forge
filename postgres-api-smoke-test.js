@@ -536,7 +536,7 @@ try {
   assert(Number(completedDeveloperProject?.commissionAmount) === 50 && Number(completedDeveloperProject?.developerCommissionRate) === 25, 'Developer execution commission was not calculated as 25% of the 200 ILS verified collection.');
   const finalCommissions = await client.query('SELECT kind, "ratePercent"::float8 AS rate, amount::float8 AS amount, status FROM commissions WHERE "requestId" = $1 ORDER BY kind', [syntheticLeadId]);
   assert(finalCommissions.rowCount === 2, 'Project completion must not duplicate either commission.');
-  assert(finalCommissions.rows.some(row => row.kind === 'developer' && row.rate === 25 && row.amount === 50 && row.status === 'confirmed'), 'The normalized developer commission row was not confirmed at 25% after delivery review.');
+  assert(finalCommissions.rows.some(row => row.kind === 'developer' && row.rate === 25 && row.amount === 50 && row.status === 'pending'), 'The normalized developer commission should accrue at 25% after delivery review and remain pending during the configured hold period.');
   assert(finalCommissions.rows.some(row => row.kind === 'referral' && row.rate === 15 && row.amount === 30), 'The normalized Rookie commission row changed during delivery completion.');
   const marketerAfterPayment = await request('GET', '/api/dashboard', { cookie: employees.marketer.cookie });
   assert(marketerAfterPayment.data.leads?.some(row => row.id === syntheticLeadId && Number(row.commissionAmount) === 30), 'Rookie marketing commission was not persisted at 15% of the paid 200 ILS project.');
