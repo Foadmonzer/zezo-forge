@@ -257,12 +257,12 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await staffConversation.locator(':scope > summary').click();
   await staffConversation.locator(`[data-conversation-reply="${conversationId}"] textarea[name="message"]`).fill('Synthetic Order Manager response.');
   await staffConversation.locator(`[data-conversation-reply="${conversationId}"] button[type="submit"]`).click();
+  await expect(staffConversation).toContainText('Synthetic Order Manager response.', { timeout: 30_000 });
   const quoteEditor = staffConversation.locator('details.conversation-quote-editor');
-  // Saving a reply refreshes the dashboard markup and collapses the conversation card.
-  if (!(await staffConversation.evaluate(element => element.open))) {
-    await staffConversation.locator(':scope > summary').click();
-  }
-  await quoteEditor.locator(':scope > summary').click();
+  // The saved reply refreshes the dashboard markup; explicitly expand both native details panes afterward.
+  await staffConversation.evaluate(element => { element.open = true; });
+  await quoteEditor.evaluate(element => { element.open = true; });
+  await expect(quoteEditor.locator('[name="amount"]')).toBeVisible();
   await quoteEditor.locator('[name="amount"]').fill('200');
   await quoteEditor.locator('[name="scope"]').fill('Single responsive ZEZO restaurant website scope for browser acceptance tests.');
   await quoteEditor.locator('[name="included"]').fill('One responsive landing page and contact details.');
