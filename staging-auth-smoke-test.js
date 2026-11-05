@@ -14,7 +14,9 @@ assert.equal(stagingPasswordMatches('Synthetic-Staging-Only-Phase4-Password'), t
 assert.equal(stagingPasswordMatches('incorrect'), false);
 assert.equal(isStagingSessionValid(session, now), true);
 assert.equal(isStagingSessionValid(session, now + STAGING_SESSION_TTL_SECONDS * 1000), false);
-const tamperedSession = `${session.slice(0, -1)}${session.endsWith('A') ? 'B' : 'A'}`;
+const [expiry, nonce, signature] = session.split('.');
+const tamperedSignature = `${signature.startsWith('A') ? 'B' : 'A'}${signature.slice(1)}`;
+const tamperedSession = `${expiry}.${nonce}.${tamperedSignature}`;
 assert.equal(isStagingSessionValid(tamperedSession, now), false);
 assert.equal(isStagingSessionValid('malformed', now), false);
 
