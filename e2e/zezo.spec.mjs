@@ -301,7 +301,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await ownerPage.locator('[data-dash-tab="requests"]').click();
   const leadCard = ownerPage.locator(`[data-lead-card="${leadId}"]`);
   await expect(leadCard).toBeVisible();
-  if (!(await leadCard.evaluate(element => element.open))) await leadCard.locator('summary').click();
+  if (!(await leadCard.evaluate(element => element.open))) await leadCard.locator(':scope > summary').click();
   await leadCard.locator('[data-lead-edit] [name="contractAmount"]').first().fill('200');
   await leadCard.locator('[data-lead-edit] button[type="submit"]').first().click();
   const assign = leadCard.locator(`[data-developer-assign="${leadId}"]`);
@@ -336,7 +336,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await ownerPage.reload();
   await ownerPage.locator('[data-dash-tab="requests"]').click();
   const refreshedLead = ownerPage.locator(`[data-lead-card="${leadId}"]`);
-  if (!(await refreshedLead.evaluate(element => element.open))) await refreshedLead.locator('summary').click();
+  if (!(await refreshedLead.evaluate(element => element.open))) await refreshedLead.locator(':scope > summary').click();
   await refreshedLead.locator(`[data-developer-review="${leadId}"] [name="decision"]`).selectOption('approved');
   await refreshedLead.locator(`[data-developer-review="${leadId}"] button[type="submit"]`).click();
   await refreshedLead.locator(`[data-project-stage-form="${leadId}"] [name="stage"]`).selectOption('completed');
