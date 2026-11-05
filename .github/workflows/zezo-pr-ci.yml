@@ -39,16 +39,13 @@ jobs:
       - run: pnpm test:staging
       - run: pnpm test:staging-auth
       - run: pnpm exec prisma validate
-      - name: Migrate and test on isolated PostgreSQL
+      - name: Migrate, test, and benchmark isolated PostgreSQL
         env:
           PGHOST: 127.0.0.1
           PGPORT: 5432
           PGUSER: zezo_ci
           PGDATABASE: zezo_ci
-        run: node scripts/run-ci-postgres.mjs
-      - name: Compare core read paths under synthetic concurrency
-        env:
           BENCH_SAMPLES: 12
           BENCH_CONCURRENCY: 6
-        run: node postgres-core-read-benchmark.js
+        run: node scripts/run-ci-postgres.mjs
       - run: pnpm build

@@ -8,7 +8,8 @@ import { closePostgresPool } from './src/server/postgres-runtime.js';
 
 if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL must point to a disposable synthetic phase6 PostgreSQL database.');
 const databaseName = new URL(process.env.DATABASE_URL).pathname.replace(/^\//, '');
-if (!/^zezo_phase6_[a-z0-9_]+$/i.test(databaseName)) throw new Error('Refusing to benchmark a database not named zezo_phase6_<suffix>.');
+const disposableDatabase = /^zezo_phase6_[a-z0-9_]+$/i.test(databaseName) || (process.env.GITHUB_ACTIONS === 'true' && databaseName === 'zezo_ci');
+if (!disposableDatabase) throw new Error('Refusing to benchmark anything but a disposable zezo_phase6_* database or the isolated GitHub Actions zezo_ci service.');
 process.env.ZEZO_STAGING = 'true';
 process.env.ZEZO_STAGING_ACCESS_PASSWORD ||= `Benchmark-${randomBytes(24).toString('base64url')}`;
 process.env.NODE_ENV = 'test';

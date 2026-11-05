@@ -9,9 +9,14 @@ if (![host, user, database].every(Boolean)) throw new Error('PGHOST, PGUSER, and
 const connection = `postgresql://${encodeURIComponent(user)}@${host}:${port}/${encodeURIComponent(database)}`;
 const env = { ...process.env, DATABASE_URL: connection, NODE_ENV: 'test' };
 const executable = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
+const commands = [
+  { executable, args: ['exec', 'prisma', 'migrate', 'deploy'] },
+  { executable, args: ['test:postgres'] },
+  { executable: process.execPath, args: ['postgres-core-read-benchmark.js'] }
+];
 
-for (const args of [['exec', 'prisma', 'migrate', 'deploy'], ['test:postgres']]) {
-  const result = spawnSync(executable, args, { stdio: 'inherit', env, shell: process.platform === 'win32' });
+for (const command of commands) {
+  const result = spawnSync(command.executable, command.args, { stdio: 'inherit', env, shell: process.platform === 'win32' });
   if (result.error) throw result.error;
   if (result.status !== 0) process.exit(result.status || 1);
 }
