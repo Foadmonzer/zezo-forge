@@ -26,16 +26,18 @@ export default defineConfig({
     { name: 'webkit', use: { browserName: 'webkit' } }
   ],
   webServer: {
-    command: 'pnpm exec next start --hostname 127.0.0.1 --port 3000',
+    command: 'pnpm exec next dev --hostname 127.0.0.1 --port 3000',
     cwd: repoRoot,
     url: `${baseURL}/api/health`,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
     env: {
       ...process.env,
-      NODE_ENV: 'production',
+      NODE_ENV: 'development',
+      ZEZO_NEXT_BUILD_DIR: '.next-e2e',
       ZEZO_STAGING: 'false',
       ZEZO_DATA_DIR: process.env.ZEZO_DATA_DIR || '../data-e2e'
     }
   }
 });
+
