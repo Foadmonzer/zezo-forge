@@ -508,10 +508,10 @@ try {
   };
   const duplicateRows = await client.query('SELECT count(*)::int AS count FROM payments WHERE "requestId" = $1 AND "idempotencyKey" = $2', [syntheticLeadId, idempotencyKey]);
   assert(Number(duplicateRows.rows[0].count) === 1, 'Concurrent payment requests created more than one payment row.');
-  const normalizedCommissions = await client.query('SELECT kind, "ratePercent"::float8 AS rate, amount::float8 AS amount FROM commissions WHERE "requestId" = $1 ORDER BY kind', [syntheticLeadId]);
+  const normalizedCommissions = await client.query('SELECT kind, "ratePercent"::float8 AS rate, amount::float8 AS amount, status FROM commissions WHERE "requestId" = $1 ORDER BY kind', [syntheticLeadId]);
   assert(normalizedCommissions.rowCount === 2, 'A project must retain one marketing and one developer commission record.');
   assert(normalizedCommissions.rows.some(row => row.kind === 'referral' && row.rate === 15 && row.amount === 30), 'The normalized Rookie commission row is missing or incorrect.');
-  assert(normalizedCommissions.rows.some(row => row.kind === 'developer' && row.rate === 25 && row.amount === 50), 'The normalized developer commission row is missing or incorrect.');
+  assert(normalizedCommissions.rows.some(row => row.kind === 'developer' && row.rate === 25 && row.amount === 0), 'Developer commission must stay unearned before delivery review and completion.');
   console.log(`[FINANCE_CONCURRENCY] ${JSON.stringify(paymentConcurrency)}`);
   const developerFile = Buffer.from('%PDF-1.4 synthetic project delivery');
   const developerUpload = await request('POST', `/api/developer/projects/${syntheticLeadId}/files`, {
@@ -534,6 +534,10 @@ try {
   const developerFinalDashboard = await request('GET', '/api/dashboard', { cookie: employees.developer.cookie });
   const completedDeveloperProject = developerFinalDashboard.data.projects?.find(project => project.id === syntheticLeadId);
   assert(Number(completedDeveloperProject?.commissionAmount) === 50 && Number(completedDeveloperProject?.developerCommissionRate) === 25, 'Developer execution commission was not calculated as 25% of the 200 ILS verified collection.');
+  const finalCommissions = await client.query('SELECT kind, "ratePercent"::float8 AS rate, amount::float8 AS amount, status FROM commissions WHERE "requestId" = $1 ORDER BY kind', [syntheticLeadId]);
+  assert(finalCommissions.rowCount === 2, 'Project completion must not duplicate either commission.');
+  assert(finalCommissions.rows.some(row => row.kind === 'developer' && row.rate === 25 && row.amount === 50 && row.status === 'confirmed'), 'The normalized developer commission row was not confirmed at 25% after delivery review.');
+  assert(finalCommissions.rows.some(row => row.kind === 'referral' && row.rate === 15 && row.amount === 30), 'The normalized Rookie commission row changed during delivery completion.');
   const marketerAfterPayment = await request('GET', '/api/dashboard', { cookie: employees.marketer.cookie });
   assert(marketerAfterPayment.data.leads?.some(row => row.id === syntheticLeadId && Number(row.commissionAmount) === 30), 'Rookie marketing commission was not persisted at 15% of the paid 200 ILS project.');
   results.push(`concurrent duplicate payment requests remain idempotent (p50 ${paymentConcurrency.p50Ms}ms / p95 ${paymentConcurrency.p95Ms}ms; one payment row); normalized project commissions retain 25% developer (50 ILS) and 15% marketer (30 ILS) separately`);
@@ -613,3 +617,4 @@ try {
   await client.end();
   await closePostgresPool();
 }
+
