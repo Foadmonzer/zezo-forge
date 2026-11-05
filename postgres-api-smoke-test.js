@@ -392,7 +392,7 @@ try {
   assert(quoteWhileLocked?.done && quoteWhileLocked.value.status === 201 && quoteWhileLocked.value.data.conversation.quote?.amount === 200, 'Owner quote creation queued behind the global advisory lock.');
   assert(acceptWhileLocked?.done && acceptWhileLocked.value.status === 200, 'Customer quote acceptance queued behind the global advisory lock.');
   const acceptedQuoteRow = await client.query('SELECT state FROM quotes WHERE "conversationId" = $1 ORDER BY "createdAt" DESC LIMIT 1', [syntheticConversationId]);
-  const acceptedQuoteConversation = await client.query('SELECT data -> "agreedPriceSnapshot" AS snapshot FROM conversations WHERE id = $1', [syntheticConversationId]);
+  const acceptedQuoteConversation = await client.query("SELECT data -> 'agreedPriceSnapshot' AS snapshot FROM conversations WHERE id = $1", [syntheticConversationId]);
   assert(acceptedQuoteRow.rows[0]?.state === 'accepted' && Number(acceptedQuoteConversation.rows[0]?.snapshot?.amount) === 200, 'Quote acceptance was not committed atomically with its immutable price snapshot.');
   const repeatedQuoteAcceptances = await Promise.all(Array.from({ length: 4 }, () => request('POST', `/api/conversations/${syntheticConversationId}/accept-quote`, { cookie: customerCookie })));
   assert(repeatedQuoteAcceptances.every(row => row.status === 409), 'An already accepted quote was accepted again by a duplicate request.');
