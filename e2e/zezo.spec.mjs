@@ -254,7 +254,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await orderPage.locator('[data-dash-tab="conversations"]').click();
   const staffConversation = orderPage.locator('details.conversation-staff-card').filter({ hasText: 'مطعم السعادة' });
   await expect(staffConversation).toBeVisible();
-  await staffConversation.locator('summary').click();
+  await staffConversation.locator(':scope > summary').click();
   await staffConversation.locator(`[data-conversation-reply="${conversationId}"] textarea[name="message"]`).fill('Synthetic Order Manager response.');
   await staffConversation.locator(`[data-conversation-reply="${conversationId}"] button[type="submit"]`).click();
   const quoteEditor = staffConversation.locator('details.conversation-quote-editor');
@@ -388,7 +388,7 @@ test('interactive demos perform their core local actions without external servic
 
   await page.goto('/?preview=ai-helio-desk');
   await page.locator('.ld-chat-form textarea[name="prompt"]').fill('What courses are available?');
-  await page.locator('.ld-chat-form button[type="submit"]').click();
+  await page.locator('.ld-chat-form .ld-primary').click();
   await expect(page.locator('.ld-message.user')).toContainText('What courses are available?');
   await expect(page.locator('.ld-message-list .ld-message')).toHaveCount(3);
 
