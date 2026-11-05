@@ -29,6 +29,14 @@ export function currentPostgresClient() {
   return transactionStorage.getStore() ?? null;
 }
 
+// Read-only repository queries can use the shared pool directly. Keep this
+// separate from withPostgresTransaction so public reads do not join the legacy
+// whole-store serialization queue.
+export async function queryPostgres(sql, values = []) {
+  const client = currentPostgresClient();
+  return client ? client.query(sql, values) : getPool().query(sql, values);
+}
+
 export async function consumeRateLimitBucket(bucket, key, max, windowMs) {
   const digest = createHash('sha256').update(`zezo-rate:${bucket}:${key}`).digest('hex');
   if (postgresConfigured()) {

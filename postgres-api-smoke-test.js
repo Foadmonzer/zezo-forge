@@ -3,6 +3,7 @@ import pg from 'pg';
 import { init, handle } from './server.js';
 import { closePostgresPool } from './src/server/postgres-runtime.js';
 import { createHash, createHmac, randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 
 if (!process.env.DATABASE_URL) {
   console.error('DATABASE_URL is required for the PostgreSQL API smoke test.');
@@ -19,6 +20,7 @@ const results = [];
 let syntheticConversationId = '';
 let syntheticLeadId = '';
 const employeeIds = [];
+let preexistingOutboxIds = [];
 const rateBucket = value => createHash('sha256').update(`zezo-rate:${value}`).digest('hex');
 const testRateBuckets = [
   rateBucket('login:first-admin:127.0.0.1'), rateBucket(`login:127.0.0.1:${ownerUsername}`),
@@ -105,6 +107,7 @@ function currentTotp(secret) {
 
 await client.connect();
 try {
+  preexistingOutboxIds = (await client.query('SELECT id FROM outbox_messages')).rows.map(row => row.id);
   await client.query('DELETE FROM rate_limit_buckets WHERE key = ANY($1::text[])', [testRateBuckets]);
   await init();
   const health = await request('GET', '/api/health');
@@ -113,6 +116,31 @@ try {
 
   const publicBefore = await request('GET', '/api/public');
   assert(publicBefore.data.adminSetupAvailable === true, 'Fresh PostgreSQL test database must allow first Owner setup.');
+  assert(Object.keys(publicBefore.data.templatePrices || {}).length === 40, 'Public runtime read did not return the 40 template price entries.');
+  assert(Object.values(publicBefore.data.templatePrices).every(price => Number(price) === 200), 'Default template starting prices changed in the PostgreSQL public read.');
+  assert(Object.keys(publicBefore.data.templateActive || {}).length === 40, 'Public runtime read did not return template availability.');
+  results.push('lock-free public runtime read preserves all 40 template prices and availability');
+
+  // Hold the legacy global advisory lock from a second PostgreSQL connection.
+  // The targeted public repository must still answer while legacy API writes wait.
+  const lockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await lockHolder.connect();
+  let lockedPublicRead;
+  try {
+    await lockHolder.query('BEGIN');
+    await lockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+    const pendingRead = request('GET', '/api/public').then(value => ({ done: true, value }));
+    lockedPublicRead = await Promise.race([
+      pendingRead,
+      new Promise(resolve => setTimeout(() => resolve({ done: false }), 800))
+    ]);
+  } finally {
+    await lockHolder.query('ROLLBACK').catch(() => {});
+    await lockHolder.end();
+  }
+  assert(lockedPublicRead?.done === true && lockedPublicRead.value.status === 200,
+    'Public runtime read queued behind the legacy global PostgreSQL advisory lock.');
+  results.push('public runtime read completed while the legacy global advisory lock was held');
 
   const setup = await request('POST', '/api/setup', {
     body: { name: 'Synthetic ZEZO Owner', username: ownerUsername, password }
@@ -311,6 +339,26 @@ try {
   });
   assert(officialOrder.status === 201 && officialOrder.data.id, `Customer official order creation failed with ${officialOrder.status}.`);
   syntheticLeadId = officialOrder.data.id;
+  const publicTrackPath = `/api/track?token=${encodeURIComponent(officialOrder.data.trackingToken)}&lang=en`;
+  const publicTrack = await request('GET', publicTrackPath);
+  assert(publicTrack.status === 200 && publicTrack.data.status && publicTrack.data.service === 'web' && !('email' in publicTrack.data) && !('phone' in publicTrack.data), 'Lock-free tracking read did not return the customer-safe project status fields.');
+  const trackLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await trackLockHolder.connect();
+  let trackWhileLocked;
+  try {
+    await trackLockHolder.query('BEGIN');
+    await trackLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+    const pendingTrackRead = request('GET', publicTrackPath).then(value => ({ done: true, value }));
+    trackWhileLocked = await Promise.race([
+      pendingTrackRead,
+      new Promise(resolve => setTimeout(() => resolve({ done: false }), 800))
+    ]);
+  } finally {
+    await trackLockHolder.query('ROLLBACK').catch(() => {});
+    await trackLockHolder.end();
+  }
+  assert(trackWhileLocked?.done === true && trackWhileLocked.value.status === 200, 'Public tracking read queued behind the global advisory lock.');
+  results.push('tracking-token status read is lock-free and exposes only the customer-safe status fields');
   const orderDashboard = await request('GET', '/api/dashboard', { cookie: customerCookie });
   assert(orderDashboard.status === 200 && orderDashboard.data.orders?.some(row => row.id === syntheticLeadId), 'Official order was not available after reloading from PostgreSQL.');
   const ownerAfterOrder = await request('GET', '/api/dashboard', { cookie: ownerCookie });
@@ -425,6 +473,7 @@ try {
       await client.query('DELETE FROM conversations WHERE id = $1', [syntheticConversationId]);
       await client.query('DELETE FROM user_accounts WHERE id = ANY($1::text[])', [syntheticIds]);
       await client.query('DELETE FROM rate_limit_buckets WHERE key = ANY($1::text[])', [testRateBuckets]);
+      await client.query('DELETE FROM outbox_messages WHERE NOT (id = ANY($1::text[]))', [preexistingOutboxIds]);
       const remaining = await client.query(
         'SELECT (SELECT count(*) FROM user_accounts WHERE id = ANY($1::text[])) + (SELECT count(*) FROM auth_sessions WHERE "userId" = ANY($1::text[])) AS count',
         [syntheticIds]

@@ -10,6 +10,8 @@ import { buildWhatsAppUrl, normalizeWhatsAppNumber } from './public/whatsapp.js'
 import { currentPostgresClient, postgresConfigured, withPostgresTransaction } from './src/server/postgres-runtime.js';
 import { createStagingSession, isStagingSessionValid, STAGING_ACCESS_COOKIE, STAGING_SESSION_TTL_SECONDS, stagingPasswordMatches } from './src/server/staging-auth.js';
 import { deleteReferralTrackingForVisitor, loadNormalizedStore, persistNormalizedStore } from './src/server/postgres-store.js';
+import { loadPublicRuntimeSnapshot, loadPublicTrackRecord } from './src/server/public-read-repository.js';
+import { claimNextOutboxMessage, completeOutboxMessage } from './src/server/outbox-repository.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const STAGING_MODE = process.env.ZEZO_STAGING === 'true';
@@ -91,6 +93,7 @@ const quoteAttempts = new Map();
 const clientRegistrationAttempts = new Map();
 const passwordResetAttempts = new Map();
 const conversationAttempts = new Map();
+let mailWorkerRunning = false;
 
 const now = () => new Date().toISOString();
 const hash = value => createHash('sha256').update(String(value)).digest('hex');
@@ -335,8 +338,6 @@ async function initStore() {
   if ('setupHash' in store) { delete store.setupHash; migratedSetupFields = true; }
   if ('setupExpires' in store) { delete store.setupExpires; migratedSetupFields = true; }
   if (store.settings.commissionPercent == null) store.settings.commissionPercent = 15;
-  let recoveredMail=false;
-  for (const item of store.mailQueue) if (item.state === 'sending') { item.state = 'retry'; recoveredMail=true; }
   for (const user of store.users) {
     if (user.role === 'orders_manager' || user.role === 'documentation_officer') { user.role='hr_manager'; migratedSetupFields=true; }
     if (referralEnabled(user)) {
@@ -407,7 +408,7 @@ async function initStore() {
   const financeMigrated=ledgerSizeBefore!==store.financeLedger.length;
   const rankRequestsCreated = syncAllRankRequests();
   for(const lead of store.leads){const linked=(store.crmLeads||[]).some(row=>row.orderIds?.includes(lead.id)||row.id===lead.crmLeadId);ensureCrmCaseForOrder(lead);if(!linked)migratedCrm=true;}
-  if(postgresConfigured() || recoveredMail || migratedSetupFields || migratedWithdrawals || migratedTemplateAvailability || migratedTemplatePricing || migratedPermissionData || migratedClientData || migratedNotifications || migratedCrm || referralLinksCreated || referralDataCleaned || rankRequestsCreated.length || financeMigrated || store.users.some(referralEnabled)) await persist();
+  if(postgresConfigured() || migratedSetupFields || migratedWithdrawals || migratedTemplateAvailability || migratedTemplatePricing || migratedPermissionData || migratedClientData || migratedNotifications || migratedCrm || referralLinksCreated || referralDataCleaned || rankRequestsCreated.length || financeMigrated || store.users.some(referralEnabled)) await persist();
   for (const request of rankRequestsCreated) await queueRankRequestMail(request);
   return firstAdminSetupAvailable();
 }
@@ -713,7 +714,7 @@ function bindClientReferral(user, attribution){
   user.referralUserId=attribution.user.id;user.referralCode=attribution.code||attribution.user.currentReferralCode||attribution.user.referralCode;
   user.referralLinkId=attribution.link?.id||null;user.referralBoundAt=now();return true;
 }
-const emailReady = () => !STAGING_MODE && Boolean(process.env.RESEND_API_KEY && process.env.ZEZO_FROM_EMAIL);
+const emailReady = () => !STAGING_MODE && process.env.ZEZO_ENABLE_EMAIL_DELIVERY === 'true' && Boolean(process.env.RESEND_API_KEY && process.env.ZEZO_FROM_EMAIL);
 const adminEmailReady = () => !STAGING_MODE && Boolean(process.env.ZEZO_NOTIFICATION_EMAIL);
 function requestIsSecure(req) {
   if (req.socket?.encrypted) return true;
@@ -726,7 +727,47 @@ function siteBase(req) {
   return `${requestIsSecure(req) ? 'https' : 'http'}://${/^[a-z0-9.-]+(?::\d+)?$/.test(host) ? host : 'localhost'}`;
 }
 async function processMailQueue() {
-  if (STAGING_MODE || !emailReady() || store.mailQueue.some(item => item.state === 'sending')) return;
+  if (STAGING_MODE || !emailReady()) return 0;
+  if (postgresConfigured()) {
+    if (mailWorkerRunning) return 0;
+    mailWorkerRunning = true;
+    let processed = 0;
+    try {
+      while (true) {
+        const claimed = await claimNextOutboxMessage({ allowAdmin: adminEmailReady() });
+        if (!claimed) break;
+        const item = { ...(claimed.data || {}), id: claimed.id, recipient: claimed.recipient || '', attempts: claimed.attempts };
+        const recipient = item.recipientType === 'admin' ? process.env.ZEZO_NOTIFICATION_EMAIL : (item.to || item.recipient);
+        let nextState;
+        let providerId = '';
+        let lastError = '';
+        try {
+          const response = await fetch('https://api.resend.com/emails', {
+            method: 'POST', signal: AbortSignal.timeout(12000),
+            headers: { 'Authorization': `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': item.id },
+            body: JSON.stringify({ from: process.env.ZEZO_FROM_EMAIL, to: recipient, subject: item.subject, text: item.text })
+          });
+          const result = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(result.message || `Email provider returned ${response.status}`);
+          nextState = 'sent';
+          providerId = clean(result.id, 120);
+        } catch (error) {
+          nextState = item.attempts >= 5 ? 'failed' : 'retry';
+          lastError = clean(error.message, 220);
+        }
+        const completed = await completeOutboxMessage(item.id, claimed.leaseToken, { state: nextState, providerId, lastError });
+        if (completed) {
+          const stored = store.mailQueue.find(row => row.id === item.id);
+          if (stored) Object.assign(stored, completed.data || {}, { id: completed.id, state: completed.state, attempts: completed.attempts, updatedAt: completed.updatedAt });
+        }
+        processed += 1;
+      }
+      return processed;
+    } finally {
+      mailWorkerRunning = false;
+    }
+  }
+  if (store.mailQueue.some(item => item.state === 'sending')) return 0;
   for (const item of [...store.mailQueue].reverse()) {
     if (!['pending','retry'].includes(item.state) || item.attempts >= 5) continue;
     const recipient = item.recipientType === 'admin' ? process.env.ZEZO_NOTIFICATION_EMAIL : item.to;
@@ -748,13 +789,16 @@ async function processMailQueue() {
     }
     await persist();
   }
+  return undefined;
 }
 async function queueMail({ to = '', recipientType = 'direct', subject, text, kind }) {
   const safeText=String(text??'').replace(/\r\n?/g,'\n').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g,'').trim().slice(0,6000);
   const item = { id: id('mail'), createdAt: now(), kind: clean(kind, 50), to: clean(to, 150), recipientType, subject: clean(subject, 180), text: safeText, state: 'pending', attempts: 0, lastError: '' };
   store.mailQueue.unshift(item); store.mailQueue = store.mailQueue.slice(0, 1000);
   await persist();
-  void processMailQueue();
+  // PostgreSQL deployments use the separately supervised durable worker; do not
+  // send inside the request transaction or rely on a serverless timer.
+  if (!postgresConfigured()) void processMailQueue();
   return item;
 }
 function fallbackQuote(brief) {
@@ -1279,6 +1323,23 @@ async function handle(req, res) {
   // Health checks disclose no store data or mutable state. Keep them outside the
   // compatibility-store transaction so probes do not queue behind business writes.
   if (req.method === 'GET' && path === '/api/health') return handleRequest(req, res);
+  if (req.method === 'GET' && path === '/api/public') {
+    // Preserve the legacy staging response without loading data when the gate is closed.
+    if (!stagingAuthorized(req)) return handleRequest(req, res);
+    const snapshot = await loadPublicRuntimeSnapshot(referralMonth());
+    // Monthly referral rollover remains on the established write path, which
+    // serializes the related account/link mutations until they get their own repository.
+    if (!snapshot.referral_rollover_required) return handlePublicRuntimeConfig(req, res, snapshot);
+  }
+  if (req.method === 'GET' && path === '/api/track') {
+    if (!stagingAuthorized(req)) return handleRequest(req, res);
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const trackToken = clean(url.searchParams.get('token'), 120);
+    const lead = await loadPublicTrackRecord(hash(trackToken));
+    if (!lead) return json(res, 404, { error: 'رابط التتبع غير صالح أو منتهي / Tracking link is invalid or expired' }, responseSecurityHeaders());
+    const lang = url.searchParams.get('lang') === 'en' ? 'en' : 'ar';
+    return json(res, 200, { createdAt: lead.createdAt, service: lead.service, status: lead.status, statusText: publicStatusLabels[lead.status]?.[lang] || publicStatusLabels.new[lang], note: lead.publicStatusNote || '' }, responseSecurityHeaders());
+  }
   if (!path.startsWith('/api/')) {
     return withPostgresTransaction(async client => {
       await loadPostgresStore(client);
@@ -1317,12 +1378,7 @@ async function handle(req, res) {
 async function handleRequest(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const path = decodeURIComponent(url.pathname);
-  const security = {
-    'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'strict-origin-when-cross-origin',
-    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
-    'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
-  };
-  if (STAGING_MODE) security['X-Robots-Tag'] = 'noindex, nofollow, noarchive, nosnippet';
+  const security = responseSecurityHeaders();
   if (STAGING_MODE && path === '/robots.txt') {
     res.writeHead(200, { ...security, 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
     return res.end('User-agent: *\nDisallow: /\n');
@@ -2284,7 +2340,53 @@ async function handleRequest(req, res) {
   catch { res.writeHead(404,headers); res.end('Not found'); }
 }
 
-export { init, handle };
+function responseSecurityHeaders() {
+  const security = {
+    'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'strict-origin-when-cross-origin',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+    'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+  };
+  if (STAGING_MODE) security['X-Robots-Tag'] = 'noindex, nofollow, noarchive, nosnippet';
+  return security;
+}
+
+function handlePublicRuntimeConfig(req, res, snapshot) {
+  const storedSettings = snapshot.settings && typeof snapshot.settings === 'object' ? snapshot.settings : {};
+  const settings = { ...defaultStore().settings, ...storedSettings };
+  const templatePrices = { ...(settings.templatePrices || {}) };
+  for (const [templateId, amount] of Object.entries(snapshot.template_prices || {})) {
+    // null means quote-only; preserve it instead of exposing the typed-column fallback of 0.
+    if (templatePrices[templateId] !== null) {
+      const numericAmount = Number(amount);
+      if (Number.isFinite(numericAmount)) templatePrices[templateId] = numericAmount;
+    }
+  }
+  const templateActive = { ...(settings.templateActive || {}), ...(snapshot.template_active || {}) };
+  const templateInclusions = { ...(settings.templateInclusions || {}), ...(snapshot.template_inclusions || {}) };
+  const legacyPhone = process.env.ZEZO_WHATSAPP_NUMBER;
+  const customerSupportPhone = STAGING_MODE ? '' : normalizeWhatsAppNumber(process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP !== undefined ? process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP : legacyPhone);
+  const ordersPhone = STAGING_MODE ? '' : normalizeWhatsAppNumber(process.env.ZEZO_ORDERS_WHATSAPP !== undefined ? process.env.ZEZO_ORDERS_WHATSAPP : legacyPhone);
+  const ordersUrl = buildWhatsAppUrl(ordersPhone);
+  const setupAvailable = canSetUpFirstAdmin() && !snapshot.has_active_owner;
+  return json(res, 200, {
+    prices: (Array.isArray(settings.prices) ? settings.prices : []).filter(price => price.active !== false),
+    templatePrices,
+    templateInclusions,
+    templateActive,
+    commissionConfigured: settings.commissionPercent != null,
+    customerSupportWhatsappNumber: customerSupportPhone,
+    ordersWhatsappNumber: ordersPhone,
+    customerSupportWhatsappUrl: buildWhatsAppUrl(customerSupportPhone),
+    ordersWhatsappUrl: ordersUrl,
+    whatsappUrl: ordersUrl,
+    emailReady: emailReady() && adminEmailReady(),
+    aiQuoteReady: !STAGING_MODE && Boolean(process.env.OPENAI_API_KEY && process.env.OPENAI_MODEL),
+    adminSetupAvailable: setupAvailable,
+    stagingMode: STAGING_MODE
+  }, responseSecurityHeaders());
+}
+
+export { init, handle, processMailQueue as runOutboxWorker };
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
   const setupAvailable = await init();
