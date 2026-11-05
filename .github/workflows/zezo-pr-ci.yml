@@ -57,6 +57,7 @@ jobs:
       options: --ipc=host
     timeout-minutes: 35
     env:
+      HOME: /root
       DATABASE_URL: postgresql://zezo_ci@postgres:5432/zezo_ci
       ZEZO_DATA_DIR: ${{ github.workspace }}/../zezo-browser-e2e-data
       ZEZO_STAGING: 'false'

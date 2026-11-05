@@ -143,6 +143,7 @@ test('all 40 catalog templates open and both request actions route to the correc
   }
   expect(report).toHaveLength(40);
 
+  await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.goto('/#templates');
   for (const id of ids) {
     for (const action of ['order', 'customize']) {
@@ -226,6 +227,9 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await page.locator('#conversationReplyForm [name="message"]').fill('Synthetic customer follow-up message.');
   await page.locator('#conversationReplyForm button[type="submit"]').click();
   await expect(page.locator('#conversationMessages')).toContainText('Synthetic customer follow-up message');
+  await page.locator('#conversationModal [data-close-conversation]').click();
+  await page.locator('.login-open').click();
+  await expect(page.locator('#dashboardBackdrop.open')).toBeVisible();
   await page.locator('#dashboardLogout').click();
   await expect(page.locator('#dashboardBackdrop.open')).toHaveCount(0);
   await page.locator('.login-open').click();
@@ -358,7 +362,7 @@ test('interactive demos perform their core local actions without external servic
   await restaurant.locator('[data-web="view"][data-view="cart"]').click();
   await expect(restaurant.locator('.zfx-cart-line')).toHaveCount(1);
   await restaurant.locator('[data-web="view"][data-view="checkout"]').click();
-  await restaurant.locator('[data-web-form="checkout"] button[type="submit"]').click();
+  await restaurant.locator('[data-web-form="checkout"] .zfx-primary').click();
   await expect(restaurant.locator('.zfx-success')).toBeVisible();
   await restaurant.locator('[data-web="view"][data-view="admin"]').click();
   await expect(restaurant.locator('.zfx-record')).toHaveCount(1);
