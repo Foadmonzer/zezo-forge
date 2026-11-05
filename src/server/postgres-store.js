@@ -31,13 +31,13 @@ async function rows(client, sql) {
   return (await client.query(sql)).rows;
 }
 
-async function upsert(client, table, primaryKey, columns, records) {
+async function upsert(client, table, primaryKey, columns, records, conflictWhere = '') {
   for (const record of records) {
     const names = columns.map(([name]) => `"${name}"`);
     const values = columns.map(([, get]) => get(record));
     const placeholders = columns.map((_, index) => `$${index + 1}`);
     const updates = columns.filter(([name]) => name !== primaryKey).map(([name]) => `"${name}" = EXCLUDED."${name}"`);
-    const statement = `INSERT INTO "${table}" (${names.join(', ')}) VALUES (${placeholders.join(', ')}) ON CONFLICT ("${primaryKey}") DO UPDATE SET ${updates.join(', ')}`;
+    const statement = `INSERT INTO "${table}" (${names.join(', ')}) VALUES (${placeholders.join(', ')}) ON CONFLICT ("${primaryKey}") DO UPDATE SET ${updates.join(', ')}${conflictWhere ? ` WHERE ${conflictWhere}` : ''}`;
     await client.query(statement, values);
   }
 }
@@ -236,7 +236,7 @@ export async function persistNormalizedStore(client, store) {
     ['id', row => row.id], ['customerId', row => userIds.has(row.clientId) ? row.clientId : null], ['assignedToId', row => userIds.has(row.assignedUserId) ? row.assignedUserId : null],
     ['status', row => row.status || 'new'], ['templateId', row => row.templateId || null], ['source', row => row.source || null],
     ['data', row => json(({ ...row, messages: undefined, quote: undefined }))], ['createdAt', row => isoDate(row.createdAt)], ['updatedAt', row => isoDate(row.updatedAt)]
-  ], conversations);
+  ], conversations, 'EXCLUDED."updatedAt" > conversations."updatedAt"');
   const messages = conversations.flatMap(conversation => (conversation.messages || []).map(message => ({ conversation, message })));
   await upsert(client, 'conversation_messages', 'id', [
     ['id', row => row.message.id], ['conversationId', row => row.conversation.id], ['senderId', row => userIds.has(row.message.senderId) ? row.message.senderId : null],
@@ -247,7 +247,7 @@ export async function persistNormalizedStore(client, store) {
   await upsert(client, 'quotes', 'id', [
     ['id', row => row.quote.id], ['conversationId', row => row.conversation.id], ['amount', row => safeNumber(row.quote.amount)], ['currency', row => row.quote.currency || 'ILS'],
     ['state', row => row.quote.status || 'draft'], ['data', row => json(row.quote)], ['createdAt', row => isoDate(row.quote.createdAt || row.conversation.createdAt)]
-  ], quotes);
+  ], quotes, `quotes."state" <> 'accepted' OR EXCLUDED."state" = 'accepted'`);
 
   const payments = (store.payments || []).map(row => ({ ...row, requestId: row.leadId || row.requestId }));
   await upsert(client, 'payments', 'id', [

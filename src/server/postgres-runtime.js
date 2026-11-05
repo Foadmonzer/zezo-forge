@@ -59,6 +59,27 @@ export async function withPostgresScopedTransaction(work) {
   }
 }
 
+// Read-only snapshots for dashboards that still use the legacy serializer. They
+// share a consistent MVCC view without taking the compatibility write lock.
+// Keep mutations out of callbacks passed to this helper.
+export async function withPostgresReadTransaction(work) {
+  const activeClient = currentPostgresClient();
+  if (activeClient) return work(activeClient);
+
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    const result = await transactionStorage.run(client, () => work(client));
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 export async function consumeRateLimitBucket(bucket, key, max, windowMs) {
   const digest = createHash('sha256').update(`zezo-rate:${bucket}:${key}`).digest('hex');
   if (postgresConfigured()) {

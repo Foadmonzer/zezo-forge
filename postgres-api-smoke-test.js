@@ -302,6 +302,29 @@ try {
   assert(coreConversationReads?.done && coreConversationReads.values[0].status === 200 && coreConversationReads.values[0].data.conversations?.some(row => row.id === syntheticConversationId) && coreConversationReads.values[1].status === 200,
     'Authenticated conversation list/detail reads still wait on the global advisory lock or lost their access checks.');
   results.push('authenticated conversation list and detail reads bypass the global advisory lock while preserving authorization');
+  const managementLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await managementLockHolder.connect();
+  let managementDashboardsWhileLocked;
+  try {
+    await managementLockHolder.query('BEGIN');
+    await managementLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+    managementDashboardsWhileLocked = await Promise.race([
+      Promise.all([
+        request('GET', '/api/dashboard', { cookie: ownerCookie }),
+        request('GET', '/api/dashboard', { cookie: employees.order_manager.cookie }),
+        request('GET', '/api/dashboard', { cookie: employees.hr_manager.cookie }),
+        request('GET', '/api/dashboard', { cookie: employees.marketer.cookie })
+      ]).then(values => ({ done: true, values })),
+      new Promise(resolve => setTimeout(() => resolve({ done: false }), 2500))
+    ]);
+  } finally {
+    await managementLockHolder.query('ROLLBACK').catch(() => {});
+    await managementLockHolder.end();
+  }
+  assert(managementDashboardsWhileLocked?.done && managementDashboardsWhileLocked.values.every(row => row.status === 200), 'Owner or manager dashboards waited on the global advisory lock.');
+  assert(managementDashboardsWhileLocked.values[1].data.conversations?.some(row => row.id === syntheticConversationId), 'Order Manager lost the assigned conversation in its scoped dashboard.');
+  assert(!managementDashboardsWhileLocked.values[1].data.users && !managementDashboardsWhileLocked.values[1].data.financeSummary, 'Order Manager dashboard exposed owner-only data.');
+  results.push('Owner and management dashboards bypass the global advisory lock; Order Manager dashboard remains scoped');
   const ownerReply = await request('POST', `/api/conversations/${syntheticConversationId}/messages`, {
     body: { message: 'Synthetic ZEZO reply saved for the database integration test.' }, cookie: ownerCookie
   });
@@ -341,13 +364,41 @@ try {
   const oversizedRow = await client.query('SELECT count(*)::int AS count FROM stored_attachments WHERE "fileName" = $1', ['synthetic-oversize.pdf']);
   assert(Number(oversizedRow.rows[0].count) === 0, 'Oversized attachment bytes were persisted.');
   results.push('BYTEA attachment access controls plus exact 4 MB accepted / 4 MB + 1 byte rejected boundary');
-  const quote = await request('POST', `/api/conversations/${syntheticConversationId}/quote`, {
-    body: { amount: 200, scope: 'Single landing page with the agreed demo layout.', included: 'One responsive page and contact details.' }, cookie: ownerCookie
-  });
-  assert(quote.status === 201 && quote.data.conversation.quote?.amount === 200, `Owner quote creation failed with ${quote.status}.`);
-  const acceptedQuote = await request('POST', `/api/conversations/${syntheticConversationId}/accept-quote`, { cookie: customerCookie });
-  assert(acceptedQuote.status === 200, `Customer quote acceptance failed with ${acceptedQuote.status}.`);
-  results.push('two-account conversation, owner reply, protected PostgreSQL attachment upload/download, quote, and customer acceptance');
+  const quoteLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await quoteLockHolder.connect();
+  let quoteWhileLocked;
+  let acceptWhileLocked;
+  try {
+    await quoteLockHolder.query('BEGIN');
+    await quoteLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+    quoteWhileLocked = await Promise.race([
+      request('POST', `/api/conversations/${syntheticConversationId}/quote`, {
+        body: { amount: 200, scope: 'Single landing page with the agreed demo layout.', included: 'One responsive page and contact details.' }, cookie: ownerCookie
+      }).then(value => ({ done: true, value })),
+      new Promise(resolve => setTimeout(() => resolve({ done: false }), 1500))
+    ]);
+    if (quoteWhileLocked?.done && quoteWhileLocked.value.status === 201) {
+      const staffAcceptance = await request('POST', `/api/conversations/${syntheticConversationId}/accept-quote`, { cookie: employees.order_manager.cookie });
+      assert.equal(staffAcceptance.status, 403, 'An Order Manager must not accept a quote on behalf of the customer.');
+      acceptWhileLocked = await Promise.race([
+        request('POST', `/api/conversations/${syntheticConversationId}/accept-quote`, { cookie: customerCookie }).then(value => ({ done: true, value })),
+        new Promise(resolve => setTimeout(() => resolve({ done: false }), 1500))
+      ]);
+    }
+  } finally {
+    await quoteLockHolder.query('ROLLBACK').catch(() => {});
+    await quoteLockHolder.end();
+  }
+  assert(quoteWhileLocked?.done && quoteWhileLocked.value.status === 201 && quoteWhileLocked.value.data.conversation.quote?.amount === 200, 'Owner quote creation queued behind the global advisory lock.');
+  assert(acceptWhileLocked?.done && acceptWhileLocked.value.status === 200, 'Customer quote acceptance queued behind the global advisory lock.');
+  const acceptedQuoteRow = await client.query('SELECT state FROM quotes WHERE "conversationId" = $1 ORDER BY "createdAt" DESC LIMIT 1', [syntheticConversationId]);
+  const acceptedQuoteConversation = await client.query('SELECT data -> "agreedPriceSnapshot" AS snapshot FROM conversations WHERE id = $1', [syntheticConversationId]);
+  assert(acceptedQuoteRow.rows[0]?.state === 'accepted' && Number(acceptedQuoteConversation.rows[0]?.snapshot?.amount) === 200, 'Quote acceptance was not committed atomically with its immutable price snapshot.');
+  const repeatedQuoteAcceptances = await Promise.all(Array.from({ length: 4 }, () => request('POST', `/api/conversations/${syntheticConversationId}/accept-quote`, { cookie: customerCookie })));
+  assert(repeatedQuoteAcceptances.every(row => row.status === 409), 'An already accepted quote was accepted again by a duplicate request.');
+  const acceptedMessageCount = await client.query(`SELECT count(*)::int AS count FROM conversation_messages WHERE "conversationId" = $1 AND body LIKE 'تم قبول عرض السعر%'`, [syntheticConversationId]);
+  assert(Number(acceptedMessageCount.rows[0].count) === 1, 'Concurrent repeated acceptances wrote more than one acceptance message.');
+  results.push('two-account conversation, protected attachments, quote and acceptance complete under the legacy lock using row-scoped PostgreSQL transactions');
 
   const officialOrder = await request('POST', '/api/leads', {
     body: {

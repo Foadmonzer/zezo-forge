@@ -343,3 +343,45 @@ export async function loadEmployeeDashboardData(userId) {
     settings: settingsResult.rows[0]?.value || {}
   };
 }
+
+export async function loadOrderManagerOrders(userId, scope, department = 'orders') {
+  const conditions = [];
+  const values = [];
+  if (scope === 'assigned') {
+    values.push(userId);
+    conditions.push(`data ->> 'orderManagerUserId' = $${values.length}`);
+  } else if (scope === 'department') {
+    values.push(department || 'orders');
+    conditions.push(`COALESCE(NULLIF(data ->> 'department', ''), 'orders') = $${values.length}`);
+  } else if (scope !== 'all') {
+    return [];
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const result = await queryPostgres(`
+    SELECT id, "customerId", "referrerId", "developerId", status, "projectStage", "templateId", "agreedAmount", data, "createdAt", "updatedAt"
+    FROM project_requests ${where}
+    ORDER BY "createdAt" DESC
+  `, values);
+  return result.rows.map(row => ({
+    ...object(row.data), id: row.id, clientId: row.customerId || row.data?.clientId || null,
+    referralUserId: row.referrerId || row.data?.referralUserId || null,
+    developerUserId: row.developerId || row.data?.developerUserId || null,
+    status: row.status || row.data?.status || 'new', projectStage: row.projectStage || row.data?.projectStage || 'new_request',
+    templateId: row.templateId || row.data?.templateId || '',
+    contractAmount: row.agreedAmount == null ? row.data?.contractAmount ?? null : Number(row.agreedAmount),
+    createdAt: asIso(row.createdAt), updatedAt: asIso(row.updatedAt), attachments: Array.isArray(row.data?.attachments) ? row.data.attachments : []
+  }));
+}
+
+export async function loadConversationAssignees() {
+  const result = await queryPostgres(`
+    SELECT id, role, active, "fullName", data
+    FROM user_accounts
+    WHERE active = TRUE AND role <> 'admin'
+    ORDER BY "fullName", id
+  `);
+  return result.rows.map(row => ({
+    ...object(row.data), id: row.id, role: row.role, active: row.active,
+    name: row.fullName || row.data?.name || ''
+  }));
+}

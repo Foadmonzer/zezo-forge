@@ -28,6 +28,9 @@ const waves = Math.ceil(sampleCount / concurrency);
 const users = [];
 const conversationIds = [];
 const crmIds = [];
+const leadIds = [];
+let orderManagerId = '';
+let adminId = '';
 const gateCookie = `${STAGING_ACCESS_COOKIE}=${encodeURIComponent(createStagingSession())}`;
 
 class Response extends Writable {
@@ -108,6 +111,44 @@ try {
     users.push({ id: userId, username, sessionId, cookie: `zezo_session=${encodeURIComponent(sessionId)}` });
   }
 
+  orderManagerId = `phase6_order_manager_${suffix}`;
+  const orderManagerSessionId = randomBytes(32).toString('base64url');
+  const orderManagerSessionHash = createHash('sha256').update(orderManagerSessionId).digest('hex');
+  const orderManagerData = { name: 'Synthetic Phase 6 Order Manager', department: 'orders', mfaEnabledAt: now.toISOString() };
+  await client.query(`
+    INSERT INTO user_accounts (id,email,username,role,active,"fullName","passwordHash",data,"createdAt","updatedAt")
+    VALUES ($1,$2,$2,'order_manager',TRUE,$3,$4,$5::jsonb,NOW(),NOW())
+  `, [orderManagerId, `phase6_order_manager_${suffix}@example.test`, orderManagerData.name, passwordHash, JSON.stringify(orderManagerData)]);
+  await client.query('INSERT INTO auth_sessions (id,"userId","expiresAt",data,"createdAt") VALUES ($1,$2,NOW() + INTERVAL \'2 hours\',$3::jsonb,NOW())', [orderManagerSessionHash, orderManagerId, '{}']);
+  const orderManagerCookie = `zezo_session=${encodeURIComponent(orderManagerSessionId)}`;
+
+  adminId = `phase6_admin_${suffix}`;
+  const adminSessionId = randomBytes(32).toString('base64url');
+  const adminSessionHash = createHash('sha256').update(adminSessionId).digest('hex');
+  const adminData = { name: 'Synthetic Phase 6 Owner', department: 'owner', mfaEnabledAt: now.toISOString() };
+  await client.query(`
+    INSERT INTO user_accounts (id,email,username,role,active,"fullName","passwordHash",data,"createdAt","updatedAt")
+    VALUES ($1,$2,$2,'admin',TRUE,$3,$4,$5::jsonb,NOW(),NOW())
+  `, [adminId, `phase6_admin_${suffix}@example.test`, adminData.name, passwordHash, JSON.stringify(adminData)]);
+  await client.query('INSERT INTO auth_sessions (id,"userId","expiresAt",data,"createdAt") VALUES ($1,$2,NOW() + INTERVAL \'2 hours\',$3::jsonb,NOW())', [adminSessionHash, adminId, '{}']);
+  const adminCookie = `zezo_session=${encodeURIComponent(adminSessionId)}`;
+
+  for (let index = 0; index < usersToSeed; index++) {
+    const leadId = `phase6_order_${suffix}_${index}`;
+    leadIds.push(leadId);
+    const leadData = {
+      id: leadId, name: `Synthetic Order Customer ${index}`, email: users[index].username, phone: '', clientWhatsappPhone: '',
+      service: 'web', category: 'site', details: 'Synthetic order used by the Phase 7 dashboard benchmark.', budget: '200 ILS',
+      orderManagerUserId: orderManagerId, projectStage: 'under_review', status: 'review', attachments: [], supportNotes: [],
+      createdAt: now.toISOString(), updatedAt: now.toISOString()
+    };
+    await client.query(`
+      INSERT INTO project_requests (id,"customerId",status,"projectStage","agreedAmount",data,"createdAt","updatedAt")
+      VALUES ($1,$2,'review','under_review',200,$3::jsonb,$4,$4)
+    `, [leadId, users[index].id, JSON.stringify(leadData), now]);
+  }
+  await client.query('UPDATE conversations SET "assignedToId" = $1 WHERE id = ANY($2::text[])', [orderManagerId, conversationIds]);
+
   const ownerIdForCrm = `phase6_marketer_${suffix}`;
   const ownerSessionId = randomBytes(32).toString('base64url');
   const ownerSessionHash = createHash('sha256').update(ownerSessionId).digest('hex');
@@ -127,6 +168,8 @@ try {
 
   const conversations = users.map(user => () => request('GET', '/api/conversations', { cookie: user.cookie }));
   const dashboards = users.map(user => () => request('GET', '/api/dashboard', { cookie: user.cookie }));
+  const orderManagerDashboards = Array.from({ length: sampleCount }, () => () => request('GET', '/api/dashboard', { cookie: orderManagerCookie }));
+  const adminDashboards = Array.from({ length: sampleCount }, () => () => request('GET', '/api/dashboard', { cookie: adminCookie }));
   const crm = Array.from({ length: sampleCount }, () => () => request('GET', '/api/crm', { cookie: ownerCookie }));
   const loginUsers = [...users];
   const login = loginUsers.map(user => () => request('POST', '/api/auth/login', { body: { username: user.username, password, accountType: 'client' } }));
@@ -144,17 +187,20 @@ try {
     });
     output.push(compact(await measure('GET /api/conversations', mode, conversations)));
     output.push(compact(await measure('GET /api/dashboard', mode, dashboards)));
+    output.push(compact(await measure('GET /api/dashboard (order manager)', mode, orderManagerDashboards)));
+    output.push(compact(await measure('GET /api/dashboard (owner)', mode, adminDashboards)));
     const marketerDashboard = Array.from({ length: sampleCount }, () => () => request('GET', '/api/dashboard', { cookie: ownerCookie }));
     output.push(compact(await measure('GET /api/dashboard (marketer)', mode, marketerDashboard)));
     output.push(compact(await measure('GET /api/crm', mode, crm)));
   }
-  console.log(JSON.stringify({ database: databaseName, syntheticUsers: users.length, conversations: conversationIds.length, crmRecords: crmIds.length, results: output }, null, 2));
+  console.log(JSON.stringify({ database: databaseName, syntheticUsers: users.length + 3, conversations: conversationIds.length, orders: leadIds.length, crmRecords: crmIds.length, results: output }, null, 2));
 } finally {
   process.env.ZEZO_BENCH_LEGACY_CORE_READS = 'false';
   if (users.length) {
     await client.query('BEGIN').catch(() => {});
     try {
-      const testUserIds = [...users.map(user => user.id), `phase6_marketer_${suffix}`];
+      const testUserIds = [...users.map(user => user.id), `phase6_marketer_${suffix}`, orderManagerId, adminId];
+      await client.query('DELETE FROM project_requests WHERE id = ANY($1::text[])', [leadIds]);
       await client.query('DELETE FROM commissions WHERE "userId" = ANY($1::text[])', [testUserIds]);
       await client.query('DELETE FROM finance_ledger_entries WHERE "employeeId" = ANY($1::text[])', [testUserIds]);
       await client.query('DELETE FROM wallet_transactions WHERE "userId" = ANY($1::text[])', [testUserIds]);
@@ -170,7 +216,7 @@ try {
       await client.query('DELETE FROM conversations WHERE id = ANY($1::text[])', [conversationIds]);
       await client.query('DELETE FROM crm_records WHERE id = ANY($1::text[])', [crmIds]);
       await client.query('DELETE FROM user_accounts WHERE id = ANY($1::text[])', [testUserIds]);
-      const rateKeys = [...users.map(user => user.username), `phase6_marketer_${suffix}@example.test`]
+      const rateKeys = [...users.map(user => user.username), `phase6_marketer_${suffix}@example.test`, `phase6_order_manager_${suffix}@example.test`, `phase6_admin_${suffix}@example.test`]
         .map(username => createHash('sha256').update(`zezo-rate:login:127.0.0.1:${username}`).digest('hex'));
       await client.query('DELETE FROM rate_limit_buckets WHERE key = ANY($1::text[])', [rateKeys]);
       await client.query('COMMIT');

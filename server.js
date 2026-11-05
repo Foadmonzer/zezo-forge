@@ -7,11 +7,12 @@ import { randomBytes, scryptSync, timingSafeEqual, createHash, createHmac } from
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { templateCatalog, templateById } from './public/template-catalog.js';
 import { buildWhatsAppUrl, normalizeWhatsAppNumber } from './public/whatsapp.js';
-import { consumeRateLimitBucket, currentPostgresClient, deleteRateLimitBucket, postgresConfigured, withPostgresTransaction } from './src/server/postgres-runtime.js';
+import { consumeRateLimitBucket, currentPostgresClient, deleteRateLimitBucket, postgresConfigured, withPostgresReadTransaction, withPostgresTransaction } from './src/server/postgres-runtime.js';
 import { createStagingSession, isStagingSessionValid, STAGING_ACCESS_COOKIE, STAGING_SESSION_TTL_SECONDS, stagingPasswordMatches } from './src/server/staging-auth.js';
 import { deleteReferralTrackingForVisitor, loadNormalizedStore, persistNormalizedStore } from './src/server/postgres-store.js';
 import { loadPublicRuntimeSnapshot, loadPublicTrackRecord } from './src/server/public-read-repository.js';
-import { claimGuestConversations, findLoginAccount, loadClientDashboardData, loadConversationViews, loadCrmRecordsForViewer, loadCrmRelatedRows, loadEmployeeDashboardData, loadReferralEventsForUsers, loadSessionAccount, storeLoginSessionAndAudit } from './src/server/core-read-repository.js';
+import { claimGuestConversations, findLoginAccount, loadClientDashboardData, loadConversationAssignees, loadConversationViews, loadCrmRecordsForViewer, loadCrmRelatedRows, loadEmployeeDashboardData, loadOrderManagerOrders, loadReferralEventsForUsers, loadSessionAccount, storeLoginSessionAndAudit } from './src/server/core-read-repository.js';
+import { acceptPostgresQuote, createPostgresQuote } from './src/server/postgres-conversation-repository.js';
 import { claimNextOutboxMessage, completeOutboxMessage } from './src/server/outbox-repository.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
@@ -942,6 +943,56 @@ async function handlePostgresCoreRead(req, res, path) {
     return true;
   }
 
+  const directConversationMutation = /^\/api\/conversations\/([^/]+)\/(quote|accept-quote)$/.exec(path);
+  if (req.method === 'POST' && directConversationMutation) {
+    const [, conversationId, action] = directConversationMutation;
+    const auth = await directPostgresSessionUser(req);
+    if (action === 'quote') {
+      if (!directRequireAuth(req, res, auth?.user, ['admin', 'order_manager', 'hr_manager', 'marketing_manager'])) return true;
+      const body = await jsonBody(req);
+      const amount = Number(body.amount);
+      const scope = clean(body.scope, 1600);
+      const included = clean(body.included, 1200);
+      const exclusions = clean(body.exclusions, 1200);
+      if (!Number.isFinite(amount) || amount < 0 || amount > 10000000 || scope.length < 8) {
+        json(res, 400, { error: 'أدخل مبلغاً ووصف نطاق واضحين للعرض / Enter a valid amount and clear quote scope' }, security); return true;
+      }
+      const quote = { id: id('quote'), amount: money(amount), currency: 'ILS', scope, included, exclusions, createdBy: auth.user.id, acceptedAt: null };
+      const message = `${auth.user.name} · عرض سعر أولي: ${quote.amount} ₪\n${scope}${included ? `\n${included}` : ''}${exclusions ? `\nغير مشمول: ${exclusions}` : ''}\nالسعر لا يعتمد إلا بعد قبولك.`;
+      const result = await createPostgresQuote({
+        conversationId, actor: auth.user, quote, message, auditId: id('evt'), messageId: id('msg'), notificationId: id('ntf'),
+        at: now(), permissionScope: effectivePermission(auth.user, 'conversations.read'),
+        authorize: conversation => conversationAccess(auth.user, conversation, 'conversations.read') &&
+          requirePermission(auth, res, 'quotes.draft', { assigneeId: conversation.assignedUserId || '', ownerId: conversation.clientId || '', department: conversation.department || 'orders' })
+      });
+      if (result.kind === 'missing') json(res, 404, { error: 'المحادثة غير موجودة / Conversation not found' }, security);
+      else if (result.kind === 'forbidden') { if (!res.headersSent) json(res, 403, { error: 'لا تملك صلاحية إعداد عرض السعر لهذه المحادثة / Not permitted to quote this conversation' }, security); }
+      else json(res, 201, { conversation: result.conversation }, security);
+      return true;
+    }
+
+    const rawGuest = guestSessionValue(req);
+    const guestHash = rawGuest ? hash(rawGuest) : '';
+    const actor = auth?.user || { id: '', role: 'guest' };
+    if (auth && !directRequireAuth(req, res, auth.user, allRoles)) return true;
+    if (!['client', 'guest'].includes(actor.role)) {
+      json(res, 403, { error: 'قبول عرض السعر متاح للعميل فقط / Only the customer can accept a quote' }, security); return true;
+    }
+    const result = await acceptPostgresQuote({
+      conversationId, actor, guestHash, quoteMessage: 'تم قبول عرض السعر.', auditId: id('evt'), messageId: id('msg'), at: now(),
+      permissionScope: effectivePermission(actor, 'conversations.read'),
+      authorize: conversation => {
+        if (actor.role === 'client') return conversation.clientId === actor.id || Boolean(guestHash && conversation.guestSessionHash === guestHash);
+        if (actor.role === 'guest') return Boolean(guestHash && conversation.guestSessionHash === guestHash);
+        return conversationAccess(actor, conversation, 'conversations.read');
+      }
+    });
+    if (result.kind === 'missing' || result.kind === 'forbidden') json(res, 404, { error: 'المحادثة غير موجودة / Conversation not found' }, security);
+    else if (result.kind === 'no_pending_quote') json(res, 409, { error: 'لا يوجد عرض سعر ينتظر القبول / No quote is awaiting acceptance' }, security);
+    else json(res, 200, { ok: true, conversation: result.conversation }, security);
+    return true;
+  }
+
   if (req.method === 'GET' && path === '/api/dashboard') {
     const auth = await directPostgresSessionUser(req);
     if (auth?.user.role === 'client') {
@@ -968,6 +1019,39 @@ async function handlePostgresCoreRead(req, res, path) {
       const previousStore = store;
       try {
         store = { ...defaultStore(), ...data, users: [auth.user] };
+        json(res, 200, dashboardFor(auth.user), security);
+      } finally {
+        store = previousStore;
+      }
+      return true;
+    }
+    if (auth?.user.role === 'order_manager') {
+      if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
+      const user = auth.user;
+      const [orders, conversations, staffUsers] = await Promise.all([
+        loadOrderManagerOrders(user.id, effectivePermission(user, 'orders.manage'), user.department || roleDepartment(user.role)),
+        loadConversationViews(user, { permissionScope: effectivePermission(user, 'conversations.read'), department: user.department || roleDepartment(user.role) }),
+        hasPermission(user, 'conversations.assign', { department: 'orders' }) ? loadConversationAssignees() : Promise.resolve([])
+      ]);
+      const output = {
+        role: user.role, user: publicUser(user),
+        currentPermissions: Object.fromEntries(Object.keys(permissionDefinitions).map(key => [key, effectivePermission(user, key)])),
+        orders: permissionEnabled(user, 'orders.manage') ? orders.filter(lead => hasPermission(user, 'orders.manage', { assigneeId: lead.orderManagerUserId || '', ownerId: lead.clientId || '', department: 'orders' })).map(lead => safeOrderLead(lead, true)) : [],
+        conversations: conversations.filter(conversation => conversationAccess(user, conversation, 'conversations.read')),
+        conversationAssignees: staffUsers.filter(row => row.active && !row.accountDisabledAt && row.role !== 'admin' && hasPermission(row, 'conversations.read', { assigneeId: row.id, department: 'orders' })).map(row => ({ id: row.id, name: row.name, role: row.role, active: true }))
+      };
+      json(res, 200, output, security);
+      return true;
+    }
+    if (['admin', 'hr_manager', 'marketing_manager'].includes(auth?.user.role)) {
+      if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
+      // Until each management panel has a dedicated repository, take a consistent
+      // read-only snapshot. This skips both the global advisory lock and the legacy
+      // full-store rewrite; dashboardFor remains the role-specific serializer.
+      const snapshot = await withPostgresReadTransaction(client => loadNormalizedStore(client, defaultStore));
+      const previousStore = store;
+      try {
+        store = { ...defaultStore(), ...snapshot };
         json(res, 200, dashboardFor(auth.user), security);
       } finally {
         store = previousStore;
