@@ -248,7 +248,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   // An Owner assigns the conversation. The Order Manager responds and drafts a quote through the UI.
   await json(await ownerApi.patch(`/api/conversations/${encodeURIComponent(conversationId)}`, { data: { assignedUserId: orderManager.id } }));
   const orderPage = await browser.newPage({ viewport: { width: 1366, height: 900 } });
-  await loginThroughUI(orderPage, { username: orderManager.username, password: orderManager.password });
+  await loginThroughUI(orderPage, { username: orderManager.username, password: orderManager.password, accountType: 'management' });
   await orderPage.locator('[data-dash-tab="conversations"]').click();
   const staffConversation = orderPage.locator('details.conversation-staff-card').filter({ hasText: 'مطعم السعادة' });
   await expect(staffConversation).toBeVisible();
@@ -372,7 +372,7 @@ test('interactive demos perform their core local actions without external servic
   await page.locator('[data-ld="specialty"]').first().click();
   await page.locator('[data-ld="doctor"]').first().click();
   await page.locator('[data-ld-form="clinic-date"] input[name="date"]').fill('2026-12-01');
-  await page.locator('[data-ld-form="clinic-date"] button[type="submit"]').click();
+  await page.locator('[data-ld-form="clinic-date"] .ld-primary').click();
   await page.locator('[data-ld="clinic-time"]').first().click();
   await page.locator('[data-ld="confirm-booking"]').click();
   await expect(page.locator('.ld-clinic-confirmed')).toBeVisible();
