@@ -258,7 +258,11 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await staffConversation.locator(`[data-conversation-reply="${conversationId}"] textarea[name="message"]`).fill('Synthetic Order Manager response.');
   await staffConversation.locator(`[data-conversation-reply="${conversationId}"] button[type="submit"]`).click();
   const quoteEditor = staffConversation.locator('details.conversation-quote-editor');
-  await quoteEditor.locator('summary').click();
+  // Saving a reply refreshes the dashboard markup and collapses the conversation card.
+  if (!(await staffConversation.evaluate(element => element.open))) {
+    await staffConversation.locator(':scope > summary').click();
+  }
+  await quoteEditor.locator(':scope > summary').click();
   await quoteEditor.locator('[name="amount"]').fill('200');
   await quoteEditor.locator('[name="scope"]').fill('Single responsive ZEZO restaurant website scope for browser acceptance tests.');
   await quoteEditor.locator('[name="included"]').fill('One responsive landing page and contact details.');
@@ -393,10 +397,10 @@ test('interactive demos perform their core local actions without external servic
   await expect(page.locator('.ld-message-list .ld-message')).toHaveCount(3);
 
   await page.goto('/?preview=idea-business-canvas');
-  const planner = page.locator('#demoPlanner');
-  await expect(planner).toBeVisible();
-  await planner.locator('textarea').first().fill('Synthetic idea saved locally');
-  await planner.locator('button[type="submit"]').click();
+  const canvas = page.locator('.canvas-grid');
+  await expect(canvas).toBeVisible();
+  await canvas.locator('textarea[name="value"]').fill('Synthetic idea saved locally');
+  await page.locator('.canvas-toolbar [data-idea-action="save"]').click();
   await expect(page.locator('#templatePreviewNotice')).toContainText('حُفظت');
 });
 
