@@ -1,0 +1,44 @@
+services:
+  web:
+    build: .
+    image: zezo-forge:production
+    restart: unless-stopped
+    command: ["pnpm", "start", "--", "--hostname", "0.0.0.0", "--port", "3000"]
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL to the production PostgreSQL URL}
+      ZEZO_PUBLIC_URL: ${ZEZO_PUBLIC_URL:?Set ZEZO_PUBLIC_URL to the verified HTTPS domain}
+      ZEZO_DISABLE_ADMIN_SETUP: "true"
+      ZEZO_ENABLE_EMAIL_DELIVERY: "false"
+      ZEZO_TRUST_PROXY: ${ZEZO_TRUST_PROXY:-0}
+      ZEZO_DATABASE_POOL_SIZE: ${ZEZO_DATABASE_POOL_SIZE:-4}
+    ports:
+      - "127.0.0.1:${ZEZO_LOCAL_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+  mail-worker:
+    image: zezo-forge:production
+    build: .
+    restart: unless-stopped
+    command: ["pnpm", "worker:mail"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL to the production PostgreSQL URL}
+      ZEZO_DISABLE_ADMIN_SETUP: "true"
+      ZEZO_ENABLE_EMAIL_DELIVERY: "false"
+      ZEZO_DATABASE_POOL_SIZE: ${ZEZO_DATABASE_POOL_SIZE:-2}
+
+  migrate:
+    image: zezo-forge:production
+    build: .
+    profiles: ["tools"]
+    command: ["pnpm", "db:migrate:deploy"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${MIGRATION_DATABASE_URL:?Set MIGRATION_DATABASE_URL for the one-off migration role}

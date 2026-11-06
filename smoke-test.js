@@ -1,19 +1,24 @@
 import assert from 'node:assert/strict';
 import { Readable, Writable } from 'node:stream';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomBytes, createHmac } from 'node:crypto';
+import { randomBytes, createHmac, scryptSync } from 'node:crypto';
 import { templateCatalog, templateById } from './public/template-catalog.js';
 import { buildTemplateEnquiryMessage, buildWhatsAppUrl, normalizeWhatsAppNumber } from './public/whatsapp.js';
 
 const testDataDir = await mkdtemp(join(tmpdir(), 'zezo-v1-smoke-'));
 process.env.ZEZO_DATA_DIR = testDataDir;
 process.env.NODE_ENV = 'test';
+process.env.DATABASE_URL = '';
 process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP = '+971500000001';
 process.env.ZEZO_ORDERS_WHATSAPP = '+971500000002';
 for (const key of ['RESEND_API_KEY','ZEZO_FROM_EMAIL','ZEZO_NOTIFICATION_EMAIL','OPENAI_API_KEY','OPENAI_MODEL']) process.env[key]='';
 const temporaryPassword = () => `Smoke!${randomBytes(24).toString('base64url')}`;
+const initialAdminPassword = temporaryPassword();
+const adminPassword = temporaryPassword();
+const adminSalt = randomBytes(16).toString('hex');
+await writeFile(join(testDataDir, 'zezo-data.json'), JSON.stringify({ users: [{ id: 'synthetic_smoke_owner', name: 'Smoke Admin', username: 'smokeadmin', email: 'smoke-admin@example.test', role: 'admin', active: true, mustChangePassword: true, salt: adminSalt, passwordHash: scryptSync(initialAdminPassword, adminSalt, 64).toString('hex'), createdAt: new Date().toISOString() }] }));
 function currentTotp(secret){
   const alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';let bits=0,value=0,bytes=[];
   for(const char of secret){const index=alphabet.indexOf(char);if(index<0)continue;value=(value<<5)|index;bits+=5;if(bits>=8){bytes.push((value>>>(bits-8))&255);bits-=8;}}
@@ -79,8 +84,7 @@ async function enableManagementMfa(handle,cookie){
 let app;
 try {
   app = await import('./server.js');
-  const setupAvailable = await app.init();
-  assert.equal(setupAvailable, true, 'first run in local development should allow secure owner setup without a setup code');
+  assert.equal(await app.init(), false, 'public app startup never enables Owner self-registration');
 
   const home = await call(app.handle, 'GET', '/');
   assertStatus(home, 200, 'homepage');
@@ -88,13 +92,14 @@ try {
   assert.match(home.body,/data-customer-view="login"[\s\S]*?data-customer-view="register"/,'public client access starts with separate sign-in and account creation choices');
   assert.match(home.body,/name="confirmPassword"/,'client registration asks for password confirmation');
   assert.match(home.body,/name="student"/,'client registration asks whether the user is a university student');
+  assert.doesNotMatch(home.body,/id="firstAdminSetup"|id="setupForm"|Create the first Owner account/i,'public UI does not expose Owner creation');
   assert.doesNotMatch(home.body,/footer-team[^>]*>\s*(?:مساحة الفريق|Team access)/,'public footer does not expose a staff portal link');
   const teamPortal = await call(app.handle,'GET','/team');
   assertStatus(teamPortal,200,'direct team portal route');
   assert.match(teamPortal.body,/employeeLoginForm/,'team portal route serves the protected sign-in interface');
   const badClientRegistration=await call(app.handle,'POST','/api/client/register',{remoteAddress:'127.0.0.11',body:{name:'Smoke Signup',email:'signup-mismatch@example.test',password:'Smoke!Registration123',confirmPassword:'Smoke!Registration456',student:true,university:'Test University'}});
   assertStatus(badClientRegistration,400,'client registration rejects mismatched passwords');
-  const clientSignup=await call(app.handle,'POST','/api/client/register',{remoteAddress:'127.0.0.12',body:{name:'Smoke Signup',email:'signup-client@example.test',password:'Smoke!Registration123',confirmPassword:'Smoke!Registration123',student:true,university:'Test University'}});
+  const clientSignup=await call(app.handle,'POST','/api/client/register',{remoteAddress:'127.0.0.12',body:{name:'Smoke Signup',email:'signup-client@example.test',password:'Smoke!Registration123',confirmPassword:'Smoke!Registration123',student:true,university:'Test University',role:'admin'}});
   assertStatus(clientSignup,201,'client registration creates a client account');
   const signedUpClient=asJson(clientSignup);
   assert.equal(signedUpClient.user.role,'client','public registration cannot choose a staff role');
@@ -180,7 +185,7 @@ try {
   assert.equal(templateUrl.pathname,'/971500000002','template order opens the orders department number');
   assert.equal(templateUrl.searchParams.get('text'),templateMessage,'Arabic and line breaks survive wa.me URL encoding');
   assert.ok(!buildTemplateEnquiryMessage({title:'Template',code:'WEB-003',price:200}).includes('رمز الإحالة'),'template message omits absent referral attribution');
-  assert.equal(publicConfig.adminSetupAvailable,true,'local first-admin setup should be available before the first administrator exists');
+  assert.equal(Object.hasOwn(publicConfig,'adminSetupAvailable'),false,'public configuration does not advertise Owner setup');
   assert.equal(publicConfig.prices.find(p=>p.id==='landing-basic')?.price,150,'basic landing page price should be 150 ILS');
   assert.equal(publicConfig.prices.find(p=>p.id==='landing-custom')?.price,300,'custom landing page price should be 300 ILS');
   assert.equal(Object.keys(publicConfig.templatePrices||{}).length,40,'public pricing config should expose all template price slots');
@@ -189,16 +194,15 @@ try {
   const quote=asJson(await call(app.handle,'POST','/api/quote',{body:{brief:'أحتاج صفحة تعريف بسيطة من صفحة واحدة',lang:'ar'}}));
   assert.equal(quote.packageId,'landing-basic','quote assistant should recommend only a scoped fixed package');
   assert.equal(quote.price,150);
-  const initialAdminPassword = temporaryPassword();
-  const adminPassword = temporaryPassword();
   process.env.NODE_ENV='production';
-  assert.equal(asJson(await call(app.handle,'GET','/api/public')).adminSetupAvailable,false,'production must hide first-admin setup');
-  assertStatus(await call(app.handle,'POST','/api/setup',{body:{name:'Public Admin',username:'publicadmin',password:'123456789'}}),403,'production cannot create a first administrator through the public form');
+  assert.equal(Object.hasOwn(asJson(await call(app.handle,'GET','/api/public')),'adminSetupAvailable'),false,'production public configuration omits Owner setup');
+  assertStatus(await call(app.handle,'POST','/api/setup',{body:{name:'Public Admin',username:'publicadmin',password:'Synthetic-Only-Password-9876'}}),410,'production public API permanently refuses Owner creation');
   process.env.NODE_ENV='test';
-  const adminSetup = await call(app.handle, 'POST', '/api/setup', { body: { name: 'Smoke Admin', username: 'smokeadmin', password: initialAdminPassword } });
-  assertStatus(adminSetup, 201, 'first administrator setup');
-  const adminCookie = sessionFrom(adminSetup);
-  assert.equal(asJson(adminSetup).user.mustChangePassword,true,'first administrator must change the temporary password before accessing data');
+  assertStatus(await call(app.handle,'POST','/api/setup',{body:{name:'Smoke Admin',username:'smokeadmin',password:initialAdminPassword}}),410,'test-mode public API also permanently refuses Owner creation');
+  const adminLogin=await call(app.handle,'POST','/api/auth/login',{body:{username:'smokeadmin',password:initialAdminPassword,accountType:'management'}});
+  assertStatus(adminLogin,200,'synthetic pre-provisioned Owner login');
+  const adminCookie = sessionFrom(adminLogin);
+  assert.equal(asJson(adminLogin).user.mustChangePassword,true,'synthetic Owner must change the bootstrap password before accessing data');
   assertStatus(await call(app.handle,'GET','/api/dashboard',{cookie:adminCookie}),428,'temporary admin password locks the dashboard');
   assertStatus(await call(app.handle,'POST','/api/auth/password',{cookie:adminCookie,body:{currentPassword:initialAdminPassword,newPassword:adminPassword}}),200,'first admin changes temporary password');
   assertStatus(await call(app.handle,'GET','/api/dashboard',{cookie:adminCookie}),428,'management dashboard stays locked until two-step verification is enabled');
@@ -212,7 +216,7 @@ try {
   assertStatus(login, 200, 'administrator login');
   assertStatus(await call(app.handle, 'POST', '/api/auth/login', { body:{username:'smokeadmin',password:adminPassword,accountType:'employee'} }), 401, 'administrator cannot use the employee login lane');
   assertStatus(await call(app.handle, 'POST', '/api/auth/login', { body:{username:'smokeadmin',password:'incorrect',accountType:'management'} }), 401, 'invalid password');
-  assertStatus(await call(app.handle, 'POST', '/api/setup', { body: { name: 'Another Admin', username: 'otheradmin', password: temporaryPassword() } }), 409, 'only one initial administrator setup');
+  assertStatus(await call(app.handle, 'POST', '/api/setup', { body: { name: 'Another Admin', username: 'otheradmin', password: temporaryPassword() } }), 410, 'public Owner creation remains permanently closed after an Owner exists');
 
   async function invite(name, username, role) {
     const body={ name, username, role, email:`${username}@example.test` };if(role==='admin')body.ownerMfaCode=currentTotp(ownerMfaSecret);
