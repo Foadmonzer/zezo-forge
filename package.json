@@ -2,6 +2,7 @@
   "name": "zezo-digital-platform",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@11.25.0",
   "description": "ZEZO bilingual website and referral workspace",
   "type": "module",
   "scripts": {
@@ -14,6 +15,10 @@
     "db:generate": "prisma generate",
     "db:migrate:dev": "prisma migrate dev",
     "db:migrate:deploy": "prisma migrate deploy",
+    "db:backup:encrypted": "node scripts/postgres-encrypted-backup.mjs backup",
+    "db:restore:encrypted:test": "node scripts/postgres-encrypted-backup.mjs restore",
+    "backup:railway": "node scripts/railway-postgres-backup.mjs",
+    "owner:provision": "node scripts/provision-owner.mjs",
     "worker:mail": "node outbox-worker.js",
     "test:smoke": "node smoke-test.js",
     "test:staging": "node staging-smoke-test.js",
