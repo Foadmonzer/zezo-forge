@@ -1,5 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { request as playwrightRequest } from 'playwright';
+import pg from 'pg';
+import { provisionFirstOwner } from '../src/server/owner-bootstrap.js';
 import { readFile } from 'node:fs/promises';
 import { randomUUID, createHmac } from 'node:crypto';
 
@@ -167,8 +169,19 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   const ownerPassword = `Owner!${suffix}Changed2026`;
   const ownerApi = await playwrightRequest.newContext({ baseURL });
 
-  const setup = await json(await ownerApi.post('/api/setup', { data: { name: 'Synthetic E2E Owner', username: ownerUsername, password: ownerTemporary } }));
-  expect(setup.user.role).toBe('admin');
+  const ownerDb = new pg.Client({ connectionString: process.env.DATABASE_URL, application_name: 'zezo-playwright-owner-bootstrap' });
+  await ownerDb.connect();
+  const provisionedOwner = await provisionFirstOwner({
+    client: ownerDb,
+    name: 'Synthetic E2E Owner',
+    username: ownerUsername,
+    email: `${ownerUsername}@example.test`,
+    password: ownerTemporary,
+  });
+  await ownerDb.end();
+  expect(provisionedOwner.mustChangePassword).toBe(true);
+  const bootstrapLogin = await json(await ownerApi.post('/api/auth/login', { data: { username: ownerUsername, password: ownerTemporary, accountType: 'management' } }));
+  expect(bootstrapLogin.user.role).toBe('admin');
   await json(await ownerApi.post('/api/auth/password', { data: { currentPassword: ownerTemporary, newPassword: ownerPassword } }));
   const ownerLogin = await json(await ownerApi.post('/api/auth/login', { data: { username: ownerUsername, password: ownerPassword, accountType: 'management' } }));
   const ownerMfa = await json(await ownerApi.get('/api/auth/mfa/setup'));
