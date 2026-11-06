@@ -14,6 +14,7 @@ import { loadPublicRuntimeSnapshot, loadPublicTrackRecord } from './src/server/p
 import { claimGuestConversations, findLoginAccount, loadClientDashboardData, loadConversationAssignees, loadConversationViews, loadCrmRecordsForViewer, loadCrmRelatedRows, loadEmployeeDashboardData, loadOrderManagerOrders, loadReferralEventsForUsers, loadSessionAccount, storeLoginSessionAndAudit } from './src/server/core-read-repository.js';
 import { acceptPostgresQuote, createPostgresQuote } from './src/server/postgres-conversation-repository.js';
 import { claimNextOutboxMessage, completeOutboxMessage } from './src/server/outbox-repository.js';
+import { createPostgresWithdrawalRequest } from './src/server/postgres-withdrawal-repository.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const STAGING_MODE = process.env.ZEZO_STAGING === 'true';
@@ -122,8 +123,6 @@ function setProjectStage(lead, stage, actor, note='', clientNote='') {
   return true;
 }
 const publicUser = u => ({ id: u.id, name: u.name, username: u.username, email: u.email || '', phone: u.phone || '', instagram:u.instagram||'', socialLinks:u.socialLinks||'', telegramUsername:u.telegramUsername||'', role: u.role, active: u.active, accountDisabled:Boolean(u.accountDisabledAt), accountProvisioned:Boolean(u.passwordHash), mustChangePassword:Boolean(u.mustChangePassword), mfaEnabled:Boolean(u.mfaEnabledAt), referralCode: referralEnabled(u) ? (u.currentReferralCode||u.referralCode) : undefined, inviteApprovalStatus:u.inviteApprovalStatus||'', inviteStatus:invitationStatus(u), inviteExpiresAt:u.inviteExpiresAt||null, createdAt: u.createdAt });
-function canSetUpFirstAdmin() { return process.env.ZEZO_DISABLE_ADMIN_SETUP !== 'true' && (STAGING_MODE || process.env.NODE_ENV !== 'production'); }
-function firstAdminSetupAvailable() { return canSetUpFirstAdmin() && !store.users.some(u=>u.role==='admin'&&u.active); }
 const money = n => Math.round(Number(n) * 100) / 100;
 const cents = n => Math.round((Number(n)||0) * 100);
 const fromCents = n => Number((Number(n||0)/100).toFixed(2));
@@ -412,7 +411,7 @@ async function initStore() {
   for(const lead of store.leads){const linked=(store.crmLeads||[]).some(row=>row.orderIds?.includes(lead.id)||row.id===lead.crmLeadId);ensureCrmCaseForOrder(lead);if(!linked)migratedCrm=true;}
   if(postgresConfigured() || migratedSetupFields || migratedWithdrawals || migratedTemplateAvailability || migratedTemplatePricing || migratedPermissionData || migratedClientData || migratedNotifications || migratedCrm || referralLinksCreated || referralDataCleaned || rankRequestsCreated.length || financeMigrated || store.users.some(referralEnabled)) await persist();
   for (const request of rankRequestsCreated) await queueRankRequestMail(request);
-  return firstAdminSetupAvailable();
+  return false;
 }
 function audit(actor, action, target, detail = '') {
   const entry={ id: id('evt'), at: now(), actor: actor ? actor.username : 'system', actorId:actor?.id||'', role: actor?.role || 'system', action, target, detail: clean(detail, 180) };
@@ -1482,21 +1481,39 @@ function updateDeveloperCommission(lead) {
 }
 function outstandingDeveloperCommission(lead){return money(Math.max(0,Number(lead.developerCommissionAmount||0)-Number(lead.developerCommissionPaidAmount||0)));}
 function developerCommissionDebt(userId){return money(store.leads.filter(lead=>lead.developerUserId===userId).reduce((sum,lead)=>sum+Number(lead.developerCommissionDebtRemaining||0),0));}
+const activeWithdrawalStatuses=new Set(['pending','under_review','approved','awaiting_transfer','requested']);
+function reservedCommissionAmount(lead,kind){
+  const outstanding=kind==='developer'?outstandingDeveloperCommission(lead):outstandingCommission(lead);
+  let reserved=0;
+  for(const withdrawal of store.withdrawals){
+    if(!activeWithdrawalStatuses.has(withdrawal.status))continue;
+    const matching=(withdrawal.commissionItems||[]).filter(item=>item.leadId===lead.id&&item.kind===kind);
+    if(!matching.length)continue;
+    // Legacy active requests may not have per-commission amounts. Reserve the
+    // whole matching commission conservatively until that request is resolved.
+    if(matching.some(item=>!Number.isFinite(Number(item.amount))||Number(item.amount)<=0))reserved+=outstanding;
+    else reserved+=matching.reduce((sum,item)=>sum+Number(item.amount),0);
+  }
+  return money(Math.min(outstanding,reserved));
+}
+function availableOutstandingCommission(lead,kind){
+  const outstanding=kind==='developer'?outstandingDeveloperCommission(lead):outstandingCommission(lead);
+  return money(Math.max(0,outstanding-reservedCommissionAmount(lead,kind)));
+}
 function walletFor(userId){
   const referrals=store.leads.filter(lead=>lead.referralUserId===userId),projects=store.leads.filter(lead=>lead.developerUserId===userId);
   const refPending=money(referrals.filter(lead=>lead.commissionStatus==='pending').reduce((sum,lead)=>sum+outstandingCommission(lead),0));
   const devPending=money(projects.filter(lead=>lead.developerCommissionStatus==='pending').reduce((sum,lead)=>sum+outstandingDeveloperCommission(lead),0));
-  const refGross=money(referrals.filter(lead=>lead.commissionStatus==='confirmed'&&!lead.withdrawalId).reduce((sum,lead)=>sum+outstandingCommission(lead),0));
-  const devGross=money(projects.filter(lead=>lead.developerCommissionStatus==='confirmed'&&!lead.developerWithdrawalId).reduce((sum,lead)=>sum+outstandingDeveloperCommission(lead),0));
+  const refGross=money(referrals.filter(lead=>lead.commissionStatus==='confirmed').reduce((sum,lead)=>sum+availableOutstandingCommission(lead,'referral'),0));
+  const devGross=money(projects.filter(lead=>lead.developerCommissionStatus==='confirmed').reduce((sum,lead)=>sum+availableOutstandingCommission(lead,'developer'),0));
   const refDebt=outstandingCommissionDebt(userId),devDebt=developerCommissionDebt(userId),debt=money(refDebt+devDebt);
-  const activeWithdrawalStatuses=['pending','under_review','approved','awaiting_transfer','requested'];
-  const requested=money(store.withdrawals.filter(item=>item.userId===userId&&activeWithdrawalStatuses.includes(item.status)).reduce((sum,item)=>sum+Number(item.amount||0),0));
+  const requested=money(store.withdrawals.filter(item=>item.userId===userId&&activeWithdrawalStatuses.has(item.status)).reduce((sum,item)=>sum+Number(item.amount||0),0));
   const paid=money(store.withdrawals.filter(item=>item.userId===userId&&item.status==='paid').reduce((sum,item)=>sum+Number(item.amount||0),0));
   const refPaid=money(store.withdrawals.filter(item=>item.userId===userId&&item.status==='paid').reduce((sum,item)=>sum+Number(item.referralAmount||0),0));
   const devPaid=money(store.withdrawals.filter(item=>item.userId===userId&&item.status==='paid').reduce((sum,item)=>sum+Number(item.developerAmount||0),0));
   return {pending:money(refPending+devPending),confirmed:money(Math.max(0,refGross+devGross-debt)),requested,paid,debt,
-    referral:{pending:refPending,available:money(Math.max(0,refGross-refDebt)),reserved:money(store.withdrawals.filter(item=>item.userId===userId&&activeWithdrawalStatuses.includes(item.status)).reduce((sum,item)=>sum+Number(item.referralAmount||0),0)),paid:refPaid},
-    developer:{pending:devPending,available:money(Math.max(0,devGross-devDebt)),reserved:money(store.withdrawals.filter(item=>item.userId===userId&&activeWithdrawalStatuses.includes(item.status)).reduce((sum,item)=>sum+Number(item.developerAmount||0),0)),paid:devPaid},
+    referral:{pending:refPending,available:money(Math.max(0,refGross-refDebt)),reserved:money(store.withdrawals.filter(item=>item.userId===userId&&activeWithdrawalStatuses.has(item.status)).reduce((sum,item)=>sum+Number(item.referralAmount||0),0)),paid:refPaid},
+    developer:{pending:devPending,available:money(Math.max(0,devGross-devDebt)),reserved:money(store.withdrawals.filter(item=>item.userId===userId&&activeWithdrawalStatuses.has(item.status)).reduce((sum,item)=>sum+Number(item.developerAmount||0),0)),paid:devPaid},
     ledger:store.financeLedger.filter(row=>row.employeeId===userId&&row.type.startsWith('commission_')).slice(0,80).map(row=>({id:row.id,postedAt:row.postedAt,leadId:row.leadId,type:row.type,commissionKind:row.commissionKind,amount:fromCents(row.amountCents),currency:row.currency,status:row.statusSnapshot}))};
 }
 function dashboardFor(user) {
@@ -1544,8 +1561,8 @@ function dashboardFor(user) {
   return common;
 }
 function withdrawalForMarketer(w) { return { id:w.id, createdAt:w.createdAt, amount:w.amount, referralAmount:w.referralAmount||0, developerAmount:w.developerAmount||0, method:w.method, status:w.status, updatedAt:w.updatedAt || null, transferReference:w.status === 'paid' ? w.transferReference : undefined }; }
-function availableCommissionLeads(userId) { return store.leads.filter(l=>l.referralUserId===userId&&l.commissionStatus==='confirmed'&&!l.withdrawalId&&outstandingCommission(l)>0); }
-function availableDeveloperCommissionLeads(userId) { return store.leads.filter(l=>l.developerUserId===userId&&l.developerCommissionStatus==='confirmed'&&!l.developerWithdrawalId&&outstandingDeveloperCommission(l)>0); }
+function availableCommissionLeads(userId) { return store.leads.filter(l=>l.referralUserId===userId&&l.commissionStatus==='confirmed'&&availableOutstandingCommission(l,'referral')>0); }
+function availableDeveloperCommissionLeads(userId) { return store.leads.filter(l=>l.developerUserId===userId&&l.developerCommissionStatus==='confirmed'&&availableOutstandingCommission(l,'developer')>0); }
 function updateCommission(lead) {
   if (!lead.contractAmount || !lead.referralUserId || lead.status === 'proposal' || lead.status === 'review' || lead.status === 'new') {
     lead.commissionAmount = null; lead.commissionDebtRemaining = 0; lead.commissionStatus = lead.referralUserId ? 'pending_setup' : 'none'; return;
@@ -1578,6 +1595,10 @@ function outstandingCommission(lead) { return money(Math.max(0, Number(lead.comm
 function outstandingCommissionDebt(userId) { return money(store.leads.filter(l=>l.referralUserId===userId).reduce((sum,l)=>sum+Number(l.commissionDebtRemaining||0),0)); }
 function cancelWithdrawalForLead(lead, actor = null) {
   const withdrawalIds=new Set([lead.withdrawalId,lead.developerWithdrawalId].filter(Boolean));
+  for(const withdrawal of store.withdrawals){
+    if(!activeWithdrawalStatuses.has(withdrawal.status))continue;
+    if((withdrawal.commissionItems||[]).some(item=>item.leadId===lead.id&&(item.kind==='developer'?lead.developerUserId===withdrawal.userId:lead.referralUserId===withdrawal.userId)))withdrawalIds.add(withdrawal.id);
+  }
   for(const withdrawalId of withdrawalIds){
     const withdrawal=store.withdrawals.find(w=>w.id===withdrawalId);if(!withdrawal||!['pending','under_review','approved','awaiting_transfer','requested'].includes(withdrawal.status))continue;
     const priorStatus=withdrawal.status;withdrawal.status='rejected';withdrawal.updatedAt=now();withdrawal.note='Released because a related project was refunded or cancelled.';
@@ -1592,6 +1613,21 @@ function cancelWithdrawalForLead(lead, actor = null) {
 async function handle(req, res) {
   if (!postgresConfigured()) return handleRequest(req, res);
   const path = new URL(req.url, `http://localhost:${PORT}`).pathname;
+  // Public Owner setup is permanently closed. The first Owner is provisioned
+  // only by scripts/provision-owner.mjs with direct administrative DB access.
+  if (req.method === 'POST' && path === '/api/setup') return handleRequest(req, res);
+  if (req.method === 'POST' && path === '/api/marketer/withdrawals') {
+    if (!stagingAuthorized(req)) return handleRequest(req, res);
+    const security = responseSecurityHeaders();
+    const auth = await directPostgresSessionUser(req);
+    if (!auth) return json(res, 401, { error: 'سجّل الدخول للمتابعة / Please sign in to continue' }, security);
+    if (auth.user.mustChangePassword) return json(res, 428, { error: 'غيّر كلمة المرور المؤقتة أولاً / Change the temporary password first', mustChangePassword: true }, security);
+    if (!['marketer', 'developer'].includes(auth.user.role)) return json(res, 403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }, security);
+    const body = await jsonBody(req);
+    const result = await createPostgresWithdrawalRequest({ sessionHash: sessionKey(auth.sid), body });
+    if (result.error) return json(res, result.status, { error: result.error, ...(result.mustChangePassword ? { mustChangePassword: true } : {}) }, security);
+    return json(res, result.status, { withdrawal: result.withdrawal }, security);
+  }
   // Health checks disclose no store data or mutable state. Keep them outside the
   // compatibility-store transaction so probes do not queue behind business writes.
   if (req.method === 'GET' && path === '/api/health') return handleRequest(req, res);
@@ -1694,6 +1730,9 @@ async function handleRequest(req, res) {
     res.writeHead(401, { ...security, 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
     return res.end('ZEZO Forge staging access required.');
   }
+  if (req.method === 'POST' && path === '/api/setup') {
+    return json(res, 410, { error: 'إنشاء المالك متاح فقط من أداة الإدارة الخاصة وعلى قاعدة PostgreSQL / Owner creation is available only through the private administrative CLI against PostgreSQL' }, security);
+  }
   if (path.startsWith('/api/')) {
     if (req.method === 'GET' && path === '/api/health') return json(res, 200, { ok: true, app: 'ZEZO', storage: postgresConfigured() ? 'postgresql' : 'local-json', staging: STAGING_MODE }, security);
     if (req.method === 'GET' && path === '/api/public') {
@@ -1701,7 +1740,7 @@ async function handleRequest(req, res) {
       const customerSupportPhone = STAGING_MODE ? '' : normalizeWhatsAppNumber(process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP !== undefined ? process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP : legacyPhone);
       const ordersPhone = STAGING_MODE ? '' : normalizeWhatsAppNumber(process.env.ZEZO_ORDERS_WHATSAPP !== undefined ? process.env.ZEZO_ORDERS_WHATSAPP : legacyPhone);
       const ordersUrl = buildWhatsAppUrl(ordersPhone);
-      return json(res, 200, { prices: store.settings.prices.filter(price=>price.active!==false), templatePrices: store.settings.templatePrices || {}, templateInclusions:store.settings.templateInclusions||{}, templateActive:store.settings.templateActive||{}, commissionConfigured: store.settings.commissionPercent != null, customerSupportWhatsappNumber:customerSupportPhone, ordersWhatsappNumber:ordersPhone, customerSupportWhatsappUrl:buildWhatsAppUrl(customerSupportPhone), ordersWhatsappUrl:ordersUrl, whatsappUrl:ordersUrl, emailReady: emailReady() && adminEmailReady(), aiQuoteReady:!STAGING_MODE&&Boolean(process.env.OPENAI_API_KEY&&process.env.OPENAI_MODEL), adminSetupAvailable:firstAdminSetupAvailable(), stagingMode:STAGING_MODE }, security);
+      return json(res, 200, { prices: store.settings.prices.filter(price=>price.active!==false), templatePrices: store.settings.templatePrices || {}, templateInclusions:store.settings.templateInclusions||{}, templateActive:store.settings.templateActive||{}, commissionConfigured: store.settings.commissionPercent != null, customerSupportWhatsappNumber:customerSupportPhone, ordersWhatsappNumber:ordersPhone, customerSupportWhatsappUrl:buildWhatsAppUrl(customerSupportPhone), ordersWhatsappUrl:ordersUrl, whatsappUrl:ordersUrl, emailReady: emailReady() && adminEmailReady(), aiQuoteReady:!STAGING_MODE&&Boolean(process.env.OPENAI_API_KEY&&process.env.OPENAI_MODEL), stagingMode:STAGING_MODE }, security);
     }
     if(req.method==='POST'&&path==='/api/conversations'){
       if(!await rateAllowedFor(conversationAttempts,`create:${req.socket.remoteAddress||'unknown'}`,15,60*60_000))return json(res,429,{error:'وصلنا الحد المؤقت للمحادثات. حاول لاحقاً / Conversation limit reached. Try again later.'},security);
@@ -1976,20 +2015,6 @@ async function handleRequest(req, res) {
     if(req.method==='GET'&&path==='/api/admin/finance'){
       const auth=requireAuth(req,res,['admin']);if(!auth)return;
       return json(res,200,financeTreasuryFor(Object.fromEntries(url.searchParams)),security);
-    }
-    if (req.method === 'POST' && path === '/api/setup') {
-      const b = await jsonBody(req);
-      if (store.users.some(u=>u.role==='admin'&&u.active)) return json(res,409,{error:'تم إنشاء حساب المدير مسبقاً / Initial administrator already exists'},security);
-      if (!canSetUpFirstAdmin()) return json(res,403,{error:'إنشاء المدير الأول متاح في المعاينة المحلية فقط / First administrator setup is available only in local development'},security);
-      const setupKey=`first-admin:${req.socket.remoteAddress||'unknown'}`;
-      if (!await rateAllowed(setupKey)) return json(res,429,{error:'محاولات كثيرة. حاول بعد 15 دقيقة / Too many attempts; try again in 15 minutes'},security);
-      const name = clean(b.name,80), username = clean(b.username,40).toLowerCase();
-      if (name.length < 2 || !/^[a-z0-9._-]{3,40}$/.test(username) || !validTemporaryPassword(b.password)) return json(res,400,{error:'أدخل اسماً واسم مستخدم صالحاً وكلمة مرور مؤقتة من 9 خانات على الأقل / Use a valid name, username, and a temporary password of at least 9 characters'},security);
-      const record = passwordRecord(b.password);
-      const admin = { id:id('usr'), name, username, role:'admin', active:true, mustChangePassword:true, createdAt:now(), ...record };
-       store.users.push(admin); loginAttempts.delete(setupKey); await clearRateLimit('login', setupKey); audit(admin,'admin_setup','account','First administrator created; temporary password must be changed'); await persist();
-      const sid=token(); sessions.set(sessionKey(sid),{userId:admin.id,expires:Date.now()+SESSION_TTL});
-      return json(res,201,{user:publicUser(admin)}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
     }
     if (req.method === 'POST' && path === '/api/client/register') {
       const b=await jsonBody(req),ip=req.socket.remoteAddress||'unknown';
@@ -2526,7 +2551,7 @@ async function handleRequest(req, res) {
       if(store.withdrawals.some(item=>item.userId===auth.user.id&&item.month===month)) return json(res,409,{error:'تم استخدام طلب السحب الشهري لهذا الشهر / Your monthly withdrawal request has already been used'},security);
       const offsetAmount=money(Math.min(totalDebt,amount)),grossAmount=money(amount+offsetAmount);let remainingGross=grossAmount;
       const commissionItems=[];let referralAmount=0,developerAmount=0;
-      for(const [kind,leads] of [['referral',referralAvailable],['developer',developerAvailable]])for(const lead of leads){if(remainingGross<=0.001)break;const available=kind==='referral'?outstandingCommission(lead):outstandingDeveloperCommission(lead),selected=money(Math.min(available,remainingGross));if(selected<=0)continue;commissionItems.push({leadId:lead.id,kind,amount:selected});if(kind==='referral')referralAmount=money(referralAmount+selected);else developerAmount=money(developerAmount+selected);remainingGross=money(remainingGross-selected);}
+      for(const [kind,leads] of [['referral',referralAvailable],['developer',developerAvailable]])for(const lead of leads){if(remainingGross<=0.001)break;const available=availableOutstandingCommission(lead,kind),selected=money(Math.min(available,remainingGross));if(selected<=0)continue;commissionItems.push({leadId:lead.id,kind,amount:selected});if(kind==='referral')referralAmount=money(referralAmount+selected);else developerAmount=money(developerAmount+selected);remainingGross=money(remainingGross-selected);}
       if(remainingGross>0.01)return json(res,409,{error:'تغير الرصيد أثناء إعداد الطلب؛ حدّث الصفحة وأعد المحاولة / Balance changed; refresh and retry'},security);
       const withdrawal={id:id('wd'),userId:auth.user.id,name:auth.user.name,email:auth.user.email,role:auth.user.role,month,createdAt:now(),updatedAt:now(),amount,grossAmount,offsetAmount,balanceAtRequest:netAvailable,referralAmount,developerAmount,method:clean(b.method,20)||'binance',destination,status:'pending',commissionItems,commissionIds:commissionItems.map(item=>item.leadId),transferReference:'',transferDetails:null,note:'',statusHistory:[{status:'pending',at:now(),by:auth.user.username}]};
       for(const item of commissionItems){const lead=store.leads.find(row=>row.id===item.leadId);if(item.kind==='developer')lead.developerWithdrawalId=withdrawal.id;else lead.withdrawalId=withdrawal.id;}
@@ -2573,8 +2598,8 @@ async function handleRequest(req, res) {
         withdrawal.transferReference=transferReference;withdrawal.paidAt=new Date(transferredAt).toISOString();withdrawal.method=method;withdrawal.transferDetails={ilsDue:withdrawal.amount,sentAmount:money(sentAmount),sentCurrency,exchangeRate:money(exchangeRate),feeAmount:money(feeAmount),feeBearer,reference:transferReference,transferredAt:withdrawal.paidAt,proofReference,verifiedBy:auth.user.username,verifiedAt:now()};withdrawal.statusHistory.push({status:'paid',from:priorStatus,at:withdrawal.paidAt,by:auth.user.username});
         for(const debt of offsetAllocations){if(debt.kind==='developer'){debt.lead.developerCommissionOffsetAmount=money(Number(debt.lead.developerCommissionOffsetAmount||0)+debt.applied);updateDeveloperCommission(debt.lead);}else{debt.lead.commissionOffsetAmount=money(Number(debt.lead.commissionOffsetAmount||0)+debt.applied);updateCommission(debt.lead);}}
         for(const item of withdrawal.commissionItems||[]){const lead=store.leads.find(row=>row.id===item.leadId);if(!lead)continue;
-          if(item.kind==='developer'&&lead.developerWithdrawalId===withdrawal.id&&lead.developerCommissionStatus==='confirmed'){lead.developerCommissionPaidAmount=money(Number(lead.developerCommissionPaidAmount||0)+Number(item.amount||0));lead.developerCommissionPaidAt=withdrawal.paidAt;updateDeveloperCommission(lead);syncLeadFinanceLedger(lead,auth.user);}
-          if(item.kind!=='developer'&&lead.withdrawalId===withdrawal.id&&lead.commissionStatus==='confirmed'){lead.commissionPaidAmount=money(Number(lead.commissionPaidAmount||0)+Number(item.amount||outstandingCommission(lead)));lead.commissionPaidAt=withdrawal.paidAt;updateCommission(lead);syncLeadFinanceLedger(lead,auth.user);}
+          if(item.kind==='developer'&&lead.developerUserId===withdrawal.userId&&lead.developerCommissionStatus==='confirmed'){lead.developerCommissionPaidAmount=money(Number(lead.developerCommissionPaidAmount||0)+Number(item.amount||outstandingDeveloperCommission(lead)));lead.developerCommissionPaidAt=withdrawal.paidAt;if(lead.developerWithdrawalId===withdrawal.id)delete lead.developerWithdrawalId;updateDeveloperCommission(lead);syncLeadFinanceLedger(lead,auth.user);}
+          if(item.kind!=='developer'&&lead.referralUserId===withdrawal.userId&&lead.commissionStatus==='confirmed'){lead.commissionPaidAmount=money(Number(lead.commissionPaidAmount||0)+Number(item.amount||outstandingCommission(lead)));lead.commissionPaidAt=withdrawal.paidAt;if(lead.withdrawalId===withdrawal.id)delete lead.withdrawalId;updateCommission(lead);syncLeadFinanceLedger(lead,auth.user);}
         }
         appendFinanceEntry({idempotencyKey:`withdrawal:${withdrawal.id}:paid`,type:'withdrawal_paid',employeeId:withdrawal.userId,withdrawalId:withdrawal.id,amountCents:cents(withdrawal.amount),statusSnapshot:'paid',actor:auth.user.username,transferReference,postedAt:withdrawal.paidAt,note:`${sentAmount} ${sentCurrency}; rate ${exchangeRate}; fee ${feeAmount} ${feeBearer}`});
       }
@@ -2643,7 +2668,6 @@ function handlePublicRuntimeConfig(req, res, snapshot) {
   const customerSupportPhone = STAGING_MODE ? '' : normalizeWhatsAppNumber(process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP !== undefined ? process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP : legacyPhone);
   const ordersPhone = STAGING_MODE ? '' : normalizeWhatsAppNumber(process.env.ZEZO_ORDERS_WHATSAPP !== undefined ? process.env.ZEZO_ORDERS_WHATSAPP : legacyPhone);
   const ordersUrl = buildWhatsAppUrl(ordersPhone);
-  const setupAvailable = canSetUpFirstAdmin() && !snapshot.has_active_owner;
   return json(res, 200, {
     prices: (Array.isArray(settings.prices) ? settings.prices : []).filter(price => price.active !== false),
     templatePrices,
@@ -2657,7 +2681,6 @@ function handlePublicRuntimeConfig(req, res, snapshot) {
     whatsappUrl: ordersUrl,
     emailReady: emailReady() && adminEmailReady(),
     aiQuoteReady: !STAGING_MODE && Boolean(process.env.OPENAI_API_KEY && process.env.OPENAI_MODEL),
-    adminSetupAvailable: setupAvailable,
     stagingMode: STAGING_MODE
   }, responseSecurityHeaders());
 }
@@ -2665,13 +2688,12 @@ function handlePublicRuntimeConfig(req, res, snapshot) {
 export { init, handle, processMailQueue as runOutboxWorker };
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
-  const setupAvailable = await init();
+  await init();
   void processMailQueue();
   const mailRetryTimer=setInterval(()=>void processMailQueue(),60_000);
   mailRetryTimer.unref();
   const referralRolloverTimer=setInterval(()=>{const eventCount=store.referralEvents.length,attributionCount=store.referralAttributions.length,linksChanged=ensureMonthlyReferralLinks();cleanReferralEvents();cleanReferralAttributions();if(linksChanged||eventCount!==store.referralEvents.length||attributionCount!==store.referralAttributions.length)void persist().catch(error=>console.error('Referral maintenance failed:',error));},6*60*60_000);
   referralRolloverTimer.unref();
-  if (setupAvailable) console.log('\nLocal ZEZO setup is available: open Team access to create the first administrator. A temporary password is required to be changed immediately.\n');
   createServer((req,res)=>{
     handle(req,res).catch(async error=>{
       if(!res.headersSent){const status=error.status||500; json(res,status,{error:status===500?'حدث خطأ داخلي / Internal server error':error.message},{'X-Content-Type-Options':'nosniff'});}

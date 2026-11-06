@@ -4,6 +4,8 @@ import { init, handle } from './server.js';
 import { closePostgresPool } from './src/server/postgres-runtime.js';
 import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
+import { createStagingSession, STAGING_ACCESS_COOKIE } from './src/server/staging-auth.js';
+import { provisionFirstOwner } from './src/server/owner-bootstrap.js';
 
 if (!process.env.DATABASE_URL) {
   console.error('DATABASE_URL is required for the PostgreSQL API smoke test.');
@@ -11,6 +13,9 @@ if (!process.env.DATABASE_URL) {
 }
 
 const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
+const stagingAccessCookie = process.env.ZEZO_STAGING === 'true'
+  ? `${STAGING_ACCESS_COOKIE}=${encodeURIComponent(createStagingSession())}`
+  : '';
 const syntheticIds = [];
 const testSuffix = randomUUID().replaceAll('-', '').slice(0, 12);
 const password = `Synthetic!${testSuffix}2026`;
@@ -39,7 +44,8 @@ async function request(method, path, { body, rawBody, contentType = 'application
   const req = Readable.from(requestBytes?.length ? [requestBytes] : []);
   req.method = method;
   req.url = path;
-  req.headers = { 'content-type': contentType, ...(cookie ? { cookie } : {}) };
+  const requestCookie = [stagingAccessCookie, cookie].filter(Boolean).join('; ');
+  req.headers = { 'content-type': contentType, ...(requestCookie ? { cookie: requestCookie } : {}) };
   req.socket = { remoteAddress: '127.0.0.1', encrypted: false };
   const res = {
     headersSent: false,
@@ -116,7 +122,7 @@ try {
   results.push('API runtime uses PostgreSQL');
 
   const publicBefore = await request('GET', '/api/public');
-  assert(publicBefore.data.adminSetupAvailable === true, 'Fresh PostgreSQL test database must allow first Owner setup.');
+  assert(!Object.hasOwn(publicBefore.data, 'adminSetupAvailable'), 'Public PostgreSQL configuration must never disclose Owner setup state.');
   assert(Object.keys(publicBefore.data.templatePrices || {}).length === 40, 'Public runtime read did not return the 40 template price entries.');
   assert(Object.values(publicBefore.data.templatePrices).every(price => Number(price) === 200), 'Default template starting prices changed in the PostgreSQL public read.');
   assert(Object.keys(publicBefore.data.templateActive || {}).length === 40, 'Public runtime read did not return template availability.');
@@ -143,16 +149,28 @@ try {
     'Public runtime read queued behind the legacy global PostgreSQL advisory lock.');
   results.push('public runtime read completed while the legacy global advisory lock was held');
 
-  const setup = await request('POST', '/api/setup', {
-    body: { name: 'Synthetic ZEZO Owner', username: ownerUsername, password }
+  const publicOwnerAttempt = await request('POST', '/api/setup', {
+    body: { name: 'Synthetic Public Owner Attempt', username: `public_owner_${testSuffix}`, password }
   });
-  assert(setup.status === 201, `Synthetic Owner setup failed with ${setup.status}.`);
-  const ownerId = setup.data.user.id;
+  assert(publicOwnerAttempt.status === 410, 'The public API must permanently reject Owner creation before a first Owner exists.');
+  const bootstrap = await provisionFirstOwner({ client, name: 'Synthetic ZEZO Owner', username: ownerUsername, email: `owner_${testSuffix}@example.test`, password });
+  const ownerId = bootstrap.id;
   syntheticIds.push(ownerId);
-  let ownerCookie = cookieFrom(setup);
-  results.push('first Owner creation saved to PostgreSQL');
+  let duplicateBootstrapError = null;
+  try {
+    await provisionFirstOwner({ client, name: 'Synthetic Second Owner', username: `${ownerUsername}_two`, email: `owner_two_${testSuffix}@example.test`, password });
+  } catch (error) { duplicateBootstrapError = error; }
+  assert(/Owner bootstrap is closed/.test(duplicateBootstrapError?.message || ''), 'Private first-Owner bootstrap must refuse a second Owner after provisioning.');
+  assert(!(await client.query('SELECT 1 FROM user_accounts WHERE username = $1', [`${ownerUsername}_two`])).rowCount, 'A second Owner row was created by the private bootstrap path.');
+  let ownerCookie = '';
+  results.push('public Owner API refused provisioning, private one-time bootstrap created one Owner, and a second bootstrap attempt was rejected');
 
   const changedPassword = `${password}-Changed!`;
+  const initialOwnerLogin = await request('POST', '/api/auth/login', {
+    body: { username: ownerUsername, password, accountType: 'management' }
+  });
+  assert(initialOwnerLogin.status === 200, `Private-bootstrap Owner could not sign in (${initialOwnerLogin.status}).`);
+  ownerCookie = cookieFrom(initialOwnerLogin);
   const passwordUpdate = await request('POST', '/api/auth/password', {
     body: { currentPassword: password, newPassword: changedPassword }, cookie: ownerCookie
   });
@@ -178,24 +196,25 @@ try {
   results.push('Owner password, MFA, secure login, and persistent session');
 
   const setupAfterOwner = await request('GET', '/api/public');
-  assert(setupAfterOwner.data.adminSetupAvailable === false, 'First Owner setup was not locked after account creation.');
+  assert(!Object.hasOwn(setupAfterOwner.data, 'adminSetupAvailable'), 'Public configuration must never expose Owner setup state.');
   const secondSetup = await request('POST', '/api/setup', {
     body: { name: 'Synthetic Second Owner', username: `${ownerUsername}_two`, password }
   });
-  assert(secondSetup.status === 409, 'Second Owner setup was not rejected.');
-  results.push('first Owner setup locks after creation');
+  assert(secondSetup.status === 410, 'Public Owner creation must remain permanently closed after bootstrap.');
+  results.push('public Owner setup remains closed before and after bootstrap');
 
   const customerPassword = `Customer!${testSuffix}Longer`;
   const customerRegistration = await request('POST', '/api/client/register', {
-    body: { name: 'Synthetic Test Customer', email: customerEmail, password: customerPassword, confirmPassword: customerPassword, student: false }
+    body: { name: 'Synthetic Test Customer', email: customerEmail, password: customerPassword, confirmPassword: customerPassword, student: false, role: 'admin' }
   });
   assert(customerRegistration.status === 201, `Synthetic customer registration failed with ${customerRegistration.status}.`);
+  assert(customerRegistration.data.user?.role === 'client', 'Client registration request could not escalate its role to Owner.');
   const customerId = customerRegistration.data.user.id;
   syntheticIds.push(customerId);
   let customerCookie = cookieFrom(customerRegistration);
   const customerDashboard = await request('GET', '/api/dashboard', { cookie: customerCookie });
   assert(customerDashboard.status === 200 && customerDashboard.data.user?.role === 'client', 'Customer session did not persist between requests.');
-  results.push('customer registration and session persistence');
+  results.push('customer registration ignores requested Owner role and session persists');
 
   await request('POST', '/api/auth/logout', { cookie: customerCookie });
   customerCookie = '';
@@ -228,7 +247,7 @@ try {
       });
       assert(mfaEnabled.status === 200, `MFA enable for ${role} failed with ${mfaEnabled.status}.`);
     }
-    employees[role] = { id: activation.data.user.id, cookie: employeeCookie };
+    employees[role] = { id: activation.data.user.id, email, cookie: employeeCookie };
     employeeIds.push(activation.data.user.id);
     syntheticIds.push(activation.data.user.id);
   }
@@ -571,6 +590,128 @@ try {
   );
   assert(storedSessions.rowCount >= 2 && storedSessions.rows.every(row => /^[a-f0-9]{64}$/.test(row.id)), 'Expected only opaque SHA-256 session hashes persisted in PostgreSQL.');
   results.push('normalized account and hashed session rows persisted');
+
+  const originalPrices = ownerDashboard.data.settings?.prices;
+  const originalHoldDays = Number(ownerDashboard.data.settings?.commissionHoldDays ?? 14);
+  assert(Array.isArray(originalPrices) && originalPrices.length > 0, 'Owner test fixture did not expose existing service prices.');
+  const testHoldSetting = await request('POST', '/api/admin/pricing', {
+    body: { prices: originalPrices, commissionHoldDays: 0 }, cookie: ownerCookie
+  });
+  assert(testHoldSetting.status === 200, `Could not make synthetic commissions eligible for withdrawal stress (${testHoldSetting.status}).`);
+
+  try {
+    const syntheticSettlement = await request('POST', `/api/admin/leads/${syntheticLeadId}/settlement`, {
+      body: { contractAmount: 1000, projectCosts: 0, note: 'Synthetic financial concurrency test only.' }, cookie: ownerCookie
+    });
+    assert(syntheticSettlement.status === 201, `Synthetic settlement setup failed with ${syntheticSettlement.status}.`);
+
+    const uniquePaymentRequests = await Promise.all(Array.from({ length: 12 }, (_, index) => request('POST', '/api/admin/payment', {
+      body: {
+        leadId: syntheticLeadId,
+        amount: 100,
+        kind: 'payment',
+        verified: true,
+        idempotencyKey: `stress_${testSuffix}_payment_${index}`
+      }, cookie: ownerCookie
+    })));
+    const acceptedUniquePayments = uniquePaymentRequests.filter(result => result.status === 201);
+    const rejectedBeyondBalance = uniquePaymentRequests.filter(result => result.status === 400);
+    const unexpectedPaymentResponses = uniquePaymentRequests.filter(result => ![201, 400].includes(result.status));
+    assert(acceptedUniquePayments.length === 8 && rejectedBeyondBalance.length === 4 && unexpectedPaymentResponses.length === 0,
+      `Concurrent distinct payments did not stop at the remaining contract balance (accepted ${acceptedUniquePayments.length}, rejected ${rejectedBeyondBalance.length}, unexpected ${unexpectedPaymentResponses.length}).`);
+    const uniquePaymentLatency = uniquePaymentRequests.map(result => result.durationMs).sort((a, b) => a - b);
+    const stressPercentile = (values, fraction) => Number(values[Math.max(0, Math.ceil(fraction * values.length) - 1)].toFixed(1));
+    const totalPaymentRows = await client.query('SELECT count(*)::int AS count FROM payments WHERE "requestId" = $1', [syntheticLeadId]);
+    assert(Number(totalPaymentRows.rows[0].count) === 9, 'Distinct concurrent payment requests overpaid or duplicated the synthetic contract.');
+    const stressCommissions = await client.query('SELECT kind, "ratePercent"::float8 AS rate, amount::float8 AS amount FROM commissions WHERE "requestId" = $1 ORDER BY kind', [syntheticLeadId]);
+    assert(stressCommissions.rowCount === 2 && stressCommissions.rows.some(row => row.kind === 'referral' && row.rate === 15 && row.amount === 150) && stressCommissions.rows.some(row => row.kind === 'developer' && row.rate === 25 && row.amount === 250),
+      'Concurrent distinct payments changed or duplicated the 15% referral / 25% developer commissions.');
+
+    for (const role of ['marketer', 'developer']) {
+      const profile = await request('PATCH', '/api/profile', {
+        body: { email: employees[role].email, payoutHandle: `synthetic_${testSuffix}_${role}` }, cookie: employees[role].cookie
+      });
+      assert(profile.status === 200, `Could not configure a synthetic payout destination for ${role} (${profile.status}).`);
+    }
+    const eligibleMarketerWallet = await request('GET', '/api/dashboard', { cookie: employees.marketer.cookie });
+    const eligibleDeveloperWallet = await request('GET', '/api/dashboard', { cookie: employees.developer.cookie });
+    assert(Number(eligibleMarketerWallet.data.wallet?.referral?.available) >= 100 && Number(eligibleDeveloperWallet.data.wallet?.developer?.available) >= 100,
+      'Synthetic marketing and development wallets did not meet the existing 100 ILS minimum withdrawal.');
+
+    const withdrawalAttempts = await Promise.all([
+      ...Array.from({ length: 12 }, () => request('POST', '/api/marketer/withdrawals', {
+        body: { amount: 100, method: 'binance' }, cookie: employees.marketer.cookie
+      })),
+      ...Array.from({ length: 12 }, () => request('POST', '/api/marketer/withdrawals', {
+        body: { amount: 100, method: 'binance' }, cookie: employees.developer.cookie
+      }))
+    ]);
+    const withdrawalSuccesses = withdrawalAttempts.filter(result => result.status === 201);
+    const withdrawalConflicts = withdrawalAttempts.filter(result => result.status === 409);
+    const unexpectedWithdrawalResponses = withdrawalAttempts.filter(result => ![201, 409].includes(result.status));
+    assert(withdrawalSuccesses.length === 2 && withdrawalConflicts.length === 22 && unexpectedWithdrawalResponses.length === 0,
+      `Concurrent monthly withdrawal requests were not reserved once per employee (created ${withdrawalSuccesses.length}, conflicts ${withdrawalConflicts.length}, unexpected ${unexpectedWithdrawalResponses.length}).`);
+    const withdrawalLatency = withdrawalAttempts.map(result => result.durationMs).sort((a, b) => a - b);
+    const savedWithdrawals = await client.query('SELECT id, "userId", amount::float8 AS amount, status FROM withdrawal_requests WHERE "userId" = ANY($1::text[]) ORDER BY "userId"', [[employees.marketer.id, employees.developer.id]]);
+    assert(savedWithdrawals.rowCount === 2 && savedWithdrawals.rows.every(row => Number(row.amount) === 100 && row.status === 'pending'), 'Concurrent withdrawal reservations were missing or duplicated in PostgreSQL.');
+    const firstDeveloperWithdrawal = savedWithdrawals.rows.find(row => row.userId === employees.developer.id);
+    assert(Boolean(firstDeveloperWithdrawal), 'Developer withdrawal reservation was not created.');
+    const priorMonthDate = new Date(); priorMonthDate.setUTCMonth(priorMonthDate.getUTCMonth() - 1);
+    const priorMonth = `${priorMonthDate.getUTCFullYear()}-${String(priorMonthDate.getUTCMonth() + 1).padStart(2, '0')}`;
+    await client.query("UPDATE withdrawal_requests SET data = jsonb_set(data, '{month}', to_jsonb($2::text), true) WHERE id = $1", [firstDeveloperWithdrawal.id, priorMonth]);
+    const secondDeveloperWithdrawal = await request('POST', '/api/marketer/withdrawals', {
+      body: { amount: 100, method: 'binance' }, cookie: employees.developer.cookie
+    });
+    assert(secondDeveloperWithdrawal.status === 201, `A later-month partial withdrawal could not reserve the still-available commission (${secondDeveloperWithdrawal.status}).`);
+    const walletWithTwoReservations = await request('GET', '/api/dashboard', { cookie: employees.developer.cookie });
+    assert(Number(walletWithTwoReservations.data.wallet?.developer?.reserved) === 200 && Number(walletWithTwoReservations.data.wallet?.developer?.available) === 50,
+      'The developer wallet did not preserve the unreserved remainder after two partial requests across months.');
+    const rejectedFollowup = await request('PATCH', `/api/admin/withdrawals/${secondDeveloperWithdrawal.data.withdrawal?.id}`, {
+      body: { status: 'rejected', note: 'Synthetic release test.' }, cookie: ownerCookie
+    });
+    assert(rejectedFollowup.status === 200, `Owner could not release the synthetic partial withdrawal (${rejectedFollowup.status}).`);
+    const allSavedWithdrawals = await client.query('SELECT id, "userId", amount::float8 AS amount, status FROM withdrawal_requests WHERE "userId" = ANY($1::text[]) ORDER BY "userId", "createdAt"', [[employees.marketer.id, employees.developer.id]]);
+    assert(allSavedWithdrawals.rowCount === 3 && allSavedWithdrawals.rows.filter(row => row.status === 'pending').length === 2 && allSavedWithdrawals.rows.filter(row => row.status === 'rejected').length === 1,
+      'Partial withdrawal follow-up or rejection was not saved exactly once.');
+    const withdrawalKeys = allSavedWithdrawals.rows.map(row => `withdrawal:${row.id}:requested`);
+    const reservedLedgerRows = await client.query('SELECT count(*)::int AS count FROM finance_ledger_entries WHERE "idempotencyKey" = ANY($1::text[])', [withdrawalKeys]);
+    assert(Number(reservedLedgerRows.rows[0].count) === 3, 'Concurrent withdrawals duplicated or omitted finance-ledger reservations.');
+
+    const walletReadStartedAt = performance.now();
+    const walletReads = await Promise.all(Array.from({ length: 12 }, (_, index) => request('GET', '/api/dashboard', {
+      cookie: index % 2 ? employees.marketer.cookie : employees.developer.cookie
+    })));
+    const walletReadDurations = walletReads.map(result => result.durationMs).sort((a, b) => a - b);
+    assert(walletReads.every(result => result.status === 200), 'Concurrent employee wallet reads failed after withdrawal reservation.');
+    const reservedMarketerWallet = await request('GET', '/api/dashboard', { cookie: employees.marketer.cookie });
+    const reservedDeveloperWallet = await request('GET', '/api/dashboard', { cookie: employees.developer.cookie });
+    assert(Number(reservedMarketerWallet.data.wallet?.referral?.reserved) === 100 && Number(reservedMarketerWallet.data.wallet?.referral?.available) === 50, 'Marketing wallet did not retain its unreserved commission remainder.');
+    assert(Number(reservedDeveloperWallet.data.wallet?.developer?.reserved) === 100 && Number(reservedDeveloperWallet.data.wallet?.developer?.available) === 150, 'Developer wallet did not restore the rejected reservation while retaining the first pending request.');
+    const paymentStress = {
+      route: 'POST /api/admin/payment', requests: uniquePaymentRequests.length,
+      accepted: acceptedUniquePayments.length, rejectedAtContractBalance: rejectedBeyondBalance.length,
+      p50Ms: stressPercentile(uniquePaymentLatency, 0.5), p95Ms: stressPercentile(uniquePaymentLatency, 0.95),
+      finalPaidTotalIls: 1000, distinctPaymentRows: Number(totalPaymentRows.rows[0].count)
+    };
+    const withdrawalStress = {
+      route: 'POST /api/marketer/withdrawals', requests: withdrawalAttempts.length,
+      created: withdrawalSuccesses.length + 1, monthlyConflicts: withdrawalConflicts.length,
+      p50Ms: stressPercentile(withdrawalLatency, 0.5), p95Ms: stressPercentile(withdrawalLatency, 0.95),
+      uniqueReservationLedgerRows: Number(reservedLedgerRows.rows[0].count)
+    };
+    const walletStress = {
+      route: 'GET /api/dashboard (marketer/developer wallets)', requests: walletReads.length,
+      p50Ms: stressPercentile(walletReadDurations, 0.5), p95Ms: stressPercentile(walletReadDurations, 0.95),
+      errors: walletReads.filter(result => result.status !== 200).length
+    };
+    console.log(`[FINANCE_STRESS] ${JSON.stringify({ payments: paymentStress, withdrawals: withdrawalStress, walletReads: walletStress, wallMs: Number((performance.now() - walletReadStartedAt).toFixed(1))})}`);
+    results.push(`concurrent distinct payments stop exactly at contract balance (8 accepted / 4 rejected, p50 ${paymentStress.p50Ms}ms / p95 ${paymentStress.p95Ms}ms); 24 simultaneous withdrawal requests reserve once per employee (p50 ${withdrawalStress.p50Ms}ms / p95 ${withdrawalStress.p95Ms}ms); partial carry-over and rejection release preserve remaining wallet balances`);
+  } finally {
+    const restoredPricing = await request('POST', '/api/admin/pricing', {
+      body: { prices: originalPrices, commissionHoldDays: originalHoldDays }, cookie: ownerCookie
+    });
+    assert(restoredPricing.status === 200, `Could not restore synthetic commission hold setting (${restoredPricing.status}).`);
+  }
 
   for (const result of results) console.log(`PASS ${result}`);
 } catch (error) {

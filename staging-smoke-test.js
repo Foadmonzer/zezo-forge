@@ -10,7 +10,7 @@ const accessPassword = `Staging-${randomBytes(30).toString('base64url')}`;
 process.env.ZEZO_STAGING = 'true';
 process.env.ZEZO_STAGING_ACCESS_PASSWORD = accessPassword;
 process.env.ZEZO_DATA_DIR = dataDir;
-process.env.NODE_ENV = 'production';
+process.env.NODE_ENV = 'test';
 process.env.ZEZO_WHATSAPP_NUMBER = '+971500000000';
 process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP = '+971500000001';
 process.env.ZEZO_ORDERS_WHATSAPP = '+971500000002';
@@ -44,7 +44,7 @@ async function call(handle, method, url, { body, rawBody, contentType, auth = tr
 
 try {
   const app = await import('./server.js');
-  assert.equal(await app.init(), true, 'production-mode staging permits the protected initial Owner setup');
+  assert.equal(await app.init(), false, 'staging never enables public Owner registration');
   const gate = await call(app.handle, 'GET', '/', { auth: false });
   assert.equal(gate.status, 200, 'unauthenticated visitors receive the staging password page');
   assert.match(gate.body, /name="password"/);
@@ -74,23 +74,31 @@ try {
   assert.equal(settings.ordersWhatsappNumber, '', 'staging hides the order desk WhatsApp number');
   assert.equal(settings.emailReady, false, 'test environment never sends email');
   assert.equal(settings.aiQuoteReady, false, 'test environment never calls an AI provider');
-  assert.equal(settings.adminSetupAvailable, true);
+  assert.equal(Object.hasOwn(settings, 'adminSetupAvailable'), false, 'staging public config does not disclose an Owner setup switch');
+  let productionPublic;
+  let productionSetup;
+  try {
+    process.env.NODE_ENV = 'production';
+    productionPublic = await call(app.handle, 'GET', '/api/public');
+    productionSetup = await call(app.handle, 'POST', '/api/setup', {
+      body: { name: 'Synthetic Public Owner Attempt', username: 'blockedowner', password: 'Synthetic-Password-Only-9876' }
+    });
+  } finally {
+    process.env.NODE_ENV = 'test';
+  }
+  assert.equal(productionPublic.status, 200);
+  assert.equal(Object.hasOwn(productionPublic.json(), 'adminSetupAvailable'), false, 'production-mode public config has no Owner setup switch');
+  assert.equal(productionSetup.status, 410, 'production-mode staging refuses public first Owner setup');
   const password = `Owner-${randomBytes(30).toString('base64url')}`;
-  const ownerSetup = await call(app.handle, 'POST', '/api/setup', { body: { name: 'Test Owner', username: 'stagingowner', password }, forwardedHttps: true });
-  assert.equal(ownerSetup.status, 201, `first owner creation succeeds: ${ownerSetup.body}`);
-  assert.equal(ownerSetup.json().user.mustChangePassword, true, 'the first Owner must change the temporary password');
-  const sessionCookie = Array.isArray(ownerSetup.headers['Set-Cookie']) ? ownerSetup.headers['Set-Cookie'].join(';') : String(ownerSetup.headers['Set-Cookie'] || '');
-  assert.match(sessionCookie, /; Secure(?:;|$)/, 'sessions created through the HTTPS tunnel use Secure cookies');
-  const closed = await call(app.handle, 'GET', '/api/public');
-  assert.equal(closed.json().adminSetupAvailable, false, 'initial Owner setup closes after the first Owner is created');
-  const secondSetup = await call(app.handle, 'POST', '/api/setup', { body: { name: 'Second Owner', username: 'secondowner', password } });
-  assert.equal(secondSetup.status, 409, 'second public Owner setup is refused');
+  assert.equal(password.length > 12, true, 'synthetic bootstrap password is generated only for request rejection tests');
+  const publicSetup = await call(app.handle, 'POST', '/api/setup', { body: { name: 'Test Owner', username: 'stagingowner', password }, forwardedHttps: true });
+  assert.equal(publicSetup.status, 410, 'staging refuses public Owner creation even after the access gate is opened');
   const staticAsset = await call(app.handle, 'GET', '/app.js');
   assert.match(staticAsset.headers['X-Robots-Tag'], /noindex/);
   const badStatic = await call(app.handle, 'GET', '/missing-staging-file');
   assert.equal(badStatic.status, 200, 'unknown public routes fall back to the single-page app entry point');
   assert.match(badStatic.headers['X-Robots-Tag'], /noindex/);
-  console.log('PASS — isolated staging data, required access password, noindex headers and robots.txt, visible staging banner, disabled email/AI/WhatsApp integrations, secure first Owner setup, and setup lock after creation.');
+  console.log('PASS — isolated staging data, required access password, noindex headers and robots.txt, visible staging banner, disabled email/AI/WhatsApp integrations, and permanently closed public Owner setup.');
 } finally {
   await rm(dataDir, { recursive: true, force: true });
   for (const key of ['ZEZO_STAGING','ZEZO_STAGING_ACCESS_PASSWORD','ZEZO_DATA_DIR','NODE_ENV','ZEZO_WHATSAPP_NUMBER','ZEZO_CUSTOMER_SUPPORT_WHATSAPP','ZEZO_ORDERS_WHATSAPP','ZEZO_PUBLIC_URL','RESEND_API_KEY','ZEZO_FROM_EMAIL','ZEZO_NOTIFICATION_EMAIL','OPENAI_API_KEY','OPENAI_MODEL']) delete process.env[key];

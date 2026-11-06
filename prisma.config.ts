@@ -5,6 +5,6 @@ export default defineConfig({
   migrations: { path: 'prisma/migrations' },
   datasource: {
     // Local placeholder only. Supply a real connection string through DATABASE_URL after choosing a database.
-    url: process.env.DATABASE_URL || 'postgresql://zezo:zezo@127.0.0.1:5432/zezo_forge'
+    url: process.env.DATABASE_URL || 'postgresql://127.0.0.1:5432/zezo_forge?schema=public'
   }
 });

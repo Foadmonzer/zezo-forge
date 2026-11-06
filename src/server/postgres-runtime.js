@@ -123,6 +123,12 @@ export async function withPostgresTransaction(work) {
       await client.query('BEGIN');
       // Serialize the compatibility-state transaction across local and serverless instances.
       await client.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+      // Coordinate whole-store snapshot upserts with row-scoped financial writes.
+      // Scoped requests take compatible ROW EXCLUSIVE locks, allowing different
+      // employees to progress concurrently while preventing stale snapshot writes.
+      await client.query(`LOCK TABLE app_settings, user_accounts, project_requests, commissions,
+        withdrawal_requests, finance_ledger_entries, system_notifications, audit_entries, outbox_messages
+        IN SHARE ROW EXCLUSIVE MODE`);
       return await transactionStorage.run(client, async () => {
         const result = await work(client);
         await client.query('COMMIT');
