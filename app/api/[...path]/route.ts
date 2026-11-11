@@ -36,6 +36,10 @@ class CapturedResponse extends Writable {
 
 const globals = globalThis as typeof globalThis & { __zezoNextInit?: Promise<boolean> };
 
+function hostedServerless() {
+  return process.env.VERCEL === '1' || process.env.NETLIFY === 'true' || process.env.ZEZO_SERVERLESS_RUNTIME === 'true';
+}
+
 function initLocalRuntime() {
   return globals.__zezoNextInit ??= init();
 }
@@ -65,7 +69,7 @@ async function dispatch(request: NextRequest) {
   }
 
   // Never let a serverless deployment fall back to ephemeral JSON or local files.
-  if ((process.env.VERCEL === '1' || process.env.NETLIFY === 'true') && !postgresConfigured()) {
+  if (hostedServerless() && !postgresConfigured()) {
     return Response.json(
       { error: 'ZEZO API is not ready for serverless storage yet. Configure the PostgreSQL migration before enabling hosted requests.' },
       { status: 503, headers: { 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow' } }
@@ -82,7 +86,7 @@ async function dispatch(request: NextRequest) {
   legacyRequest.headers = Object.fromEntries(request.headers.entries()) as IncomingHttpHeaders;
   const forwardedFor = process.env.VERCEL === '1'
     ? request.headers.get('x-vercel-forwarded-for') || request.headers.get('x-forwarded-for')
-    : process.env.NETLIFY === 'true'
+    : process.env.NETLIFY === 'true' || process.env.ZEZO_SERVERLESS_RUNTIME === 'true'
       ? request.headers.get('x-nf-client-connection-ip')
       : process.env.ZEZO_TRUST_PROXY === '1' ? request.headers.get('x-forwarded-for') : null;
   legacyRequest.socket = {
