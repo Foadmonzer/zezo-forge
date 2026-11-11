@@ -35,9 +35,14 @@ export default defineConfig({
       ...process.env,
       NODE_ENV: 'development',
       ZEZO_NEXT_BUILD_DIR: '.next-e2e',
-      ZEZO_STAGING: 'false',
+      ZEZO_STAGING: process.env.ZEZO_STAGING_E2E === 'true' ? 'true' : 'false',
+      ZEZO_STAGING_ACCESS_PASSWORD: process.env.ZEZO_STAGING_E2E === 'true' ? 'Synthetic-Staging-Gate-Password-Only' : '',
+      ZEZO_STAGING_INTERNAL_SECRET: process.env.ZEZO_STAGING_E2E === 'true' ? 'Synthetic-Internal-Rate-Limit-Secret-Only-For-CI' : '',
+      ZEZO_SERVERLESS_RUNTIME: 'false',
+      ZEZO_PUBLIC_URL: baseURL,
       ZEZO_DATA_DIR: process.env.ZEZO_DATA_DIR || '../data-e2e'
     }
   }
 });
+
 
