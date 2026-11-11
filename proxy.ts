@@ -23,9 +23,23 @@ function loginPage(status: number, message = '') {
 
 function requestAddress(request: NextRequest) {
   if (process.env.VERCEL === '1') return request.headers.get('x-vercel-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
-  if (process.env.NETLIFY === 'true') return request.headers.get('x-nf-client-connection-ip')?.trim() || 'unknown';
+  if (process.env.NETLIFY === 'true' || process.env.ZEZO_SERVERLESS_RUNTIME === 'true') return request.headers.get('x-nf-client-connection-ip')?.trim() || 'unknown';
   if (process.env.ZEZO_TRUST_PROXY === '1') return request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
   return 'local';
+}
+
+function hostedServerless() {
+  return process.env.VERCEL === '1' || process.env.NETLIFY === 'true' || process.env.ZEZO_SERVERLESS_RUNTIME === 'true';
+}
+
+function configuredHttpsOrigin() {
+  try {
+    const url = new URL(String(process.env.ZEZO_PUBLIC_URL || ''));
+    if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash) return '';
+    return url.origin;
+  } catch {
+    return '';
+  }
 }
 
 export async function proxy(request: NextRequest) {
@@ -43,11 +57,14 @@ export async function proxy(request: NextRequest) {
 
   // A hosted staging gate must use a shared limiter. Do not silently fall back
   // to per-instance memory, where a serverless scale-out would reset attempts.
-  if ((process.env.VERCEL === '1' || process.env.NETLIFY === 'true') && !process.env.DATABASE_URL) {
+  if (hostedServerless() && !process.env.DATABASE_URL) {
     return loginPage(503, 'لم يتم ربط قاعدة بيانات بيئة الاختبار. الدخول متوقف لحين إعدادها.');
   }
-  if ((process.env.VERCEL === '1' || process.env.NETLIFY === 'true') && (process.env.ZEZO_STAGING_INTERNAL_SECRET || '').length < 32) {
+  if (hostedServerless() && (process.env.ZEZO_STAGING_INTERNAL_SECRET || '').length < 32) {
     return loginPage(503, 'إعداد حماية محاولات الدخول غير مكتمل.');
+  }
+  if (hostedServerless() && !configuredHttpsOrigin()) {
+    return loginPage(503, 'عنوان HTTPS لبيئة الاختبار غير مكتمل.');
   }
 
   if (!process.env.ZEZO_STAGING_ACCESS_PASSWORD || process.env.ZEZO_STAGING_ACCESS_PASSWORD.length < 16) {
@@ -57,7 +74,8 @@ export async function proxy(request: NextRequest) {
   if (path === '/__staging/login' && request.method === 'POST') {
     let allowed: boolean;
     try {
-      const limiterResponse = await fetch(new URL('/api/staging/rate-limit', request.url), {
+      const limiterOrigin = hostedServerless() ? configuredHttpsOrigin() : request.nextUrl.origin;
+      const limiterResponse = await fetch(new URL('/api/staging/rate-limit', limiterOrigin), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -93,14 +111,14 @@ export async function proxy(request: NextRequest) {
       maxAge: STAGING_SESSION_TTL_SECONDS,
       httpOnly: true,
       sameSite: 'strict',
-      secure: request.nextUrl.protocol === 'https:' || process.env.VERCEL === '1' || process.env.NETLIFY === 'true'
+      secure: request.nextUrl.protocol === 'https:' || hostedServerless()
     });
     return response;
   }
 
   if (path === '/__staging/logout') {
     const response = NextResponse.redirect(new URL('/', request.url), 303);
-    response.cookies.set({ name: STAGING_ACCESS_COOKIE, value: '', path: '/', maxAge: 0, httpOnly: true, sameSite: 'strict', secure: request.nextUrl.protocol === 'https:' || process.env.VERCEL === '1' || process.env.NETLIFY === 'true' });
+    response.cookies.set({ name: STAGING_ACCESS_COOKIE, value: '', path: '/', maxAge: 0, httpOnly: true, sameSite: 'strict', secure: request.nextUrl.protocol === 'https:' || hostedServerless() });
     for (const [name, value] of Object.entries(stagingHeaders)) response.headers.set(name, value);
     return response;
   }
