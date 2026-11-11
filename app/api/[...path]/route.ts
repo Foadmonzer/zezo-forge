@@ -1,8 +1,9 @@
 import { Readable, Writable } from 'node:stream';
 import type { IncomingHttpHeaders } from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import type { NextRequest } from 'next/server';
 import { handle, init } from '../../../server.js';
-import { postgresConfigured } from '../../../src/server/postgres-runtime.js';
+import { consumeRateLimitBucket, postgresConfigured } from '../../../src/server/postgres-runtime.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -40,17 +41,39 @@ function initLocalRuntime() {
 }
 
 async function dispatch(request: NextRequest) {
+  const requestUrl = new URL(request.url);
+  if (requestUrl.pathname === '/api/staging/rate-limit') {
+    const noStore = { 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow, noarchive' };
+    const configuredSecret = String(process.env.ZEZO_STAGING_INTERNAL_SECRET || '');
+    const suppliedSecret = request.headers.get('x-zezo-staging-internal') || '';
+    const configuredBytes = Buffer.from(configuredSecret);
+    const suppliedBytes = Buffer.from(suppliedSecret);
+    if (process.env.ZEZO_STAGING !== 'true' || configuredBytes.length < 32 || configuredBytes.length !== suppliedBytes.length || !timingSafeEqual(configuredBytes, suppliedBytes)) {
+      return new Response(null, { status: 404, headers: noStore });
+    }
+    if (request.method !== 'POST') return new Response(null, { status: 405, headers: { ...noStore, Allow: 'POST' } });
+    if (!postgresConfigured()) return Response.json({ error: 'Staging rate limiter unavailable' }, { status: 503, headers: noStore });
+    try {
+      const body = await request.json() as { address?: unknown };
+      const address = typeof body.address === 'string' ? body.address.slice(0, 128) : '';
+      if (!address) return Response.json({ error: 'Invalid limiter key' }, { status: 400, headers: noStore });
+      const allowed = await consumeRateLimitBucket('staging-login', address, 12, 15 * 60_000);
+      return Response.json({ allowed }, { status: 200, headers: noStore });
+    } catch {
+      return Response.json({ error: 'Staging rate limiter unavailable' }, { status: 503, headers: noStore });
+    }
+  }
+
   // Never let a serverless deployment fall back to ephemeral JSON or local files.
-  if (process.env.VERCEL === '1' && !postgresConfigured()) {
+  if ((process.env.VERCEL === '1' || process.env.NETLIFY === 'true') && !postgresConfigured()) {
     return Response.json(
-      { error: 'ZEZO API is not ready for serverless storage yet. Configure the PostgreSQL migration before enabling Vercel requests.' },
+      { error: 'ZEZO API is not ready for serverless storage yet. Configure the PostgreSQL migration before enabling hosted requests.' },
       { status: 503, headers: { 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow' } }
     );
   }
 
   await initLocalRuntime();
 
-  const requestUrl = new URL(request.url);
   const legacyRequest = (request.body
     ? Readable.fromWeb(request.body as unknown as import('node:stream/web').ReadableStream)
     : Readable.from([])) as LegacyRequest;
@@ -59,7 +82,9 @@ async function dispatch(request: NextRequest) {
   legacyRequest.headers = Object.fromEntries(request.headers.entries()) as IncomingHttpHeaders;
   const forwardedFor = process.env.VERCEL === '1'
     ? request.headers.get('x-vercel-forwarded-for') || request.headers.get('x-forwarded-for')
-    : process.env.ZEZO_TRUST_PROXY === '1' ? request.headers.get('x-forwarded-for') : null;
+    : process.env.NETLIFY === 'true'
+      ? request.headers.get('x-nf-client-connection-ip')
+      : process.env.ZEZO_TRUST_PROXY === '1' ? request.headers.get('x-forwarded-for') : null;
   legacyRequest.socket = {
     remoteAddress: forwardedFor?.split(',')[0]?.trim() || '127.0.0.1',
     encrypted: requestUrl.protocol === 'https:' || request.headers.get('x-forwarded-proto') === 'https'
@@ -89,3 +114,4 @@ export const POST = dispatch;
 export const PUT = dispatch;
 export const PATCH = dispatch;
 export const DELETE = dispatch;
+
