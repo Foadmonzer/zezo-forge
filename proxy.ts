@@ -50,9 +50,10 @@ export async function proxy(request: NextRequest) {
 
   const path = request.nextUrl.pathname;
   if (path === '/robots.txt') {
-    const response = NextResponse.next();
-    for (const [name, value] of Object.entries(stagingHeaders)) response.headers.set(name, value);
-    return response;
+    return new Response('User-agent: *\nDisallow: /\n', {
+      status: 200,
+      headers: { ...stagingHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+    });
   }
 
   // A hosted staging gate must use a shared limiter. Do not silently fall back
