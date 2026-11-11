@@ -96,6 +96,10 @@ jobs:
         run: pnpm exec prisma migrate deploy
       - name: Run browser tests across engines, viewports, templates, and synthetic roles
         run: node e2e/node_modules/@playwright/test/cli.js test --config=e2e/playwright.config.mjs
+      - name: Verify staging gate protects pages, APIs, and assets
+        env:
+          ZEZO_STAGING_E2E: 'true'
+        run: node e2e/node_modules/@playwright/test/cli.js test --config=e2e/playwright.config.mjs --grep "staging gate protects pages"
       - name: Upload screenshots and Playwright traces
         if: always()
         uses: actions/upload-artifact@v4
@@ -106,4 +110,5 @@ jobs:
             artifacts/playwright-report
           if-no-files-found: warn
           retention-days: 14
+
 
