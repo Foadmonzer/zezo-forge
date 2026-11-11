@@ -1,12 +1,11 @@
 import { NextResponse, type NextRequest } from 'next/server';
-import { consumeRateLimitBucket } from './src/server/postgres-runtime.js';
 import {
   createStagingSession,
   isStagingSessionValid,
   STAGING_ACCESS_COOKIE,
   STAGING_SESSION_TTL_SECONDS,
   stagingPasswordMatches
-} from './src/server/staging-auth.js';
+} from './src/server/staging-edge-auth.js';
 
 const stagingHeaders = {
   'Cache-Control': 'no-store',
@@ -24,11 +23,15 @@ function loginPage(status: number, message = '') {
 
 function requestAddress(request: NextRequest) {
   if (process.env.VERCEL === '1') return request.headers.get('x-vercel-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
+  if (process.env.NETLIFY === 'true') return request.headers.get('x-nf-client-connection-ip')?.trim() || 'unknown';
   if (process.env.ZEZO_TRUST_PROXY === '1') return request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown';
   return 'local';
 }
 
 export async function proxy(request: NextRequest) {
+  // This private, secret-authenticated internal endpoint runs in the Node.js
+  // Route Handler so its shared PostgreSQL limiter is not bundled into Proxy.
+  if (request.nextUrl.pathname === '/api/staging/rate-limit') return NextResponse.next();
   if (process.env.ZEZO_STAGING !== 'true') return NextResponse.next();
 
   const path = request.nextUrl.pathname;
@@ -40,8 +43,11 @@ export async function proxy(request: NextRequest) {
 
   // A hosted staging gate must use a shared limiter. Do not silently fall back
   // to per-instance memory, where a serverless scale-out would reset attempts.
-  if (process.env.VERCEL === '1' && !process.env.DATABASE_URL) {
+  if ((process.env.VERCEL === '1' || process.env.NETLIFY === 'true') && !process.env.DATABASE_URL) {
     return loginPage(503, 'لم يتم ربط قاعدة بيانات بيئة الاختبار. الدخول متوقف لحين إعدادها.');
+  }
+  if ((process.env.VERCEL === '1' || process.env.NETLIFY === 'true') && (process.env.ZEZO_STAGING_INTERNAL_SECRET || '').length < 32) {
+    return loginPage(503, 'إعداد حماية محاولات الدخول غير مكتمل.');
   }
 
   if (!process.env.ZEZO_STAGING_ACCESS_PASSWORD || process.env.ZEZO_STAGING_ACCESS_PASSWORD.length < 16) {
@@ -51,7 +57,18 @@ export async function proxy(request: NextRequest) {
   if (path === '/__staging/login' && request.method === 'POST') {
     let allowed: boolean;
     try {
-      allowed = await consumeRateLimitBucket('staging-login', requestAddress(request), 12, 15 * 60_000);
+      const limiterResponse = await fetch(new URL('/api/staging/rate-limit', request.url), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-ZEZO-Staging-Internal': process.env.ZEZO_STAGING_INTERNAL_SECRET || ''
+        },
+        body: JSON.stringify({ address: requestAddress(request) }),
+        cache: 'no-store'
+      });
+      if (!limiterResponse.ok) throw new Error('Staging limiter unavailable.');
+      const limiter = await limiterResponse.json() as { allowed?: boolean };
+      allowed = limiter.allowed === true;
     } catch {
       return loginPage(503, 'تعذر التحقق من خدمة حماية المعاينة. حاول لاحقاً.');
     }
@@ -65,31 +82,31 @@ export async function proxy(request: NextRequest) {
     } catch {
       return loginPage(400, 'تعذر قراءة كلمة المرور. حاول مرة أخرى.');
     }
-    if (!stagingPasswordMatches(password)) return loginPage(401, 'كلمة المرور غير صحيحة.');
+    if (!await stagingPasswordMatches(password)) return loginPage(401, 'كلمة المرور غير صحيحة.');
 
     const response = NextResponse.redirect(new URL('/', request.url), 303);
     for (const [name, value] of Object.entries(stagingHeaders)) response.headers.set(name, value);
     response.cookies.set({
       name: STAGING_ACCESS_COOKIE,
-      value: createStagingSession(),
+      value: await createStagingSession(),
       path: '/',
       maxAge: STAGING_SESSION_TTL_SECONDS,
       httpOnly: true,
       sameSite: 'strict',
-      secure: request.nextUrl.protocol === 'https:' || process.env.VERCEL === '1'
+      secure: request.nextUrl.protocol === 'https:' || process.env.VERCEL === '1' || process.env.NETLIFY === 'true'
     });
     return response;
   }
 
   if (path === '/__staging/logout') {
     const response = NextResponse.redirect(new URL('/', request.url), 303);
-    response.cookies.set({ name: STAGING_ACCESS_COOKIE, value: '', path: '/', maxAge: 0, httpOnly: true, sameSite: 'strict', secure: request.nextUrl.protocol === 'https:' || process.env.VERCEL === '1' });
+    response.cookies.set({ name: STAGING_ACCESS_COOKIE, value: '', path: '/', maxAge: 0, httpOnly: true, sameSite: 'strict', secure: request.nextUrl.protocol === 'https:' || process.env.VERCEL === '1' || process.env.NETLIFY === 'true' });
     for (const [name, value] of Object.entries(stagingHeaders)) response.headers.set(name, value);
     return response;
   }
 
   const cookieValue = request.cookies.get(STAGING_ACCESS_COOKIE)?.value || '';
-  if (!isStagingSessionValid(cookieValue)) {
+  if (!await isStagingSessionValid(cookieValue)) {
     if (path.startsWith('/api/')) {
       return Response.json({ error: 'كلمة مرور بيئة الاختبار مطلوبة / Staging password required', stagingAccessRequired: true }, { status: 401, headers: stagingHeaders });
     }
@@ -106,3 +123,4 @@ export const config = {
   // the private staging site's compiled application bundle to anonymous users.
   matcher: ['/:path*']
 };
+
