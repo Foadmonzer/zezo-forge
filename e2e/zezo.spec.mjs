@@ -222,7 +222,9 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await page.setViewportSize({ width: 1366, height: 900 });
   await page.goto(`/?ref=${encodeURIComponent(referralCode)}`);
   await page.locator('.login-open').click();
-  await page.locator('[data-customer-view="register"]').click();
+  await expect(page.locator('#authModal.open')).toBeVisible();
+  await expect(page.locator('#customerChoicePanel [data-customer-view="register"]')).toBeVisible();
+  await page.locator('#customerChoicePanel [data-customer-view="register"]').click();
   await page.locator('#clientRegisterForm [name="name"]').fill('Synthetic Browser Customer');
   await page.locator('#clientRegisterForm [name="email"]').fill(`e2e_customer_${suffix}@example.test`);
   const customerPassword = `Customer!${suffix}Password2026`;
@@ -474,4 +476,5 @@ test('interactive demos perform their core local actions without external servic
   await page.locator('.canvas-toolbar [data-idea-action="save"]').click();
   await expect(page.locator('#templatePreviewNotice')).toContainText('حُفظت');
 });
+
 
