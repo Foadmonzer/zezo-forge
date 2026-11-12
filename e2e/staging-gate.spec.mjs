@@ -36,7 +36,6 @@ test('staging gate protects pages, API, and static assets until a secure session
   const loginHeaders = await loginResponse.allHeaders();
   expect(loginResponse.status(), `staging login status=${loginResponse.status()} location=${loginHeaders.location || 'missing'}`).toBe(303);
   expect(loginHeaders.location || '', 'successful login should redirect to the staging home page').not.toContain('stagingError=');
-  expect(loginHeaders['set-cookie'] || '', 'successful login should issue the protected staging cookie').toContain('zezo_staging_access=');
 
   const cookies = await page.context().cookies();
   const gateCookie = cookies.find(cookie => cookie.name === 'zezo_staging_access');
