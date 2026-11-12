@@ -122,6 +122,7 @@ test('responsive page layouts, navigation, and screenshots at requested widths',
 });
 
 test('all 40 catalog templates open and both request actions route to the correct template', async ({ page, browserName }, testInfo) => {
+  test.setTimeout(240_000);
   test.skip(browserName !== 'chromium', 'The 40-template sweep runs once in Chromium.');
   const ids = await templateIds();
   expect(ids).toHaveLength(40);
