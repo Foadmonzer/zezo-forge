@@ -107,7 +107,12 @@ async function handleStagingLogin(request: NextRequest) {
       secure: request.nextUrl.protocol === 'https:' || hostedServerless()
     });
     return response;
-  } catch {
+  } catch (error) {
+    const code = typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as { code?: unknown }).code || 'unknown').slice(0, 32)
+      : 'unknown';
+    const name = error instanceof Error ? error.name : 'unknown';
+    console.error('ZEZO staging login limiter failed', { name, code });
     return stagingLoginRedirect(request, 'limiter_unavailable');
   }
 }
