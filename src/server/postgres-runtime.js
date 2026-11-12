@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
 import pg from 'pg';
+import { SUPABASE_ROOT_CA_2021 } from './supabase-root-ca-2021.js';
 
 const { Pool } = pg;
 const transactionStorage = new AsyncLocalStorage();
@@ -12,15 +13,53 @@ export function postgresConfigured() {
   return Boolean(process.env.DATABASE_URL);
 }
 
+function configuredRootCertificate() {
+  if (process.env.DATABASE_CA_CERT_BASE64) {
+    return Buffer.from(process.env.DATABASE_CA_CERT_BASE64, 'base64').toString('utf8');
+  }
+  return process.env.DATABASE_CA_CERT?.replace(/\\n/g, '\n') || '';
+}
+
+function isSupabaseDatabaseHost(hostname) {
+  const host = hostname.toLowerCase();
+  return host.endsWith('.supabase.co') || host.endsWith('.pooler.supabase.com');
+}
+
+function poolLimit(value) {
+  return Math.min(20, Math.max(2, Number(value) || 8));
+}
+
+// node-postgres replaces the ssl object when sslmode/sslrootcert/sslcert/sslkey
+// is present in connectionString. Remove those query options when supplying a
+// CA explicitly so TLS verifies both the chain and the database hostname.
+export function createPostgresPoolOptions(databaseUrl, rootCertificate = '', configuredPoolSize = 8) {
+  const parsedUrl = new URL(databaseUrl);
+  const ca = rootCertificate || (isSupabaseDatabaseHost(parsedUrl.hostname) ? SUPABASE_ROOT_CA_2021 : '');
+
+  if (ca) {
+    const tlsParameters = new Set(['sslmode', 'sslrootcert', 'sslcert', 'sslkey']);
+    for (const key of [...parsedUrl.searchParams.keys()]) {
+      if (tlsParameters.has(key.toLowerCase())) parsedUrl.searchParams.delete(key);
+    }
+  }
+
+  return {
+    connectionString: ca ? parsedUrl.toString() : databaseUrl,
+    ...(ca ? { ssl: { ca, rejectUnauthorized: true } } : {}),
+    max: poolLimit(configuredPoolSize),
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 10_000
+  };
+}
+
 function getPool() {
   if (!pool) {
     if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required for PostgreSQL persistence.');
-    pool = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      max: Math.min(20, Math.max(2, Number(process.env.ZEZO_DATABASE_POOL_SIZE) || 8)),
-      idleTimeoutMillis: 30_000,
-      connectionTimeoutMillis: 10_000
-    });
+    pool = new Pool(createPostgresPoolOptions(
+      process.env.DATABASE_URL,
+      configuredRootCertificate(),
+      process.env.ZEZO_DATABASE_POOL_SIZE
+    ));
   }
   return pool;
 }
