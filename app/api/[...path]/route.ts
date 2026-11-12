@@ -1,9 +1,10 @@
 import { Readable, Writable } from 'node:stream';
 import type { IncomingHttpHeaders } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
-import type { NextRequest } from 'next/server';
+import { NextResponse, type NextRequest } from 'next/server';
 import { handle, init } from '../../../server.js';
 import { consumeRateLimitBucket, postgresConfigured } from '../../../src/server/postgres-runtime.js';
+import { createStagingSession, stagingPasswordMatches, STAGING_ACCESS_COOKIE, STAGING_SESSION_TTL_SECONDS } from '../../../src/server/staging-edge-auth.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -44,8 +45,63 @@ function initLocalRuntime() {
   return globals.__zezoNextInit ??= init();
 }
 
+function stagingLoginRedirect(request: NextRequest, code: string) {
+  const target = new URL('/', request.url);
+  target.searchParams.set('stagingError', code);
+  const response = NextResponse.redirect(target, 303);
+  response.headers.set('Cache-Control', 'no-store');
+  response.headers.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
+  return response;
+}
+
+function stagingRequestAddress(request: NextRequest) {
+  const forwarded = process.env.NETLIFY === 'true' || process.env.ZEZO_SERVERLESS_RUNTIME === 'true'
+    ? request.headers.get('x-nf-client-connection-ip')
+    : request.headers.get('x-forwarded-for');
+  return (forwarded?.split(',')[0]?.trim() || 'unknown').slice(0, 128);
+}
+
+async function handleStagingLogin(request: NextRequest) {
+  if (process.env.ZEZO_STAGING !== 'true') return new Response(null, { status: 404 });
+  if (request.method !== 'POST') return new Response(null, { status: 405, headers: { Allow: 'POST' } });
+  if (!process.env.ZEZO_STAGING_ACCESS_PASSWORD || process.env.ZEZO_STAGING_ACCESS_PASSWORD.length < 16) {
+    return stagingLoginRedirect(request, 'configuration');
+  }
+  if (hostedServerless() && !postgresConfigured()) {
+    return stagingLoginRedirect(request, 'database_unavailable');
+  }
+
+  try {
+    const allowed = await consumeRateLimitBucket('staging-login', stagingRequestAddress(request), 12, 15 * 60_000);
+    if (!allowed) return stagingLoginRedirect(request, 'rate_limited');
+
+    const form = await request.formData();
+    const value = form.get('password');
+    const password = typeof value === 'string' ? value : '';
+    if (!await stagingPasswordMatches(password)) return stagingLoginRedirect(request, 'invalid_password');
+
+    const response = NextResponse.redirect(new URL('/', request.url), 303);
+    response.headers.set('Cache-Control', 'no-store');
+    response.headers.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    response.cookies.set({
+      name: STAGING_ACCESS_COOKIE,
+      value: await createStagingSession(),
+      path: '/',
+      maxAge: STAGING_SESSION_TTL_SECONDS,
+      httpOnly: true,
+      sameSite: 'strict',
+      secure: request.nextUrl.protocol === 'https:' || hostedServerless()
+    });
+    return response;
+  } catch {
+    return stagingLoginRedirect(request, 'limiter_unavailable');
+  }
+}
+
 async function dispatch(request: NextRequest) {
   const requestUrl = new URL(request.url);
+  if (requestUrl.pathname === '/api/staging/login') return handleStagingLogin(request);
+
   if (requestUrl.pathname === '/api/staging/rate-limit') {
     const noStore = { 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow, noarchive' };
     const configuredSecret = String(process.env.ZEZO_STAGING_INTERNAL_SECRET || '');
