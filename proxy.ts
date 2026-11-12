@@ -77,7 +77,7 @@ export async function proxy(request: NextRequest) {
   }
 
   if (path === '/__staging/logout') {
-    const response = NextResponse.redirect(new URL('/', request.url), 303);
+    const response = new NextResponse(null, { status: 303, headers: { Location: '/' } });
     response.cookies.set({ name: STAGING_ACCESS_COOKIE, value: '', path: '/', maxAge: 0, httpOnly: true, sameSite: 'strict', secure: request.nextUrl.protocol === 'https:' || hostedServerless() });
     for (const [name, value] of Object.entries(stagingHeaders)) response.headers.set(name, value);
     return response;
