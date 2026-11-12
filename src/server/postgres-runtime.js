@@ -17,7 +17,7 @@ function configuredRootCertificate() {
   if (process.env.DATABASE_CA_CERT_BASE64) {
     return Buffer.from(process.env.DATABASE_CA_CERT_BASE64, 'base64').toString('utf8');
   }
-  return process.env.DATABASE_CA_CERT?.replace(/\\n/g, '\n') || '';
+  return process.env.DATABASE_CA_CERT || '';
 }
 
 function isSupabaseDatabaseHost(hostname) {
