@@ -43,6 +43,8 @@ test('staging gate protects pages, API, and static assets until a secure session
   expect(gateCookie).toBeTruthy();
   expect(gateCookie.httpOnly).toBe(true);
   expect(gateCookie.sameSite).toBe('Strict');
+  const authorizedApi = await request.get('/api/public', { headers: { cookie: `zezo_staging_access=${gateCookie.value}` } });
+  expect(authorizedApi.status(), 'the server should accept the session cookie minted by the staging login').toBe(200);
   expect(await page.evaluate(() => document.cookie)).not.toContain('zezo_staging_access');
   await expect(page.locator('body')).not.toContainText('دخول بيئة الاختبار');
   expect(await page.evaluate(async () => (await fetch('/api/public')).status)).toBe(200);
