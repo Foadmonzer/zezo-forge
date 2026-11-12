@@ -25,8 +25,9 @@ test('staging gate protects pages, API, and static assets until a secure session
   });
   expect(wrongInternalSecret.status()).toBe(404);
 
-  const badLogin = await request.post('/__staging/login', { form: { password: 'not-the-staging-password' } });
-  expect(badLogin.status()).toBe(401);
+  const badLogin = await request.post('/api/staging/login', { form: { password: 'not-the-staging-password' }, maxRedirects: 0 });
+  expect(badLogin.status()).toBe(303);
+  expect(badLogin.headers().location).toContain('stagingError=invalid_password');
 
   await page.getByLabel('كلمة مرور المعاينة').fill(stagingPassword);
   await page.getByRole('button', { name: 'دخول آمن' }).click();
