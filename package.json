@@ -24,6 +24,7 @@
     "test:staging": "node staging-smoke-test.js",
     "test:staging-auth": "node staging-auth-smoke-test.js",
     "test:postgres": "node postgres-smoke-test.js && node postgres-api-smoke-test.js && node postgres-outbox-smoke-test.js",
+    "perf:production": "node scripts/measure-production-performance.mjs",
     "test": "node smoke-test.js && node staging-smoke-test.js"
   },
   "engines": {

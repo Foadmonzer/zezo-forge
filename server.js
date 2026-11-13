@@ -7,7 +7,7 @@ import { randomBytes, scryptSync, timingSafeEqual, createHash, createHmac } from
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { templateCatalog, templateById } from './public/template-catalog.js';
 import { buildWhatsAppUrl, normalizeWhatsAppNumber } from './public/whatsapp.js';
-import { consumeRateLimitBucket, currentPostgresClient, deleteRateLimitBucket, postgresConfigured, withPostgresReadTransaction, withPostgresTransaction } from './src/server/postgres-runtime.js';
+import { consumeRateLimitBucket, currentPostgresClient, deleteRateLimitBucket, postgresConfigured, withPostgresReadTransaction, withPostgresScopedTransaction, withPostgresTransaction } from './src/server/postgres-runtime.js';
 import { createStagingSession, isStagingSessionValid, STAGING_ACCESS_COOKIE, STAGING_SESSION_TTL_SECONDS, stagingPasswordMatches } from './src/server/staging-auth.js';
 import { deleteReferralTrackingForVisitor, loadNormalizedStore, persistNormalizedStore } from './src/server/postgres-store.js';
 import { loadPublicRuntimeSnapshot, loadPublicTrackRecord } from './src/server/public-read-repository.js';
@@ -248,6 +248,17 @@ async function loadPostgresStore(client) {
   sessions.clear();
   const sessionResult = await client.query('SELECT id, "userId", "expiresAt" FROM auth_sessions WHERE "expiresAt" > NOW()');
   for (const row of sessionResult.rows) sessions.set(row.id, { userId: row.userId, expires: new Date(row.expiresAt).getTime() });
+}
+
+async function withPostgresReadStoreSnapshot(work) {
+  const snapshot = await withPostgresReadTransaction(client => loadNormalizedStore(client, defaultStore));
+  const previousStore = store;
+  store = { ...defaultStore(), ...snapshot };
+  try {
+    return work();
+  } finally {
+    store = previousStore;
+  }
 }
 
 async function persistPostgresStore(client) {
@@ -920,6 +931,88 @@ function directCrmAggregate(records, events, { from = '', to = '', service = '' 
     overdueFollowUps: records.filter(row => row.followUpAt && Date.parse(row.followUpAt) < Date.now() && !['completed_sale', 'cancelled', 'not_interested', 'duplicate'].includes(row.status)).length
   };
 }
+async function loadNotificationDeadlineSnapshot(client) {
+  const asObject = value => value && typeof value === 'object' ? value : {};
+  const asIso = value => {
+    if (!value) return '';
+    const parsed = value instanceof Date ? value : new Date(value);
+    return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : String(value);
+  };
+
+  const userRows = (await client.query(`
+    SELECT id, email, username, role, active, "fullName", data, "createdAt"
+    FROM user_accounts
+    WHERE active = TRUE AND role <> 'client'
+  `)).rows;
+  const users = userRows.map(row => ({
+    ...asObject(row.data), id: row.id, email: row.email || '', username: row.username || '',
+    role: row.role, active: row.active, name: row.fullName || row.data?.name || '',
+    createdAt: asIso(row.createdAt)
+  }));
+
+  const leadRows = (await client.query(`
+    SELECT id, status, "developerId", data, "createdAt", "updatedAt"
+    FROM project_requests
+    WHERE "developerId" IS NOT NULL OR data ? 'developerUserId' OR data ? 'developerDueDate'
+  `)).rows;
+  const leads = new Map(leadRows.map(row => {
+    const data = asObject(row.data);
+    return [row.id, {
+      ...data, id: row.id, status: row.status || data.status || 'new',
+      developerUserId: row.developerId || data.developerUserId || null,
+      createdAt: asIso(row.createdAt), updatedAt: asIso(row.updatedAt)
+    }];
+  }));
+  const projectRows = (await client.query(`
+    SELECT p."requestId", p."developerId", p."dueAt", p.data,
+      r.status AS "requestStatus", r.data AS "requestData",
+      r."createdAt" AS "requestCreatedAt", r."updatedAt" AS "requestUpdatedAt"
+    FROM projects p
+    LEFT JOIN project_requests r ON r.id = p."requestId"
+    WHERE p."developerId" IS NOT NULL OR p."dueAt" IS NOT NULL
+  `)).rows;
+  for (const row of projectRows) {
+    const projectData = asObject(row.data);
+    const requestData = asObject(row.requestData);
+    const lead = leads.get(row.requestId) || {
+      ...requestData, id: row.requestId, status: row.requestStatus || requestData.status || 'new',
+      createdAt: asIso(row.requestCreatedAt), updatedAt: asIso(row.requestUpdatedAt)
+    };
+    if (row.developerId) lead.developerUserId = row.developerId;
+    if (row.dueAt) lead.developerDueDate = asIso(row.dueAt);
+    for (const key of ['developerDueDate', 'developerUpdatedAt']) {
+      if (projectData[key] !== undefined && !lead[key]) lead[key] = projectData[key];
+    }
+    leads.set(row.requestId, lead);
+  }
+
+  const crmRows = (await client.query(`
+    SELECT id, status, data, "createdAt", "updatedAt"
+    FROM crm_records
+    WHERE status IN ('new_enquiry', 'awaiting_contact')
+      OR NULLIF(data->>'followUpAt', '') IS NOT NULL
+  `)).rows;
+  const crmLeads = crmRows.map(row => ({
+    ...asObject(row.data), id: row.id, status: row.status || row.data?.status || 'new_enquiry',
+    createdAt: asIso(row.createdAt), updatedAt: asIso(row.updatedAt)
+  }));
+
+  const recipientIds = [...new Set(users.map(user => user.id).filter(Boolean))];
+  const notificationRows = recipientIds.length
+    ? (await client.query(`
+        SELECT id, "userId", type, "readAt", data, "createdAt"
+        FROM system_notifications
+        WHERE "userId" = ANY($1::text[]) AND type = 'deadline'
+      `, [recipientIds])).rows
+    : [];
+  const notifications = notificationRows.map(row => ({
+    ...asObject(row.data), id: row.id, userId: row.userId, type: row.type || row.data?.type,
+    readAt: row.readAt ? asIso(row.readAt) : '', createdAt: asIso(row.createdAt)
+  }));
+
+  return { ...defaultStore(), users, leads: [...leads.values()], crmLeads, notifications };
+}
+
 async function handlePostgresCoreRead(req, res, path) {
   if (!stagingAuthorized(req)) return false;
   const security = responseSecurityHeaders();
@@ -1151,9 +1244,9 @@ async function handlePostgresCoreRead(req, res, path) {
     return true;
   }
 
-  // The public site header polls notifications on every page load. Reject
-  // anonymous and first-login sessions here so this harmless preview request
-  // cannot enter the legacy whole-store transaction and block password setup.
+  // The header polls this endpoint every 30 seconds. Keep it out of the legacy
+  // whole-store rewrite and the company-wide advisory lock. Deadline reminders
+  // are generated from only their source tables and saved idempotently.
   if (req.method === 'GET' && path === '/api/notifications') {
     const auth = await directPostgresSessionUser(req);
     if (!auth) {
@@ -1164,6 +1257,239 @@ async function handlePostgresCoreRead(req, res, path) {
       directRequireAuth(req, res, auth.user, allRoles);
       return true;
     }
+    if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const type = clean(url.searchParams.get('type'), 32);
+    const status = clean(url.searchParams.get('status'), 12);
+    const from = clean(url.searchParams.get('from'), 10);
+    const to = clean(url.searchParams.get('to'), 10);
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 50));
+    const notificationTypes = ['project','inquiry','withdrawal','rank','sale','commission','quote','payment','team','deadline','finance','referral','update'];
+    if ((type && !notificationTypes.includes(type)) || (status && !['all','read','unread'].includes(status)) ||
+        (from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) || (to && !/^\d{4}-\d{2}-\d{2}$/.test(to))) {
+      json(res, 400, { error: 'فلاتر الإشعارات غير صالحة / Invalid notification filters' }, security);
+      return true;
+    }
+    const result = await withPostgresScopedTransaction(async client => {
+      const snapshot = await loadNotificationDeadlineSnapshot(client);
+      const beforeIds = new Set(snapshot.notifications.map(row => row.id));
+      const previousStore = store;
+      let generated = [];
+      try {
+        store = snapshot;
+        emitDeadlineNotifications();
+        generated = store.notifications.filter(row => !beforeIds.has(row.id));
+      } finally {
+        store = previousStore;
+      }
+
+      if (generated.length) {
+        // This narrow lock serializes only notification inserts; it does not
+        // block unrelated reads, conversations, orders, or financial writes.
+        await client.query('LOCK TABLE system_notifications IN SHARE ROW EXCLUSIVE MODE');
+        for (const row of generated) {
+          if (!row.eventKey) continue;
+          await client.query(`
+            INSERT INTO system_notifications (id, "userId", type, "readAt", data, "createdAt")
+            SELECT $1, $2, $3, $4, $5::jsonb, $6
+            WHERE NOT EXISTS (
+              SELECT 1 FROM system_notifications existing
+              WHERE existing."userId" = $2 AND existing.data->>'eventKey' = $7
+            )
+            ON CONFLICT (id) DO NOTHING
+          `, [row.id, row.userId, row.type || null, row.readAt ? new Date(row.readAt) : null, JSON.stringify(row), new Date(row.createdAt), row.eventKey]);
+        }
+      }
+
+      const conditions = ['"userId" = $1'];
+      const values = [auth.user.id];
+      const addFilter = (condition, value) => { values.push(value); conditions.push(condition.replace('?', `$${values.length}`)); };
+      if (type) addFilter('type = ?', type);
+      if (status === 'read') conditions.push('"readAt" IS NOT NULL');
+      if (status === 'unread') conditions.push('"readAt" IS NULL');
+      if (from) addFilter('"createdAt" >= ?', new Date(`${from}T00:00:00.000Z`));
+      if (to) addFilter('"createdAt" <= ?', new Date(`${to}T23:59:59.999Z`));
+      const unread = await client.query('SELECT COUNT(*)::int AS count FROM system_notifications WHERE "userId" = $1 AND "readAt" IS NULL', [auth.user.id]);
+      values.push(limit);
+      const rows = await client.query(`
+        SELECT id, type, "readAt", data, "createdAt"
+        FROM system_notifications
+        WHERE ${conditions.join(' AND ')}
+        ORDER BY "createdAt" DESC
+        LIMIT $${values.length}
+      `, values);
+      const notifications = rows.rows.map(row => safeNotification({
+        ...(row.data && typeof row.data === 'object' ? row.data : {}),
+        id: row.id, type: row.type || row.data?.type || '',
+        readAt: row.readAt ? new Date(row.readAt).toISOString() : '',
+        createdAt: new Date(row.createdAt).toISOString()
+      }));
+      return { notifications, unreadCount: Number(unread.rows[0]?.count || 0) };
+    });
+    json(res, 200, { ...result, authenticated: true, emailReady: emailReady() && adminEmailReady() }, security);
+    return true;
+  }
+
+  const notificationRead = req.method === 'PATCH' && /^\/api\/notifications\/[^/]+$/.test(path);
+  if (notificationRead) {
+    const auth = await directPostgresSessionUser(req);
+    if (!auth) { json(res, 401, { error: 'سجّل الدخول للمتابعة / Please sign in to continue' }, security); return true; }
+    if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
+    const notificationId = clean(path.split('/').at(-1), 100);
+    const result = await withPostgresScopedTransaction(async client => {
+      const selected = await client.query('SELECT id, "userId", type, "readAt", data, "createdAt" FROM system_notifications WHERE id = $1 AND "userId" = $2 FOR UPDATE', [notificationId, auth.user.id]);
+      if (!selected.rowCount) return null;
+      let row = selected.rows[0];
+      if (!row.readAt) {
+        const at = new Date();
+        const updated = await client.query(`
+          UPDATE system_notifications
+          SET "readAt" = $3, data = jsonb_set(data, '{readAt}', to_jsonb($3::text), TRUE)
+          WHERE id = $1 AND "userId" = $2
+          RETURNING id, "userId", type, "readAt", data, "createdAt"
+        `, [notificationId, auth.user.id, at]);
+        row = updated.rows[0];
+      }
+      const unread = await client.query('SELECT COUNT(*)::int AS count FROM system_notifications WHERE "userId" = $1 AND "readAt" IS NULL', [auth.user.id]);
+      return {
+        notification: safeNotification({ ...(row.data || {}), id: row.id, type: row.type || row.data?.type || '', readAt: row.readAt ? new Date(row.readAt).toISOString() : '', createdAt: new Date(row.createdAt).toISOString() }),
+        unreadCount: Number(unread.rows[0]?.count || 0)
+      };
+    });
+    if (!result) { json(res, 404, { error: 'الإشعار غير موجود / Notification not found' }, security); return true; }
+    json(res, 200, result, security);
+    return true;
+  }
+
+  if (req.method === 'POST' && path === '/api/notifications/read-all') {
+    const auth = await directPostgresSessionUser(req);
+    if (!auth) { json(res, 401, { error: 'سجّل الدخول للمتابعة / Please sign in to continue' }, security); return true; }
+    if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
+    await withPostgresScopedTransaction(client => client.query(`
+      UPDATE system_notifications
+      SET "readAt" = NOW(), data = jsonb_set(data, '{readAt}', to_jsonb(NOW()::text), TRUE)
+      WHERE "userId" = $1 AND "readAt" IS NULL
+    `, [auth.user.id]));
+    json(res, 200, { ok: true, unreadCount: 0 }, security);
+    return true;
+  }
+
+  if (req.method === 'GET' && path === '/api/admin/finance') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, ['admin'])) return true;
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const report = await withPostgresReadStoreSnapshot(() => financeTreasuryFor(Object.fromEntries(url.searchParams)));
+    json(res, 200, report, security);
+    return true;
+  }
+
+  if (req.method === 'GET' && path === '/api/referral-intelligence') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, ['admin','hr_manager','marketing_manager','marketer','developer'])) return true;
+    const user = auth.user;
+    const canViewTeam = user.role === 'admin' || (user.role === 'hr_manager' && hasPermission(user, 'employees.read', { department: 'people' })) || (user.role === 'marketing_manager' && hasPermission(user, 'employees.read', { department: 'marketing' }));
+    if (['hr_manager','marketing_manager'].includes(user.role) && !canViewTeam) {
+      json(res, 403, { error: 'إحصاءات الفريق تحتاج صلاحية مشاهدة الموظفين / Team analytics require employee-view permission' }, security);
+      return true;
+    }
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const requestedUser = clean(url.searchParams.get('employee'), 80);
+    if (requestedUser && !canViewTeam && requestedUser !== user.id) {
+      json(res, 403, { error: 'لا يمكنك عرض موظف آخر / You cannot view another employee' }, security);
+      return true;
+    }
+    const from = clean(url.searchParams.get('from'), 10);
+    const to = clean(url.searchParams.get('to'), 10);
+    const status = clean(url.searchParams.get('status'), 20);
+    if ((from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) || (to && !/^\d{4}-\d{2}-\d{2}$/.test(to)) ||
+        (status && !['new','review','proposal','active','waiting_payment','completed','cancelled'].includes(status))) {
+      json(res, 400, { error: 'الفلاتر غير صالحة / Invalid filters' }, security);
+      return true;
+    }
+    const report = await withPostgresReadStoreSnapshot(() => {
+      const intel = referralIntelligenceForViewer(user);
+      const allowedIds = new Set(intel.employees.map(row => row.id));
+      const employee = requestedUser && allowedIds.has(requestedUser) ? requestedUser : '';
+      const start = from ? Date.parse(`${from}T00:00:00.000Z`) : -Infinity;
+      const end = to ? Date.parse(`${to}T23:59:59.999Z`) : Infinity;
+      const matchingOrders = intel.orders.filter(order => (!employee || order.userId === employee) && (!status || order.status === status));
+      const matchingOrderById = new Map(matchingOrders.map(order => [order.id, order]));
+      const orders = matchingOrders.filter(order => Date.parse(order.createdAt) >= start && Date.parse(order.createdAt) <= end);
+      const events = store.referralEvents.filter(event => allowedIds.has(event.userId) && (!employee || event.userId === employee) &&
+        Date.parse(event.createdAt) >= start && Date.parse(event.createdAt) <= end && (!status || (event.leadId && matchingOrderById.has(event.leadId))))
+        .map(event => ({ id: event.id, userId: event.userId, employeeName: intel.employees.find(row => row.id === event.userId)?.name || '', code: event.code,
+          linkId: event.linkId, month: event.month, type: event.type, createdAt: event.createdAt, resourceId: event.resourceId, leadId: event.leadId,
+          followupId: event.followupId, reversed: Boolean(event.reversedAt), status: event.leadId ? matchingOrderById.get(event.leadId)?.status || '' : '',
+          visitorHash: event.type === 'visit' ? event.visitorHash : null }));
+      events.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+      const active = events.filter(event => !event.reversed);
+      const counts = type => active.filter(event => event.type === type).length;
+      const visitors = new Set(active.filter(event => event.type === 'visit').map(event => event.visitorHash).filter(Boolean)).size;
+      const linkStats = intel.links.filter(link => !employee || link.userId === employee).map(link => {
+        const subset = active.filter(event => event.linkId === link.id);
+        const count = type => subset.filter(event => event.type === type).length;
+        return { ...link, visits: new Set(subset.filter(event => event.type === 'visit').map(event => event.visitorHash).filter(Boolean)).size,
+          serviceViews: count('service_view'), templateViews: count('template_view'), whatsappClicks: count('whatsapp_click'), inquiries: count('inquiry_confirmed'),
+          requests: new Set(orders.filter(order => order.linkId === link.id).map(order => order.id)).size,
+          sales: new Set(subset.filter(event => event.type === 'qualified_sale' && event.leadId).map(event => event.leadId)).size };
+      });
+      for (const event of events) delete event.visitorHash;
+      const summary = { visits: visitors, serviceViews: counts('service_view'), templateViews: counts('template_view'), whatsappClicks: counts('whatsapp_click'),
+        inquiries: counts('inquiry_confirmed'), requests: new Set(orders.map(order => order.id)).size, quoteAcceptances: counts('quote_accepted'),
+        payments: counts('payment_received'), sales: new Set(active.filter(event => event.type === 'qualified_sale' && event.leadId).map(event => event.leadId)).size,
+        orders: orders.length };
+      const rate = (numerator, denominator) => denominator ? Math.round(numerator / denominator * 1000) / 10 : 0;
+      summary.conversionRates = { visitToRequest: rate(summary.requests, summary.visits), requestToSale: rate(summary.sales, summary.requests), whatsappToInquiry: rate(summary.inquiries, summary.whatsappClicks) };
+      return { retentionDays: 90, filters: { from, to, employee, status }, summary, employees: intel.employees.filter(row => !employee || row.id === employee),
+        links: linkStats, orders: orders.slice(0, 500), events: events.filter(event => event.type !== 'visit').slice(0, 500) };
+    });
+    json(res, 200, report, security);
+    return true;
+  }
+
+  if (req.method === 'GET' && path === '/api/crm/export') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, ['admin','marketing_manager','hr_manager','marketer'])) return true;
+    if (auth.user.role === 'marketing_manager' && !permissionEnabled(auth.user, 'orders.manage')) {
+      json(res, 403, { error: 'لا تملك صلاحية تصدير سجلات العملاء / You cannot export CRM records' }, security);
+      return true;
+    }
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const input = {
+      from: clean(url.searchParams.get('from'), 10), to: clean(url.searchParams.get('to'), 10),
+      status: clean(url.searchParams.get('status'), 32), employee: clean(url.searchParams.get('employee'), 80),
+      service: clean(url.searchParams.get('service'), 60),
+      search: ['admin','marketing_manager'].includes(auth.user.role) ? clean(url.searchParams.get('q'), 120).toLowerCase() : ''
+    };
+    if ((input.from && !/^\d{4}-\d{2}-\d{2}$/.test(input.from)) || (input.to && !/^\d{4}-\d{2}-\d{2}$/.test(input.to)) ||
+        (input.status && !crmStatuses.includes(input.status)) || (input.service && !Object.hasOwn(serviceCategories, input.service))) {
+      json(res, 400, { error: 'فلاتر CRM غير صالحة / Invalid CRM filters' }, security);
+      return true;
+    }
+    const csv = await withPostgresReadStoreSnapshot(() => {
+      const records = store.crmLeads || [];
+      const scope = auth.user.role === 'marketer' ? records.filter(row => row.referralUserId === auth.user.id)
+        : auth.user.role === 'marketing_manager' ? records.filter(row => crmAccess(auth.user, row)) : records;
+      const fromTime = input.from ? Date.parse(`${input.from}T00:00:00.000Z`) : -Infinity;
+      const toTime = input.to ? Date.parse(`${input.to}T23:59:59.999Z`) : Infinity;
+      const filtered = scope.filter(row => Date.parse(row.createdAt) >= fromTime && Date.parse(row.createdAt) <= toTime &&
+        (!input.status || row.status === input.status) && (!input.employee || ['admin','marketing_manager','hr_manager'].includes(auth.user.role) && (row.referralUserId === input.employee || row.assignedUserId === input.employee)) &&
+        (!input.service || row.service === input.service) && (!input.search || [row.name,row.phone,row.email,row.service,row.details,row.referralCode].some(value => String(value || '').toLowerCase().includes(input.search))));
+      const rows = ['hr_manager','marketer'].includes(auth.user.role)
+        ? [['metric','value'], ...Object.entries(crmAggregate(filtered, { from: input.from, to: input.to, service: input.service }))]
+        : [['id','createdAt','name','phone','email','service','status','source','referrer','referralCode','assignedTo','followUpAt','orderIds'],
+          ...filtered.map(row => [row.id,row.createdAt,row.name,row.phone,row.email,row.service,row.status,row.source,
+            store.users.find(user => user.id === row.referralUserId)?.name || '',row.referralCode,
+            store.users.find(user => user.id === row.assignedUserId)?.name || '',row.followUpAt,(row.orderIds || []).join('|')])];
+      return rows.map(row => row.map(value => {
+        let text = String(value ?? '');
+        if (/^[=+@-]/.test(text)) text = `'${text}`;
+        return `"${text.replace(/"/g, '""')}"`;
+      }).join(',')).join('\r\n');
+    });
+    res.writeHead(200, { ...security, 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="zezo-crm.csv"', 'Cache-Control': 'no-store' });
+    res.end(`\uFEFF${csv}`);
+    return true;
   }
 
   const directConversationMutation = /^\/api\/conversations\/([^/]+)\/(quote|accept-quote)$/.exec(path);
@@ -2910,7 +3236,14 @@ function handlePublicRuntimeConfig(req, res, snapshot) {
     emailReady: emailReady() && adminEmailReady(),
     aiQuoteReady: !STAGING_MODE && Boolean(process.env.OPENAI_API_KEY && process.env.OPENAI_MODEL),
     stagingMode: STAGING_MODE
-  }, responseSecurityHeaders());
+  }, {
+    ...responseSecurityHeaders(),
+    // This payload contains only shared public settings (template prices,
+    // public WhatsApp links, and feature readiness), never user-specific data.
+    // Keep browser caching disabled while allowing Netlify's CDN to absorb
+    // repeated reads and avoid a database round-trip for every page load.
+    'Netlify-CDN-Cache-Control': 'public, max-age=15, stale-while-revalidate=45, durable'
+  });
 }
 
 export { init, handle, processMailQueue as runOutboxWorker };
