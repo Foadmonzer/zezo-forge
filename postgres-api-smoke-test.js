@@ -716,7 +716,7 @@ try {
     'SELECT id, role FROM user_accounts WHERE id = ANY($1::text[]) ORDER BY role',
     [syntheticIds]
   );
-  assert(storedUsers.rowCount === 3 + employeeIds.length, 'Expected synthetic Owner, customers, and employees in PostgreSQL user_accounts.');
+  assert(storedUsers.rowCount === syntheticIds.length, 'Expected every synthetic Owner, referrer, customer, and employee in PostgreSQL user_accounts.');
   const storedSessions = await client.query(
     'SELECT id FROM auth_sessions WHERE "userId" = ANY($1::text[])',
     [syntheticIds]
