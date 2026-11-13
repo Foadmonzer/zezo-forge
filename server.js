@@ -994,6 +994,10 @@ async function handlePostgresCoreRead(req, res, path) {
 
   if (req.method === 'GET' && path === '/api/dashboard') {
     const auth = await directPostgresSessionUser(req);
+    if (!auth) {
+      json(res, 401, { error: 'سجّل الدخول للمتابعة / Please sign in to continue' }, security);
+      return true;
+    }
     if (auth?.user.role === 'client') {
       if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
       const guest = guestSessionValue(req);

@@ -121,6 +121,25 @@ try {
   assert(health.status === 200 && health.data.storage === 'postgresql', 'API did not report PostgreSQL storage.');
   results.push('API runtime uses PostgreSQL');
 
+  const dashboardLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await dashboardLockHolder.connect();
+  let anonymousDashboard;
+  try {
+    await dashboardLockHolder.query('BEGIN');
+    await dashboardLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+    const pendingDashboard = request('GET', '/api/dashboard').then(value => ({ done: true, value }));
+    anonymousDashboard = await Promise.race([
+      pendingDashboard,
+      new Promise(resolve => setTimeout(() => resolve({ done: false }), 1000))
+    ]);
+  } finally {
+    await dashboardLockHolder.query('ROLLBACK').catch(() => {});
+    await dashboardLockHolder.end();
+  }
+  assert(anonymousDashboard?.done === true && anonymousDashboard.value.status === 401,
+    'Anonymous dashboard access must be rejected before waiting on the legacy global PostgreSQL lock.');
+  results.push('anonymous dashboard access is rejected before the legacy global PostgreSQL lock');
+
   const publicBefore = await request('GET', '/api/public');
   assert(!Object.hasOwn(publicBefore.data, 'adminSetupAvailable'), 'Public PostgreSQL configuration must never disclose Owner setup state.');
   assert(Object.keys(publicBefore.data.templatePrices || {}).length === 40, 'Public runtime read did not return the 40 template price entries.');
