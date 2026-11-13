@@ -12,6 +12,7 @@ import { createStagingSession, isStagingSessionValid, STAGING_ACCESS_COOKIE, STA
 import { deleteReferralTrackingForVisitor, loadNormalizedStore, persistNormalizedStore } from './src/server/postgres-store.js';
 import { loadPublicRuntimeSnapshot, loadPublicTrackRecord } from './src/server/public-read-repository.js';
 import { claimGuestConversations, findLoginAccount, loadClientDashboardData, loadConversationAssignees, loadConversationViews, loadCrmRecordsForViewer, loadCrmRelatedRows, loadEmployeeDashboardData, loadOrderManagerOrders, loadReferralEventsForUsers, loadSessionAccount, storeLoginSessionAndAudit } from './src/server/core-read-repository.js';
+import { changePostgresPassword, enablePostgresMfa, logoutPostgresSession, setupPostgresMfa } from './src/server/postgres-auth-repository.js';
 import { acceptPostgresQuote, createPostgresQuote } from './src/server/postgres-conversation-repository.js';
 import { claimNextOutboxMessage, completeOutboxMessage } from './src/server/outbox-repository.js';
 import { createPostgresWithdrawalRequest } from './src/server/postgres-withdrawal-repository.js';
@@ -939,6 +940,63 @@ async function handlePostgresCoreRead(req, res, path) {
     loginAttempts.delete(key);
     await deleteRateLimitBucket('login', key);
     json(res, 200, { user: publicUser(user) }, { ...security, 'Set-Cookie': cookie('zezo_session', sid, SESSION_TTL / 1000, req) });
+    return true;
+  }
+
+  if (req.method === 'POST' && path === '/api/auth/password') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, allRoles)) return true;
+    const body = await jsonBody(req);
+    if (!validPassword(body.newPassword)) {
+      json(res, 400, { error: 'كلمة المرور الجديدة يجب أن تكون 12 خانة على الأقل / New password must be at least 12 characters' }, security);
+      return true;
+    }
+    const result = await changePostgresPassword({
+      sessionHash: sessionKey(auth.sid), userId: auth.user.id,
+      currentPassword: body.currentPassword, newPassword: body.newPassword,
+      verifyPassword: passwordMatches, createPasswordRecord: passwordRecord,
+      auditId: id('evt'), at: now()
+    });
+    if (result.kind === 'unauthenticated') json(res, 401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' }, security);
+    else if (result.kind === 'invalid_current_password') json(res, 401, { error: 'كلمة المرور الحالية غير صحيحة / Current password is incorrect' }, security);
+    else json(res, 200, { ok: true }, security);
+    return true;
+  }
+
+  if (req.method === 'GET' && path === '/api/auth/mfa/setup') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, ['admin', 'marketing_manager', 'hr_manager', 'order_manager'])) return true;
+    const result = await setupPostgresMfa({ sessionHash: sessionKey(auth.sid), userId: auth.user.id, proposedSecret: base32Encode(randomBytes(20)) });
+    if (result.kind === 'unauthenticated') json(res, 401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' }, security);
+    else if (result.kind === 'already_enabled') json(res, 409, { error: 'التحقق بخطوتين مفعّل مسبقاً / Two-step verification is already enabled' }, security);
+    else {
+      const issuer = 'ZEZO Forge';
+      const label = encodeURIComponent(`${issuer}:${auth.user.username}`);
+      const otpAuthUri = `otpauth://totp/${label}?secret=${result.secret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
+      json(res, 200, { secret: result.secret, otpAuthUri }, security);
+    }
+    return true;
+  }
+
+  if (req.method === 'POST' && path === '/api/auth/mfa/enable') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, ['admin', 'marketing_manager', 'hr_manager', 'order_manager'])) return true;
+    const body = await jsonBody(req);
+    const result = await enablePostgresMfa({
+      sessionHash: sessionKey(auth.sid), userId: auth.user.id, code: body.code,
+      verifyTotp: validTotp, auditId: id('evt'), at: now()
+    });
+    if (result.kind === 'unauthenticated') json(res, 401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' }, security);
+    else if (result.kind === 'already_enabled') json(res, 409, { error: 'التحقق بخطوتين مفعّل مسبقاً / Two-step verification is already enabled' }, security);
+    else if (result.kind === 'invalid_code') json(res, 400, { error: 'رمز التحقق غير صحيح؛ افحص الساعة والرمز الحالي / Invalid code; check the device clock and current code' }, security);
+    else json(res, 200, { ok: true, user: publicUser(result.user) }, security);
+    return true;
+  }
+
+  if (req.method === 'POST' && path === '/api/auth/logout') {
+    const sid = cookieValue(req, 'zezo_session');
+    if (sid) await logoutPostgresSession({ sessionHash: sessionKey(sid), auditId: id('evt'), at: now() });
+    json(res, 200, { ok: true }, { ...security, 'Set-Cookie': cookie('zezo_session', '', 0, req) });
     return true;
   }
 
