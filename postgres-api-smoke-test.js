@@ -231,17 +231,82 @@ try {
   results.push('public Owner setup remains closed before and after bootstrap');
 
   const customerPassword = `Customer!${testSuffix}Longer`;
-  const customerRegistration = await request('POST', '/api/client/register', {
-    body: { name: 'Synthetic Test Customer', email: customerEmail, password: customerPassword, confirmPassword: customerPassword, student: false, role: 'admin' }
-  });
+  const referralUserId = `usr_ref_${testSuffix}`;
+  const referralLinkId = `rfl_ref_${testSuffix}`;
+  const referralCode = `ZPG${testSuffix.toUpperCase()}`;
+  const referralEmail = `pg_referrer_${testSuffix}@example.test`;
+  const referralUser = { id: referralUserId, name: 'Synthetic Marketer', username: `pg_referrer_${testSuffix}`, email: referralEmail, role: 'marketer', active: true, referralCode, currentReferralCode: referralCode, currentReferralLinkId: referralLinkId, createdAt: new Date().toISOString() };
+  await client.query(`
+    INSERT INTO user_accounts (id, email, username, role, active, "fullName", "passwordHash", data, "createdAt", "updatedAt")
+    VALUES ($1, $2, $3, 'marketer', TRUE, $4, NULL, $5::jsonb, NOW(), NOW())
+  `, [referralUserId, referralEmail, referralUser.username, referralUser.name, JSON.stringify(referralUser)]);
+  await client.query(`
+    INSERT INTO referral_links (id, "userId", code, month, active, data, "createdAt")
+    VALUES ($1, $2, $3, '2026-11', TRUE, $4::jsonb, NOW())
+  `, [referralLinkId, referralUserId, referralCode, JSON.stringify({ id: referralLinkId, userId: referralUserId, code: referralCode, month: '2026-11', kind: 'monthly' })]);
+  syntheticIds.push(referralUserId);
+
+  const customerRegistrationBody = { name: 'Synthetic Test Customer', email: customerEmail, password: customerPassword, confirmPassword: customerPassword, student: false, role: 'admin' };
+  const registrationLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await registrationLockHolder.connect();
+  let customerRegistration;
+  let registrationPromise;
+  let registrationTimedOut = false;
+  let registrationTimeoutHandle;
+  try {
+    await registrationLockHolder.query('BEGIN');
+    await registrationLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+    registrationPromise = request('POST', '/api/client/register', { body: customerRegistrationBody, cookie: `zezo_ref=${referralCode}` });
+    customerRegistration = await Promise.race([
+      registrationPromise,
+      new Promise((_, reject) => {
+        registrationTimeoutHandle = setTimeout(() => reject(new Error('Customer registration waited on the legacy global advisory lock.')), 5000);
+        registrationTimeoutHandle.unref?.();
+      })
+    ]).catch(error => { registrationTimedOut = true; throw error; });
+  } finally {
+    clearTimeout(registrationTimeoutHandle);
+    await registrationLockHolder.query('ROLLBACK').catch(() => {});
+    await registrationLockHolder.end();
+  }
+  if (registrationTimedOut) {
+    customerRegistration = await registrationPromise;
+    if (customerRegistration.data.user?.id) syntheticIds.push(customerRegistration.data.user.id);
+    throw new Error('Customer registration waited on the legacy global advisory lock.');
+  }
   assert(customerRegistration.status === 201, `Synthetic customer registration failed with ${customerRegistration.status}.`);
   assert(customerRegistration.data.user?.role === 'client', 'Client registration request could not escalate its role to Owner.');
   const customerId = customerRegistration.data.user.id;
   syntheticIds.push(customerId);
+  const customerReferral = await client.query(`SELECT data ->> 'referralUserId' AS referrer_id, data ->> 'referralCode' AS referral_code FROM user_accounts WHERE id = $1`, [customerId]);
+  assert(customerReferral.rows[0]?.referrer_id === referralUserId && customerReferral.rows[0]?.referral_code === referralCode,
+    'Customer registration did not preserve the marketing referral attribution.');
+  const duplicateCustomerRegistration = await request('POST', '/api/client/register', { body: customerRegistrationBody, cookie: `zezo_ref=${referralCode}` });
+  assert(duplicateCustomerRegistration.status === 409, 'Customer registration allowed a duplicate email.');
+  const persistedRegistration = await client.query(`
+    SELECT
+      (SELECT count(*)::int FROM user_accounts WHERE email = $1) AS account_count,
+      (SELECT count(*)::int FROM outbox_messages WHERE recipient = $1 AND data ->> 'kind' = 'client_email_verification') AS verification_count,
+      (SELECT count(*)::int FROM audit_entries WHERE "actorId" = $2 AND action = 'client_registered') AS audit_count,
+      (SELECT count(*)::int FROM auth_sessions WHERE "userId" = $2) AS session_count
+  `, [customerEmail, customerId]);
+  const expectedVerificationCount = customerRegistration.data.verificationRequired ? 1 : 0;
+  const expectedRegistrationSessionCount = customerRegistration.data.verificationRequired ? 0 : 1;
+  assert(Number(persistedRegistration.rows[0].account_count) === 1 && Number(persistedRegistration.rows[0].verification_count) === expectedVerificationCount &&
+    Number(persistedRegistration.rows[0].audit_count) === 1 && Number(persistedRegistration.rows[0].session_count) === expectedRegistrationSessionCount,
+    'Customer account, expected verification message, audit, or session was not saved exactly once.');
   let customerCookie = cookieFrom(customerRegistration);
+  if (customerRegistration.data.verificationRequired) {
+    const verificationMessage = await client.query("SELECT data ->> 'text' AS text FROM outbox_messages WHERE recipient = $1 AND data ->> 'kind' = 'client_email_verification' LIMIT 1", [customerEmail]);
+    const verificationTokenMatch = /verifyEmail=([^\s]+)/.exec(verificationMessage.rows[0]?.text || '');
+    assert(verificationTokenMatch, 'New customer verification message did not contain a verification link.');
+    const verified = await request('POST', '/api/auth/verify-email', { body: { token: decodeURIComponent(verificationTokenMatch[1]) } });
+    assert(verified.status === 200, `Customer verification did not finish (${verified.status}).`);
+    customerCookie = cookieFrom(verified);
+  }
   const customerDashboard = await request('GET', '/api/dashboard', { cookie: customerCookie });
   assert(customerDashboard.status === 200 && customerDashboard.data.user?.role === 'client', 'Customer session did not persist between requests.');
-  results.push('customer registration ignores requested Owner role and session persists');
+  results.push('customer registration bypasses legacy global lock, preserves referral, prevents duplicates, and atomically saves account/audit/session/verification state');
 
   await request('POST', '/api/auth/logout', { cookie: customerCookie });
   customerCookie = '';

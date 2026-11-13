@@ -17,6 +17,7 @@ import { acceptPostgresQuote, createPostgresQuote } from './src/server/postgres-
 import { claimNextOutboxMessage, completeOutboxMessage } from './src/server/outbox-repository.js';
 import { createPostgresWithdrawalRequest } from './src/server/postgres-withdrawal-repository.js';
 import { createPostgresEmployeeInvitation } from './src/server/postgres-invitation-repository.js';
+import { createPostgresClientRegistration } from './src/server/postgres-client-registration-repository.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const STAGING_MODE = process.env.ZEZO_STAGING === 'true';
@@ -922,6 +923,75 @@ function directCrmAggregate(records, events, { from = '', to = '', service = '' 
 async function handlePostgresCoreRead(req, res, path) {
   if (!stagingAuthorized(req)) return false;
   const security = responseSecurityHeaders();
+  if (req.method === 'POST' && path === '/api/client/register') {
+    const body = await jsonBody(req);
+    const ip = req.socket?.remoteAddress || 'unknown';
+    if (!await consumeRateLimitBucket('client-registration', ip, 8, 60 * 60_000)) {
+      json(res, 429, { error: 'محاولات تسجيل كثيرة. حاول لاحقاً / Too many registration attempts. Try again later.' }, security);
+      return true;
+    }
+    const name = clean(body.name, 100);
+    const email = normalizeEmail(body.email);
+    const password = String(body.password || '');
+    if (name.length < 2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !validPassword(password) || String(body.confirmPassword || '') !== password) {
+      json(res, 400, { error: 'أكمل الاسم والبريد، وتأكد من تطابق كلمتي المرور (12 خانة على الأقل) / Enter your name and email, and make sure both passwords match (12+ characters).' }, security);
+      return true;
+    }
+
+    const createdAt = now();
+    const deliveryReady = emailReady();
+    const verificationToken = deliveryReady ? token(32) : '';
+    const verificationRequired = Boolean(verificationToken);
+    const credential = passwordRecord(password);
+    const referralVisitorId = clean(body.referralVisitorId, 80);
+    const referralVisitorHash = /^[\-_a-zA-Z0-9]{12,80}$/.test(referralVisitorId) ? hash(referralVisitorId) : '';
+    const referralCode = clean(cookieValue(req, 'zezo_ref') || body.referralCode, 40);
+    const isStudent = body.student === 'true' || body.student === true;
+    const user = {
+      id: id('usr'), name, username: email, email, phone: '', instagram: '', socialLinks: '', telegramUsername: '',
+      role: 'client', active: !verificationRequired, student: isStudent,
+      university: isStudent ? clean(body.university, 120) : '',
+      emailVerified: false, createdAt, ...credential
+    };
+    if (verificationRequired) {
+      user.emailVerificationHash = hash(verificationToken);
+      user.emailVerificationExpires = Date.now() + 24 * 60 * 60_000;
+    }
+    const verifyUrl = verificationRequired ? `${siteBase(req)}/?verifyEmail=${encodeURIComponent(verificationToken)}` : '';
+    const dedupeKey = `client-verification:${user.id}`;
+    const mailId = `mail_${hash(dedupeKey).slice(0, 32)}`;
+    const outboxMessage = verificationRequired ? {
+      id: mailId,
+      recipient: email,
+      data: {
+        id: mailId, to: email, recipientType: 'direct', kind: 'client_email_verification', dedupeKey,
+        subject: 'تأكيد بريد حساب ZEZO',
+        text: `مرحباً ${name}،\n\nأكد بريدك لتفعيل حسابك في ZEZO خلال 24 ساعة:\n${verifyUrl}\n\nإذا لم تنشئ هذا الحساب، تجاهل الرسالة.`,
+        state: 'pending', attempts: 0, lastError: '', createdAt, updatedAt: createdAt
+      }
+    } : null;
+    const sessionId = verificationRequired ? '' : token();
+    const result = await createPostgresClientRegistration({
+      user, referralVisitorHash, referralCode, auditId: id('evt'), at: createdAt,
+      verificationRequired,
+      sessionHash: sessionId ? sessionKey(sessionId) : '',
+      sessionExpiresAt: sessionId ? new Date(Date.now() + SESSION_TTL) : null,
+      outboxMessage
+    });
+    if (result.kind === 'duplicate') {
+      json(res, 409, { error: 'يوجد حساب بهذا البريد. سجّل الدخول بدلاً من إنشاء حساب جديد / An account already exists for this email. Please sign in.' }, security);
+      return true;
+    }
+    if (verificationRequired) {
+      json(res, 201, { verificationRequired: true, emailQueued: true }, security);
+      return true;
+    }
+    json(res, 201, { user: publicUser(result.user), verificationRequired: false, emailConfigured: false }, {
+      ...security, 'Set-Cookie': cookie('zezo_session', sessionId, SESSION_TTL / 1000, req)
+    });
+    return true;
+  }
+
   if (req.method === 'POST' && path === '/api/admin/invite') {
     const auth = await directPostgresSessionUser(req);
     if (!directRequireAuth(req, res, auth?.user, ['admin', 'hr_manager'])) return true;

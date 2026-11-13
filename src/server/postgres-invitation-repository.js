@@ -28,6 +28,8 @@ export async function createPostgresEmployeeInvitation({
     const authorizationError = authorize(inviter);
     if (authorizationError) return { kind: 'forbidden', ...authorizationError };
 
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`zezo-account-email:${user.email.toLowerCase()}`]);
+
     const duplicate = await client.query(
       'SELECT 1 FROM user_accounts WHERE username = $1 OR LOWER(email) = LOWER($2) LIMIT 1',
       [user.username, user.email]
