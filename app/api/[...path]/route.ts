@@ -151,7 +151,12 @@ async function dispatch(request: NextRequest) {
     );
   }
 
-  await initLocalRuntime();
+  // The application handler already owns PostgreSQL loading and transactions for
+  // serverless requests. Running init() first adds a second whole-store read/write
+  // transaction to every cold function instance, and can serialize unrelated API
+  // requests behind the compatibility-store lock. Keep the legacy bootstrap for
+  // the local JSON runtime only; hosted data migrations are run explicitly.
+  if (!hostedServerless()) await initLocalRuntime();
 
   const legacyRequest = (request.body
     ? Readable.fromWeb(request.body as unknown as import('node:stream/web').ReadableStream)
