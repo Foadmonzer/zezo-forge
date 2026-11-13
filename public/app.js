@@ -878,7 +878,32 @@ document.addEventListener('submit',async event=>{
     finally{button.disabled=false}
     return;
   }
-  if(event.target.matches('#inviteForm')){event.preventDefault();const form=event.target;try{const data=await postJson('/api/admin/invite',Object.fromEntries(new FormData(form)));await refreshDashboard(state.dashboardTab);const result=$('#inviteResult');if(data.approvalRequired){result.textContent=tx('تم تجهيز الدعوة. ستظهر للمالك للموافقة، وبعدها يصدر رابط التفعيل.','Invitation prepared. It is pending owner approval; an activation link is issued after approval.')}else if(data.activationToken){const link=`${location.origin}/activate?token=${encodeURIComponent(data.activationToken)}`,deliveryNote=data.emailQueued?tx('أُرسلت الدعوة إلى البريد. رابط التفعيل صالح 24 ساعة ويمكن نسخه:','Invitation email queued. The activation link is valid for 24 hours; copy it if needed:'):tx('البريد غير مفعّل. انسخ رابط التفعيل وأرسله للموظف خلال 24 ساعة:','Email is not configured. Copy and share this activation link within 24 hours:');result.innerHTML=deliveryNote+`<br><a href="${esc(link)}" target="_blank" rel="noopener">${esc(link)}</a> <button class="small-button" type="button" data-copy-invite="${esc(link)}">${tx('نسخ الرابط','Copy link')}</button>`}form.reset()}catch(e){const result=$('#inviteResult');if(result)result.textContent=e.message}return}
+  if(event.target.matches('#inviteForm')){
+    event.preventDefault();
+    const form=event.target,submit=form.querySelector('button[type="submit"]');
+    if(submit?.disabled)return;
+    if(submit)submit.disabled=true;
+    try{
+      const data=await postJson('/api/admin/invite',Object.fromEntries(new FormData(form)));
+      let successMessage='';
+      if(data.approvalRequired)successMessage=tx('تم تجهيز الدعوة. ستظهر للمالك للموافقة، وبعدها يصدر رابط التفعيل.','Invitation prepared. It is pending owner approval; an activation link is issued after approval.');
+      else if(data.activationToken){
+        const link=`${location.origin}/activate?token=${encodeURIComponent(data.activationToken)}`;
+        const deliveryNote=data.emailQueued?tx('أُضيفت الدعوة إلى الإرسال. رابط التفعيل صالح 24 ساعة ويمكن نسخه:','Invitation email queued. The activation link is valid for 24 hours; copy it if needed.'):tx('البريد غير مفعّل. انسخ رابط التفعيل وأرسله للموظف خلال 24 ساعة:','Email is not configured. Copy and share this activation link within 24 hours:');
+        successMessage=deliveryNote+`<br><a href="${esc(link)}" target="_blank" rel="noopener">${esc(link)}</a> <button class="small-button" type="button" data-copy-invite="${esc(link)}">${tx('نسخ الرابط','Copy link')}</button>`;
+      }
+      form.reset();
+      const result=$('#inviteResult');
+      if(result){
+        result.innerHTML=successMessage;
+        if(data.activationToken)result.insertAdjacentText('beforeend',` ${tx('انسخ رابط التفعيل أولاً؛ القائمة ستظهر الدعوة بعد تحديث الصفحة.','Copy the activation link first; the invitation list will update after you refresh the page.')}`);
+      }
+    }catch(e){
+      const result=$('#inviteResult');
+      if(result)result.textContent=`${e.message||tx('تعذر إنشاء الدعوة.','Could not create the invitation.')} ${tx('لا تعاود الإرسال الآن؛ تحقّق من قائمة الدعوات أولاً لتجنب إنشاء دعوة مكررة.','Do not resubmit yet; check the invitation list first to avoid a duplicate.')}`;
+    }finally{if(submit)submit.disabled=false}
+    return;
+  }
   if(event.target.matches('#pricingForm')){event.preventDefault();const form=event.target,prices=state.dashboard.settings.prices.map(p=>({id:p.id,price:form.elements[`price_${p.id}`].value}));try{await postJson('/api/admin/pricing',{prices,commissionHoldDays:form.elements.commissionHoldDays.value});await refreshDashboard('pricing');await loadPublic();showToast(tx('تم حفظ الأسعار والمهلة.','Prices and hold period saved.'))}catch(e){showToast(e.message,true)}return}
   if(event.target.matches('#templatePricingForm')){event.preventDefault();const form=event.target,templatePrices=Object.fromEntries(templateCatalog.map(t=>[t.id,form.elements[`template_${t.id}`].value===''?null:Number(form.elements[`template_${t.id}`].value)])),templateActive=Object.fromEntries(templateCatalog.map(t=>[t.id,form.elements[`template_active_${t.id}`].checked])),templateInclusions=Object.fromEntries(templateCatalog.map(t=>[t.id,{ar:form.elements[`include_ar_${t.id}`].value,en:form.elements[`include_en_${t.id}`].value}]));try{await postJson('/api/admin/template-prices',{templatePrices,templateActive,templateInclusions});await refreshDashboard('pricing');await loadPublic();showToast(tx('تم حفظ الأسعار ونطاقات القوالب.','Template prices and included scopes saved.'))}catch(e){showToast(e.message,true)}return}
   if(event.target.matches('[data-project-stage-form]')){event.preventDefault();const form=event.target;try{await fetch(`/api/admin/projects/${encodeURIComponent(form.dataset.projectStageForm)}/stage`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(form)))}).then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.error||'Project update failed')});await refreshDashboard('requests');showToast(tx('تم تحديث مرحلة المشروع.','Project stage updated.'))}catch(e){showToast(e.message,true)}return}

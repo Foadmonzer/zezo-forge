@@ -16,6 +16,7 @@ import { changePostgresPassword, enablePostgresMfa, logoutPostgresSession, setup
 import { acceptPostgresQuote, createPostgresQuote } from './src/server/postgres-conversation-repository.js';
 import { claimNextOutboxMessage, completeOutboxMessage } from './src/server/outbox-repository.js';
 import { createPostgresWithdrawalRequest } from './src/server/postgres-withdrawal-repository.js';
+import { createPostgresEmployeeInvitation } from './src/server/postgres-invitation-repository.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const STAGING_MODE = process.env.ZEZO_STAGING === 'true';
@@ -921,6 +922,86 @@ function directCrmAggregate(records, events, { from = '', to = '', service = '' 
 async function handlePostgresCoreRead(req, res, path) {
   if (!stagingAuthorized(req)) return false;
   const security = responseSecurityHeaders();
+  if (req.method === 'POST' && path === '/api/admin/invite') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, ['admin', 'hr_manager'])) return true;
+    const body = await jsonBody(req);
+    const name = clean(body.name, 80);
+    const username = clean(body.username, 40).toLowerCase();
+    const email = normalizeEmail(body.email);
+    const role = clean(body.role, 40);
+    if (!roles.includes(role) || (role === 'admin' && auth.user.role !== 'admin') || name.length < 2 ||
+        !/^[a-z0-9._-]{3,40}$/.test(username) || !/^\S+@\S+\.\S+$/.test(email)) {
+      json(res, 400, { error: 'بيانات الموظف غير مكتملة أو الدور غير مسموح / Invalid employee details or role' }, security);
+      return true;
+    }
+
+    const createdAt = now();
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
+    const activation = token(32);
+    const user = {
+      id: id('usr'), name, username, email, phone: '', instagram: '', socialLinks: clean(body.socialLinks, 800),
+      telegramUsername: '', role, department: roleDepartment(role), permissionOverrides: {}, active: false,
+      createdAt, invitationId: '', inviteCreatedBy: auth.user.id, inviteCreatedByName: auth.user.name,
+      inviteStatus: 'pending', inviteExpiresAt: expiresAt, inviteApprovalStatus: 'approved',
+      activationHash: hash(activation), activationExpires: Date.parse(expiresAt)
+    };
+    if (referralEnabled(user)) {
+      user.referralCode = `Z${randomBytes(16).toString('hex').toUpperCase()}`;
+      user.rank = 'rookie';
+      user.activeCommissionRate = 15;
+      user.teamLeaderTermsPending = false;
+    }
+    const invitation = { id: `invitation_${user.id}`, expiresAt };
+    user.invitationId = invitation.id;
+
+    const authorize = inviter => {
+      if (role === 'admin' && (!inviter.mfaEnabledAt || !validTotp(inviter.mfaSecret, body.ownerMfaCode))) {
+        return { status: 403, error: 'إنشاء دعوة مالك يحتاج تحققاً إضافياً من تطبيق المصادقة / Creating an Owner invitation requires fresh authenticator verification' };
+      }
+      if (inviter.role === 'hr_manager' && !hasPermission(inviter, 'team.invite', { department: 'people' })) {
+        return { status: 403, error: 'لا تملك تفويض إنشاء دعوات / You are not delegated to create invitations' };
+      }
+      if (inviter.role === 'hr_manager' && !(['marketer', 'developer'].includes(role) || (role === 'order_manager' && effectivePermission(inviter, 'team.invite') === 'all'))) {
+        return { status: 403, error: 'مسؤول الموظفين لا يعيّن إلا الأدوار المفوضة له صراحة / HR cannot invite roles beyond its explicit delegation' };
+      }
+      return null;
+    };
+    const activationUrl = `${siteBase(req)}/activate?token=${encodeURIComponent(activation)}`;
+    const invitationText = `مرحباً ${name}،\n\nأنشأنا لك حساباً في مساحة فريق ZEZO بدور: ${role}.\nفعّل الحساب وأنشئ كلمة مرورك خلال 24 ساعة عبر الرابط التالي:\n${activationUrl}\n\nبعد التفعيل ادخل إلى مساحة الفريق عبر: ${siteBase(req)}/team\n\nإذا لم تكن تتوقع هذه الدعوة، تجاهل الرسالة.`;
+    const noReplyFooter = '\n\n---\nرسالة تلقائية من ZEZO Forge. يرجى عدم الرد على هذه الرسالة.\nThis is an automated message from ZEZO Forge. Please do not reply.';
+    const mailId = id('mail');
+    const outboxMessage = {
+      id: mailId, recipient: email,
+      data: {
+        id: mailId, to: email, recipientType: 'direct', kind: 'team_invitation',
+        subject: 'دعوة للانضمام إلى ZEZO', text: `${invitationText}${noReplyFooter}`.slice(0, 6000),
+        state: 'pending', attempts: 0, lastError: '', createdAt, updatedAt: createdAt
+      }
+    };
+    const result = await createPostgresEmployeeInvitation({
+      sessionHash: sessionKey(auth.sid), inviterId: auth.user.id, user, invitation,
+      auditId: id('evt'), outboxMessage,
+      authorize: inviter => {
+        const problem = authorize(inviter);
+        return problem || null;
+      }
+    });
+    if (result.kind === 'unauthenticated') {
+      json(res, 401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' }, security);
+      return true;
+    }
+    if (result.kind === 'forbidden') {
+      json(res, result.status || 403, { error: result.error || 'لا تملك الصلاحية لهذه الدعوة / Not permitted to create this invitation' }, security);
+      return true;
+    }
+    if (result.kind === 'duplicate') {
+      json(res, 409, { error: 'اسم المستخدم أو البريد مستخدم بالفعل. افحص قائمة الدعوات قبل إنشاء دعوة أخرى / Username or email is already in use. Check the invitation list before creating another.' }, security);
+      return true;
+    }
+    json(res, 201, { user: publicUser(result.user), activationToken: activation, approvalRequired: false, expiresInHours: 24, emailQueued: emailReady() }, security);
+    return true;
+  }
   if (req.method === 'POST' && path === '/api/auth/login') {
     const body = await jsonBody(req);
     const username = clean(body.username, 150).toLowerCase();

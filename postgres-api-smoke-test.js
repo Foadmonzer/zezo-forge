@@ -128,8 +128,13 @@ try {
     await dashboardLockHolder.query('BEGIN');
     await dashboardLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
     const pendingDashboard = request('GET', '/api/dashboard').then(value => ({ done: true, value }));
+    const pendingAnonymousInvite = request('POST', '/api/admin/invite', { body: {} }).then(value => ({ done: true, value }));
     anonymousDashboard = await Promise.race([
       pendingDashboard,
+      new Promise(resolve => setTimeout(() => resolve({ done: false }), 1000))
+    ]);
+    var anonymousInvite = await Promise.race([
+      pendingAnonymousInvite,
       new Promise(resolve => setTimeout(() => resolve({ done: false }), 1000))
     ]);
   } finally {
@@ -139,6 +144,9 @@ try {
   assert(anonymousDashboard?.done === true && anonymousDashboard.value.status === 401,
     'Anonymous dashboard access must be rejected before waiting on the legacy global PostgreSQL lock.');
   results.push('anonymous dashboard access is rejected before the legacy global PostgreSQL lock');
+  assert(anonymousInvite?.done === true && anonymousInvite.value.status === 401,
+    'Anonymous team invitation access must be rejected before waiting on the legacy global PostgreSQL lock.');
+  results.push('anonymous team invitation access is rejected before the legacy global PostgreSQL lock');
 
   const publicBefore = await request('GET', '/api/public');
   assert(!Object.hasOwn(publicBefore.data, 'adminSetupAvailable'), 'Public PostgreSQL configuration must never disclose Owner setup state.');
@@ -249,10 +257,42 @@ try {
   const employees = {};
   for (const role of ['order_manager', 'marketer', 'developer', 'hr_manager']) {
     const email = `pg_${role}_${testSuffix}@example.test`;
-    const invite = await request('POST', '/api/admin/invite', {
+    const inviteRequest = () => request('POST', '/api/admin/invite', {
       body: { name: `Synthetic ${role}`, username: `pg_${role}_${testSuffix}`, email, role }, cookie: ownerCookie
     });
+    let invite;
+    if (role === 'order_manager') {
+      const legacyLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+      await legacyLockHolder.connect();
+      try {
+        await legacyLockHolder.query('BEGIN');
+        await legacyLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+        invite = await Promise.race([
+          inviteRequest(),
+          new Promise(resolve => setTimeout(() => resolve(null), 1200))
+        ]);
+      } finally {
+        await legacyLockHolder.query('ROLLBACK').catch(() => {});
+        await legacyLockHolder.end();
+      }
+      assert(invite?.status === 201, 'Owner invitation must complete without waiting on the legacy global PostgreSQL lock.');
+      results.push('authorized team invitation completed while the legacy global PostgreSQL lock was held');
+    } else invite = await inviteRequest();
     assert(invite.status === 201 && invite.data.activationToken, `Owner invitation for ${role} failed with ${invite.status}.`);
+    const invitationRows = await client.query(
+      `SELECT i.status, i.email, u.active, u.data->>'activationHash' AS activation_hash,
+        o.state AS outbox_state, o.data->>'kind' AS outbox_kind
+       FROM employee_invitations i
+       JOIN user_accounts u ON u.id = i.data->>'employeeId'
+       LEFT JOIN outbox_messages o ON o.recipient = i.email AND o.data->>'kind' = 'team_invitation'
+       WHERE i.id = $1`,
+      [`invitation_${invite.data.user.id}`]
+    );
+    assert(invitationRows.rowCount === 1 && invitationRows.rows[0].status === 'pending' && invitationRows.rows[0].active === false &&
+      /^[a-f0-9]{64}$/.test(invitationRows.rows[0].activation_hash || '') && invitationRows.rows[0].outbox_state === 'pending' && invitationRows.rows[0].outbox_kind === 'team_invitation',
+      `Invitation for ${role} was not saved atomically with its hashed activation token and durable outbox message.`);
+    const duplicateInvite = await inviteRequest();
+    assert(duplicateInvite.status === 409, `Replaying the same ${role} invitation must not create a duplicate account.`);
     const activation = await request('POST', '/api/auth/activate', {
       body: { token: invite.data.activationToken, password: `Employee!${role}${testSuffix}Long` }
     });
