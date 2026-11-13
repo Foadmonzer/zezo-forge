@@ -329,7 +329,7 @@ try {
   results.push('customer logout, login, and profile recovery');
 
   const employees = {};
-  for (const role of ['order_manager', 'marketer', 'developer', 'hr_manager']) {
+  for (const role of ['order_manager', 'marketer', 'developer', 'hr_manager', 'marketing_manager']) {
     const email = `pg_${role}_${testSuffix}@example.test`;
     const inviteRequest = () => request('POST', '/api/admin/invite', {
       body: { name: `Synthetic ${role}`, username: `pg_${role}_${testSuffix}`, email, role }, cookie: ownerCookie
@@ -372,7 +372,7 @@ try {
     });
     assert(activation.status === 200 && activation.data.user?.role === role, `Employee activation for ${role} failed with ${activation.status}.`);
     const employeeCookie = cookieFrom(activation);
-    if (['order_manager', 'hr_manager'].includes(role)) {
+    if (['order_manager', 'hr_manager', 'marketing_manager'].includes(role)) {
       const mfaSetup = await request('GET', '/api/auth/mfa/setup', { cookie: employeeCookie });
       assert(mfaSetup.status === 200 && mfaSetup.data.secret, `MFA setup for ${role} failed with ${mfaSetup.status}.`);
       const mfaEnabled = await request('POST', '/api/auth/mfa/enable', {
@@ -384,7 +384,7 @@ try {
     employeeIds.push(activation.data.user.id);
     syntheticIds.push(activation.data.user.id);
   }
-  for (const role of ['order_manager', 'marketer', 'developer', 'hr_manager']) {
+  for (const role of ['order_manager', 'marketer', 'developer', 'hr_manager', 'marketing_manager']) {
     const dashboard = await request('GET', '/api/dashboard', { cookie: employees[role].cookie });
     assert(dashboard.status === 200 && dashboard.data.role === role, `${role} dashboard mismatch: HTTP ${dashboard.status}, response role ${dashboard.data.role ?? 'missing'}, error ${dashboard.data.error ?? 'none'}.`);
   }
