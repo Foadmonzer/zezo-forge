@@ -480,7 +480,7 @@ try {
   });
   assert(uploadedAttachment.status === 201, `Customer attachment upload failed with ${uploadedAttachment.status}.`);
   const attachmentRow = await client.query('SELECT id, "ownerId", "fileName", content FROM stored_attachments WHERE "fileName" = $1', ['synthetic-note.pdf']);
-  assert(attachmentRow.rowCount === 1 && attachmentRow.rows[0].ownerId === syntheticIds[1] && attachmentRow.rows[0].content.equals(attachmentBytes), 'Synthetic attachment bytes or owner were not persisted in PostgreSQL.');
+  assert(attachmentRow.rowCount === 1 && attachmentRow.rows[0].ownerId === customerId && attachmentRow.rows[0].content.equals(attachmentBytes), 'Synthetic attachment bytes or owner were not persisted in PostgreSQL.');
   const customerAttachment = await request('GET', `/api/conversations/${syntheticConversationId}/files/0`, { cookie: customerCookie });
   assert(customerAttachment.status === 200 && customerAttachment.bytes.equals(attachmentBytes), 'Customer could not download the stored conversation attachment.');
   const marketerAttachment = await request('GET', `/api/conversations/${syntheticConversationId}/files/0`, { cookie: employees.marketer.cookie });
