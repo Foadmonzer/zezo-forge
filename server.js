@@ -1000,6 +1000,21 @@ async function handlePostgresCoreRead(req, res, path) {
     return true;
   }
 
+  // The public site header polls notifications on every page load. Reject
+  // anonymous and first-login sessions here so this harmless preview request
+  // cannot enter the legacy whole-store transaction and block password setup.
+  if (req.method === 'GET' && path === '/api/notifications') {
+    const auth = await directPostgresSessionUser(req);
+    if (!auth) {
+      json(res, 401, { error: 'سجّل الدخول للمتابعة / Please sign in to continue' }, security);
+      return true;
+    }
+    if (auth.user.mustChangePassword || (sensitiveManagementRole(auth.user.role) && !auth.user.mfaEnabledAt)) {
+      directRequireAuth(req, res, auth.user, allRoles);
+      return true;
+    }
+  }
+
   const directConversationMutation = /^\/api\/conversations\/([^/]+)\/(quote|accept-quote)$/.exec(path);
   if (req.method === 'POST' && directConversationMutation) {
     const [, conversationId, action] = directConversationMutation;
