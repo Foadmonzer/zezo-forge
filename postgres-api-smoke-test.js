@@ -256,7 +256,7 @@ try {
   try {
     await registrationLockHolder.query('BEGIN');
     await registrationLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
-    registrationPromise = request('POST', '/api/client/register', { body: customerRegistrationBody, cookie: `zezo_ref=${referralCode}` });
+    registrationPromise = request('POST', '/api/client/register', { body: customerRegistrationBody });
     customerRegistration = await Promise.race([
       registrationPromise,
       new Promise((_, reject) => {
@@ -278,11 +278,20 @@ try {
   assert(customerRegistration.data.user?.role === 'client', 'Client registration request could not escalate its role to Owner.');
   const customerId = customerRegistration.data.user.id;
   syntheticIds.push(customerId);
-  const customerReferral = await client.query(`SELECT data ->> 'referralUserId' AS referrer_id, data ->> 'referralCode' AS referral_code FROM user_accounts WHERE id = $1`, [customerId]);
+  const duplicateCustomerRegistration = await request('POST', '/api/client/register', { body: customerRegistrationBody });
+  assert(duplicateCustomerRegistration.status === 409, 'Customer registration allowed a duplicate email.');
+  const referralCustomerEmail = `pg_referral_customer_${testSuffix}@example.test`;
+  const referralCustomerRegistration = await request('POST', '/api/client/register', {
+    body: { ...customerRegistrationBody, name: 'Synthetic Referral Customer', email: referralCustomerEmail },
+    cookie: `zezo_ref=${referralCode}`
+  });
+  assert(referralCustomerRegistration.status === 201 && referralCustomerRegistration.data.user?.role === 'client',
+    `Synthetic referral customer registration failed with ${referralCustomerRegistration.status}.`);
+  const referralCustomerId = referralCustomerRegistration.data.user.id;
+  syntheticIds.push(referralCustomerId);
+  const customerReferral = await client.query(`SELECT data ->> 'referralUserId' AS referrer_id, data ->> 'referralCode' AS referral_code FROM user_accounts WHERE id = $1`, [referralCustomerId]);
   assert(customerReferral.rows[0]?.referrer_id === referralUserId && customerReferral.rows[0]?.referral_code === referralCode,
     'Customer registration did not preserve the marketing referral attribution.');
-  const duplicateCustomerRegistration = await request('POST', '/api/client/register', { body: customerRegistrationBody, cookie: `zezo_ref=${referralCode}` });
-  assert(duplicateCustomerRegistration.status === 409, 'Customer registration allowed a duplicate email.');
   const persistedRegistration = await client.query(`
     SELECT
       (SELECT count(*)::int FROM user_accounts WHERE email = $1) AS account_count,
@@ -707,7 +716,7 @@ try {
     'SELECT id, role FROM user_accounts WHERE id = ANY($1::text[]) ORDER BY role',
     [syntheticIds]
   );
-  assert(storedUsers.rowCount === 2 + employeeIds.length, 'Expected synthetic Owner, customer, and employees in PostgreSQL user_accounts.');
+  assert(storedUsers.rowCount === 3 + employeeIds.length, 'Expected synthetic Owner, customers, and employees in PostgreSQL user_accounts.');
   const storedSessions = await client.query(
     'SELECT id FROM auth_sessions WHERE "userId" = ANY($1::text[])',
     [syntheticIds]
