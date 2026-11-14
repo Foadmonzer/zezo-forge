@@ -2228,6 +2228,8 @@ async function handlePostgresCoreWrite(req, res, path) {
 async function handle(req, res) {
   if (!postgresConfigured()) return handleRequest(req, res);
   const path = new URL(req.url, `http://localhost:${PORT}`).pathname;
+  const permissionRouteTrace = process.env.ZEZO_PERMISSION_ROUTE_TRACE === 'true' && path.startsWith('/api/admin/permissions/');
+  if (permissionRouteTrace) console.log(`[PERMISSION_ROUTE_TRACE] request method=${req.method} staging=${STAGING_MODE} authorized=${stagingAuthorized(req)}`);
   // Public Owner setup is permanently closed. The first Owner is provisioned
   // only by scripts/provision-owner.mjs with direct administrative DB access.
   if (req.method === 'POST' && path === '/api/setup') return handleRequest(req, res);
@@ -2266,8 +2268,10 @@ async function handle(req, res) {
   const normalizedReadHandled = process.env.ZEZO_BENCH_LEGACY_CORE_READS === 'true'
     ? false
     : await handlePostgresCoreRead(req, res, path);
+  if (permissionRouteTrace) console.log(`[PERMISSION_ROUTE_TRACE] readHandled=${normalizedReadHandled}`);
   if (normalizedReadHandled) return;
   const normalizedWriteHandled = await handlePostgresCoreWrite(req, res, path);
+  if (permissionRouteTrace) console.log(`[PERMISSION_ROUTE_TRACE] writeHandled=${normalizedWriteHandled}`);
   if (normalizedWriteHandled) return;
   if (!path.startsWith('/api/')) {
     return withPostgresTransaction(async client => {

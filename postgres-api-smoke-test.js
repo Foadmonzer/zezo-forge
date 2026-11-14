@@ -416,6 +416,7 @@ try {
   await permissionsLockHolder.connect();
   let permissionChange;
   const permissionStartedAt = Date.now();
+  process.env.ZEZO_PERMISSION_ROUTE_TRACE = 'true';
   try {
     await permissionsLockHolder.query('BEGIN');
     await permissionsLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
@@ -435,6 +436,7 @@ try {
       }, 1200))
     ]);
   } finally {
+    delete process.env.ZEZO_PERMISSION_ROUTE_TRACE;
     await permissionsLockHolder.query('ROLLBACK').catch(() => {});
     await permissionsLockHolder.end();
   }
