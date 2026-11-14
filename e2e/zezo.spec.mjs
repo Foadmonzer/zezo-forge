@@ -50,6 +50,51 @@ async function loginThroughUI(page, { username, password, accountType = 'employe
   await expect(page.locator('#dashboardBackdrop.open')).toBeVisible();
 }
 
+async function measureDashboardAction(page, path, method, action, verifyUi, { waitDashboard = false, controlledNetworkDelayMs = 0 } = {}) {
+  const clickAt = Date.now();
+  let requestAt = 0;
+  const onRequest = request => {
+    if (new URL(request.url()).pathname === path && request.method() === method) requestAt = Date.now();
+  };
+  page.on('request', onRequest);
+  if (waitDashboard) await page.evaluate(() => {
+    window.__zezoDashboardMutationCount = 0;
+    window.__zezoDashboardMutationObserver?.disconnect();
+    window.__zezoDashboardMutationObserver = new MutationObserver(() => window.__zezoDashboardMutationCount++);
+    window.__zezoDashboardMutationObserver.observe(document.querySelector('#dashboardContent'), { childList: true, subtree: true, characterData: true });
+  });
+  const responsePromise = page.waitForResponse(response =>
+    new URL(response.url()).pathname === path && response.request().method() === method
+  );
+  const dashboardPromise = waitDashboard ? page.waitForResponse(response =>
+    new URL(response.url()).pathname === '/api/dashboard' && response.request().method() === 'GET' && response.ok()
+  ) : null;
+  try {
+    await action();
+    const response = await responsePromise;
+    const responseAt = Date.now();
+    if (!response.ok()) throw new Error(`Dashboard action failed: ${response.status()} ${method} ${path}`);
+    if (dashboardPromise) {
+      await dashboardPromise;
+      await page.waitForFunction(() => window.__zezoDashboardMutationCount > 0);
+    }
+    await verifyUi();
+    const uiAt = Date.now();
+    const timing = {
+      path, method,
+      clickToApiMs: requestAt ? Number((requestAt - clickAt).toFixed(1)) : null,
+      apiMs: requestAt ? Number((responseAt - requestAt).toFixed(1)) : null,
+      responseToUiMs: Number((uiAt - responseAt).toFixed(1)),
+      clickToUiMs: Number((uiAt - clickAt).toFixed(1)),
+      controlledNetworkDelayMs
+    };
+    console.log(`[DASHBOARD_ACTION_TIMING] ${JSON.stringify(timing)}`);
+    return timing;
+  } finally {
+    page.off('request', onRequest);
+  }
+}
+
 async function workspaceViewportMatrix(page, tab, name, testInfo) {
   for (const width of widths) {
     await page.setViewportSize({ width, height: 900 });
@@ -272,8 +317,9 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await expect(staffConversation).toBeVisible();
   await staffConversation.locator(':scope > summary').click();
   await staffConversation.locator(`[data-conversation-reply="${conversationId}"] textarea[name="message"]`).fill('Synthetic Order Manager response.');
-  await staffConversation.locator(`[data-conversation-reply="${conversationId}"] button[type="submit"]`).click();
-  await expect(staffConversation).toContainText('Synthetic Order Manager response.', { timeout: 30_000 });
+  await measureDashboardAction(orderPage, `/api/conversations/${encodeURIComponent(conversationId)}/messages`, 'POST', () =>
+    staffConversation.locator(`[data-conversation-reply="${conversationId}"] button[type="submit"]`).click(),
+  async () => expect(staffConversation).toContainText('Synthetic Order Manager response.', { timeout: 30_000 }), { waitDashboard: true });
   const quoteEditor = staffConversation.locator('details.conversation-quote-editor');
   // The saved reply refreshes the dashboard markup; explicitly expand both native details panes afterward.
   await staffConversation.evaluate(element => { element.open = true; });
@@ -282,8 +328,9 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await quoteEditor.locator('[name="amount"]').fill('200');
   await quoteEditor.locator('[name="scope"]').fill('Single responsive ZEZO restaurant website scope for browser acceptance tests.');
   await quoteEditor.locator('[name="included"]').fill('One responsive landing page and contact details.');
-  await quoteEditor.locator('button[type="submit"]').click();
-  await expect(staffConversation).toContainText('200');
+  await measureDashboardAction(orderPage, `/api/conversations/${encodeURIComponent(conversationId)}/quote`, 'POST', () =>
+    quoteEditor.locator('button[type="submit"]').click(),
+  async () => expect(staffConversation).toContainText('200'), { waitDashboard: true });
   await workspaceViewportMatrix(orderPage, 'conversations', 'order-manager', testInfo);
   await orderPage.close();
 
@@ -314,23 +361,50 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   // Owner: assign developer and record a synthetic, verified manual payment in the UI.
   const ownerPage = await browser.newPage({ viewport: { width: 1366, height: 900 } });
   await loginThroughUI(ownerPage, { username: ownerUsername, password: ownerPassword, accountType: 'management', mfaCode: totp(ownerMfa.secret) });
+  await ownerPage.locator('[data-dash-tab="team"]').click();
+  const inviteForm = ownerPage.locator('#inviteForm');
+  const inviteName = `Synthetic UI Invite ${suffix}`;
+  const inviteUsername = `e2e_ui_invite_${suffix}`;
+  await inviteForm.locator('[name="name"]').fill(inviteName);
+  await inviteForm.locator('[name="username"]').fill(inviteUsername);
+  await inviteForm.locator('[name="email"]').fill(`${inviteUsername}@example.test`);
+  await inviteForm.locator('[name="role"]').selectOption('marketer');
+  let uiInviteRequests = 0;
+  ownerPage.on('request', request => { if (new URL(request.url()).pathname === '/api/admin/invite' && request.method() === 'POST') uiInviteRequests++; });
+  await ownerPage.route('**/api/admin/invite', async route => {
+    await new Promise(resolve => setTimeout(resolve, 350));
+    await route.continue();
+  });
+  await measureDashboardAction(ownerPage, '/api/admin/invite', 'POST', async () => {
+    await inviteForm.locator('button[type="submit"]').click();
+    await expect(inviteForm.locator('button[type="submit"]')).toBeDisabled();
+    await expect(inviteForm.locator('button[type="submit"]')).toHaveAttribute('aria-busy', 'true');
+    await expect(ownerPage.locator('.zezo-submit-status')).toContainText('جارٍ تنفيذ العملية');
+    await ownerPage.evaluate(() => document.querySelector('#inviteForm').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
+  }, async () => {
+    await expect(ownerPage.locator('#inviteResult a[href*="/activate?token="]')).toBeVisible();
+  }, { controlledNetworkDelayMs: 350 });
+  expect(uiInviteRequests).toBe(1);
+  await ownerPage.unroute('**/api/admin/invite');
+
+  await ownerPage.locator('[data-dash-tab="permissions"]').click();
+  const permissionForm = ownerPage.locator(`[data-permission-form="${marketer.id}"]`);
+  await expect(permissionForm).toBeVisible();
+  await permissionForm.locator('[name="perm_conversations.read"]').selectOption('all');
+  await measureDashboardAction(ownerPage, `/api/admin/permissions/${encodeURIComponent(marketer.id)}`, 'PATCH', async () => {
+    await permissionForm.locator('button[type="submit"]').click();
+    await expect(permissionForm.locator('button[type="submit"]')).toBeDisabled();
+    await expect(ownerPage.locator('.zezo-submit-status')).toContainText('جارٍ تنفيذ العملية');
+  }, async () => {
+    await expect(ownerPage.locator(`[data-permission-form="${marketer.id}"] [name="perm_conversations.read"]`)).toHaveValue('all');
+  }, { waitDashboard: true });
+
   await ownerPage.locator('[data-dash-tab="requests"]').click();
   const leadCard = ownerPage.locator(`[data-lead-card="${leadId}"]`);
   await expect(leadCard).toBeVisible();
   if (!(await leadCard.evaluate(element => element.open))) await leadCard.locator(':scope > summary').click();
   const waitForOwnerDashboardWrite = async (path, action, method = 'PATCH') => {
-    const mutation = ownerPage.waitForResponse(response =>
-      new URL(response.url()).pathname === path && response.request().method() === method
-    );
-    const refresh = ownerPage.waitForResponse(response =>
-      new URL(response.url()).pathname === '/api/dashboard' &&
-      response.request().method() === 'GET' &&
-      response.ok()
-    );
-    await action();
-    const response = await mutation;
-    if (!response.ok()) throw new Error(`Owner update failed: ${response.status()} ${method} ${path}`);
-    await refresh;
+    return measureDashboardAction(ownerPage, path, method, action, async () => {}, { waitDashboard: true });
   };
   await leadCard.locator('[data-lead-edit] [name="contractAmount"]').first().fill('200');
   await waitForOwnerDashboardWrite(`/api/admin/leads/${encodeURIComponent(leadId)}`, () =>
@@ -352,7 +426,14 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await payment.locator('[name="amount"]').fill('200');
   await payment.locator('[name="note"]').fill('Synthetic manual payment; no funds moved.');
   await payment.locator('[name="verified"]').check();
-  await waitForOwnerDashboardWrite('/api/admin/payment', () => payment.locator('button[type="submit"]').click(), 'POST');
+  let paymentRequests = 0;
+  ownerPage.on('request', request => { if (new URL(request.url()).pathname === '/api/admin/payment' && request.method() === 'POST') paymentRequests++; });
+  await waitForOwnerDashboardWrite('/api/admin/payment', async () => {
+    await payment.locator('button[type="submit"]').click();
+    await expect(payment.locator('button[type="submit"]')).toBeDisabled();
+    await ownerPage.evaluate(formId => document.querySelector(formId).dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })), `[data-payment-form="${leadId}"]`);
+  }, 'POST');
+  expect(paymentRequests, 'A fast repeated payment submit must not create a second API request.').toBe(1);
   await expect(leadCard).toContainText('200');
 
   // Developer accepts, submits synthetic delivery; Owner reviews and completes it.
@@ -362,18 +443,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   const project = devPage.locator(`[data-project-card="${leadId}"]`);
   await expect(project).toBeVisible();
   const waitForDeveloperDashboardWrite = async (path, action, method) => {
-    const mutation = devPage.waitForResponse(response =>
-      new URL(response.url()).pathname === path && response.request().method() === method
-    );
-    const refresh = devPage.waitForResponse(response =>
-      new URL(response.url()).pathname === '/api/dashboard' &&
-      response.request().method() === 'GET' &&
-      response.ok()
-    );
-    await action();
-    const response = await mutation;
-    if (!response.ok()) throw new Error(`Developer update failed: ${response.status()} ${method} ${path}`);
-    await refresh;
+    return measureDashboardAction(devPage, path, method, action, async () => {}, { waitDashboard: true });
   };
   await waitForDeveloperDashboardWrite(`/api/developer/projects/${encodeURIComponent(leadId)}/decision`, () =>
     project.locator('[data-task-decision="accept"]').click(), 'POST'

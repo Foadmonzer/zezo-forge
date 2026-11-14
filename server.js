@@ -18,6 +18,7 @@ import { claimNextOutboxMessage, completeOutboxMessage } from './src/server/outb
 import { createPostgresWithdrawalRequest } from './src/server/postgres-withdrawal-repository.js';
 import { createPostgresEmployeeInvitation } from './src/server/postgres-invitation-repository.js';
 import { createPostgresClientRegistration } from './src/server/postgres-client-registration-repository.js';
+import { updatePostgresEmployeePermissions } from './src/server/postgres-permission-repository.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const STAGING_MODE = process.env.ZEZO_STAGING === 'true';
@@ -2164,6 +2165,66 @@ function cancelWithdrawalForLead(lead, actor = null) {
   }
 }
 
+async function handlePostgresCoreWrite(req, res, path) {
+  const match = req.method === 'PATCH' && /^\/api\/admin\/permissions\/[^/]+$/.test(path)
+    ? path.split('/').at(-1)
+    : '';
+  if (!match) return false;
+  if (!stagingAuthorized(req)) return false;
+
+  const security = responseSecurityHeaders();
+  const auth = await directPostgresSessionUser(req);
+  if (!directRequireAuth(req, res, auth?.user, ['admin'])) return true;
+  const targetId = decodeURIComponent(match);
+  const body = await jsonBody(req);
+  const updatedAt = now();
+  const changes = body.permissions;
+  const result = await updatePostgresEmployeePermissions({
+    sessionHash: sessionKey(auth.sid), actorId: auth.user.id, targetId,
+    updatedAt, auditId: id('evt'),
+    applyChanges: ({ actor, target }) => {
+      const nextRole = body.role === undefined ? target.role : clean(body.role, 40);
+      if (!roles.includes(nextRole) || nextRole === 'admin') return { kind: 'invalid_role' };
+      if (changes !== undefined && (!changes || typeof changes !== 'object' || Array.isArray(changes))) return { kind: 'invalid_permissions' };
+      const overrides = { ...(target.permissionOverrides || {}) };
+      for (const [key, value] of Object.entries(changes || {})) {
+        if (!Object.hasOwn(permissionDefinitions, key)) return { kind: 'unknown_permission', key };
+        if (value === null || value === 'default') { delete overrides[key]; continue; }
+        if (value !== 'none' && !permissionDefinitions[key].includes(value)) return { kind: 'invalid_scope', key };
+        overrides[key] = value;
+      }
+      const before = { role: target.role, active: target.active, permissionOverrides: target.permissionOverrides || {} };
+      target.role = nextRole;
+      target.department = body.department === 'people' && nextRole === 'hr_manager' ? 'people' : roleDepartment(nextRole);
+      target.permissionOverrides = overrides;
+      if (typeof body.active === 'boolean') {
+        target.active = body.active;
+        if (body.active) delete target.accountDisabledAt;
+        else target.accountDisabledAt = updatedAt;
+      }
+      if (target.inviteCreatedBy === actor.id && body.active === false) target.inviteStatus = 'revoked';
+      return { auditDetail: { beforeRole: before.role, role: target.role, active: target.active, permissions: Object.keys(changes || {}) } };
+    }
+  });
+
+  if (result.kind === 'unauthenticated') return json(res, 401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' }, security);
+  if (result.kind === 'forbidden') return json(res, 403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }, security);
+  if (result.kind === 'missing') return json(res, 404, { error: 'الحساب غير موجود / Account not found' }, security);
+  if (result.kind === 'owner_protected') return json(res, 409, { error: 'حساب المالك محمي من تغيير الدور أو الصلاحيات من لوحة التفويض / Owner account is protected from permission changes here' }, security);
+  if (result.kind === 'invalid_role') return json(res, 400, { error: 'اختر دور موظف صالحاً؛ تعيين Owner يحتاج دعوة مالك منفصلة / Choose a valid employee role; Owner accounts require a separate owner invitation' }, security);
+  if (result.kind === 'invalid_permissions') return json(res, 400, { error: 'صيغة الصلاحيات غير صالحة / Invalid permission settings' }, security);
+  if (result.kind === 'unknown_permission') return json(res, 400, { error: `صلاحية غير معروفة / Unknown permission: ${result.key}` }, security);
+  if (result.kind === 'invalid_scope') return json(res, 400, { error: `نطاق غير مسموح / Unsupported scope for ${result.key}` }, security);
+  const target = result.target;
+  return json(res, 200, {
+    ok: true,
+    user: {
+      ...publicUser(target), department: target.department, permissionOverrides: target.permissionOverrides,
+      effectivePermissions: Object.fromEntries(Object.keys(permissionDefinitions).map(key => [key, effectivePermission(target, key)]))
+    }
+  }, security);
+}
+
 async function handle(req, res) {
   if (!postgresConfigured()) return handleRequest(req, res);
   const path = new URL(req.url, `http://localhost:${PORT}`).pathname;
@@ -2206,6 +2267,8 @@ async function handle(req, res) {
     ? false
     : await handlePostgresCoreRead(req, res, path);
   if (normalizedReadHandled) return;
+  const normalizedWriteHandled = await handlePostgresCoreWrite(req, res, path);
+  if (normalizedWriteHandled) return;
   if (!path.startsWith('/api/')) {
     return withPostgresTransaction(async client => {
       await loadPostgresStore(client);

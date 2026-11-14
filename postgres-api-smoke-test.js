@@ -341,16 +341,27 @@ try {
       try {
         await legacyLockHolder.query('BEGIN');
         await legacyLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
-        invite = await Promise.race([
-          inviteRequest(),
+        const invitationStartedAt = Date.now();
+        const concurrentInvites = await Promise.race([
+          Promise.all([inviteRequest, inviteRequest].map(async requestInvite => {
+            const startedAt = Date.now();
+            const result = await requestInvite();
+            return { ...result, durationMs: Date.now() - startedAt };
+          })),
           new Promise(resolve => setTimeout(() => resolve(null), 1200))
         ]);
+        if (concurrentInvites) {
+          invite = concurrentInvites.find(value => value.status === 201);
+          assert(Boolean(invite) && concurrentInvites.filter(value => value.status === 409).length === 1,
+            'Concurrent duplicate staff invitations must produce exactly one invitation and one conflict.');
+          console.log(`[SCOPED_API_TIMING] ${JSON.stringify({ path: '/api/admin/invite', method: 'POST', concurrency: 2, totalMs: Date.now() - invitationStartedAt, responses: concurrentInvites.map(({ status, durationMs }) => ({ status, durationMs })) })}`);
+        }
       } finally {
         await legacyLockHolder.query('ROLLBACK').catch(() => {});
         await legacyLockHolder.end();
       }
       assert(invite?.status === 201, 'Owner invitation must complete without waiting on the legacy global PostgreSQL lock.');
-      results.push('authorized team invitation completed while the legacy global PostgreSQL lock was held');
+      results.push('authorized team invitation completed while the legacy global PostgreSQL lock was held; concurrent duplicate invitations produced one account');
     } else invite = await inviteRequest();
     assert(invite.status === 201 && invite.data.activationToken, `Owner invitation for ${role} failed with ${invite.status}.`);
     const invitationRows = await client.query(
@@ -400,6 +411,51 @@ try {
   assert(marketerInviteDenied.status === 403, 'Marketer was able to create a staff invitation.');
   results.push('secure employee invitations, activation, and role-specific dashboards for order manager, HR, marketer, and developer');
   results.push('server-side denial of owner-only payments for HR and staff invitations for marketers');
+
+  const permissionsLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await permissionsLockHolder.connect();
+  let permissionChange;
+  const permissionStartedAt = Date.now();
+  try {
+    await permissionsLockHolder.query('BEGIN');
+    await permissionsLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+    permissionChange = await Promise.race([
+      request('PATCH', `/api/admin/permissions/${encodeURIComponent(employees.marketer.id)}`, {
+        body: { role: 'marketer', active: true, permissions: { 'conversations.read': 'all' } }, cookie: ownerCookie
+      }),
+      new Promise(resolve => setTimeout(() => resolve(null), 1200))
+    ]);
+  } finally {
+    await permissionsLockHolder.query('ROLLBACK').catch(() => {});
+    await permissionsLockHolder.end();
+  }
+  assert(permissionChange?.status === 200, 'Owner permission changes must not wait behind the legacy global PostgreSQL advisory lock.');
+  console.log(`[SCOPED_API_TIMING] ${JSON.stringify({ path: `/api/admin/permissions/${encodeURIComponent(employees.marketer.id)}`, method: 'PATCH', concurrency: 1, apiMs: Date.now() - permissionStartedAt, globalAdvisoryLockHeld: true })}`);
+  assert(permissionChange.data.user?.effectivePermissions?.['conversations.read'] === 'all', 'Permission changes were not effective in the saved response.');
+  const permissionPersisted = await client.query(`
+    SELECT u.role, u.active, u.data->'permissionOverrides'->>'conversations.read' AS conversation_scope,
+      (SELECT count(*)::int FROM auth_sessions s WHERE s."userId" = u.id) AS sessions,
+      (SELECT count(*)::int FROM audit_entries a WHERE a."targetId" = u.id AND a.action = 'employee_permissions_updated') AS audit_count
+    FROM user_accounts u WHERE u.id = $1
+  `, [employees.marketer.id]);
+  assert(permissionPersisted.rows[0]?.role === 'marketer' && permissionPersisted.rows[0].active === true &&
+    permissionPersisted.rows[0].conversation_scope === 'all' && Number(permissionPersisted.rows[0].sessions) === 0 &&
+    Number(permissionPersisted.rows[0].audit_count) === 1,
+  'Scoped permission update must save one row, revoke prior sessions, and append one audit entry atomically.');
+  const ownerEscalation = await request('PATCH', `/api/admin/permissions/${encodeURIComponent(employees.marketer.id)}`, {
+    body: { role: 'admin', active: true, permissions: {} }, cookie: ownerCookie
+  });
+  assert(ownerEscalation.status === 400, 'The scoped permission update must reject Owner role assignment.');
+  const protectOwner = await request('PATCH', `/api/admin/permissions/${encodeURIComponent(ownerId)}`, {
+    body: { role: 'marketer', active: false, permissions: {} }, cookie: ownerCookie
+  });
+  assert(protectOwner.status === 409, 'The permission manager must preserve Owner protection.');
+  const refreshedMarketerLogin = await request('POST', '/api/auth/login', {
+    body: { username: `pg_marketer_${testSuffix}`, password: `Employee!marketer${testSuffix}Long`, accountType: 'employee' }
+  });
+  assert(refreshedMarketerLogin.status === 200, 'Marketer could not establish a fresh session after permission changes revoked old sessions.');
+  employees.marketer.cookie = cookieFrom(refreshedMarketerLogin);
+  results.push('Owner permission changes use row-scoped transactions, remain unblocked by the legacy global lock, apply immediately, revoke sessions, audit once, and reject Owner escalation');
 
   const visitorId = `phase3visitor${testSuffix}`;
   const trackedVisit = await request('POST', '/api/referral-events', {

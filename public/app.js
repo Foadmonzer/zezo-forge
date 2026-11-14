@@ -16,6 +16,55 @@ if(savedMotion==='off')document.documentElement.classList.add('motion-allowed');
 const money = amount => Number.isFinite(Number(amount)) ? `${new Intl.NumberFormat(state.lang === 'ar' ? 'ar' : 'en', { maximumFractionDigits: 2 }).format(Number(amount))} ₪` : '—';
 const date = value => { try { return new Intl.DateTimeFormat(state.lang === 'ar' ? 'ar' : 'en', { dateStyle:'medium' }).format(new Date(value)); } catch { return '—'; } };
 const tx = (ar, en) => state.lang === 'ar' ? ar : en;
+const busyDashboardForms = new Set();
+let dashboardRequestsInFlight = 0;
+let dashboardBusyReleaseTimer = 0;
+const dashboardActionFormSelector = [
+  '#inviteForm', '[data-permission-form]', '[data-lead-edit]', '[data-payment-form]',
+  '[data-developer-assign]', '[data-developer-review]', '[data-project-stage-form]',
+  '[data-dev-progress]', '[data-dev-file]', '[data-marketing-lead]', '[data-campaign-update]',
+  '[data-conversation-manage]', '[data-order-manager-update]', '[data-conversation-reply]',
+  '[data-conversation-quote]', '[data-hr-withdrawal]', '[data-hr-finance]',
+  '[data-settlement]', '[data-withdrawal-update]', '#expenseForm', '#financeSettingsForm',
+  '#pricingForm', '#templatePricingForm', '#campaignForm', '#profileForm', '#passwordForm'
+].join(',');
+function releaseDashboardBusyForms(){
+  for(const form of busyDashboardForms){
+    form.dataset.zezoBusy='false';form.removeAttribute('aria-busy');
+    form.querySelectorAll('button[type="submit"]').forEach(button=>{button.disabled=false;button.removeAttribute('aria-busy')});
+    if(form.nextElementSibling?.matches('.zezo-submit-status'))form.nextElementSibling.remove();
+  }
+  busyDashboardForms.clear();
+}
+function scheduleDashboardBusyRelease(delay=450){
+  clearTimeout(dashboardBusyReleaseTimer);
+  dashboardBusyReleaseTimer=setTimeout(()=>{if(dashboardRequestsInFlight===0)releaseDashboardBusyForms()},delay);
+}
+const zezoNativeFetch=window.fetch.bind(window);
+window.fetch=(...args)=>{
+  if(busyDashboardForms.size===0)return zezoNativeFetch(...args);
+  dashboardRequestsInFlight++;
+  clearTimeout(dashboardBusyReleaseTimer);
+  return zezoNativeFetch(...args).finally(()=>{
+    dashboardRequestsInFlight=Math.max(0,dashboardRequestsInFlight-1);
+    if(dashboardRequestsInFlight===0)scheduleDashboardBusyRelease();
+  });
+};
+document.addEventListener('submit',event=>{
+  const form=event.target;
+  if(!(form instanceof HTMLFormElement)||!form.matches(dashboardActionFormSelector))return;
+  if(form.dataset.zezoBusy==='true'){
+    event.preventDefault();event.stopImmediatePropagation();return;
+  }
+  form.dataset.zezoBusy='true';form.setAttribute('aria-busy','true');busyDashboardForms.add(form);
+  form.querySelectorAll('button[type="submit"]').forEach(button=>{button.disabled=true;button.setAttribute('aria-busy','true')});
+  let status=form.nextElementSibling;
+  if(!status?.matches('.zezo-submit-status')){
+    status=document.createElement('div');status.className='zezo-submit-status';status.setAttribute('role','status');status.setAttribute('aria-live','polite');form.insertAdjacentElement('afterend',status);
+  }
+  status.textContent=tx('جارٍ تنفيذ العملية…','Working…');
+  scheduleDashboardBusyRelease(1000);
+},true);
 const notificationTypeLabels={project:['مشروع','Project'],inquiry:['استفسار','Enquiry'],withdrawal:['سحب','Withdrawal'],rank:['ترقية','Rank'],sale:['مبيعة','Sale'],commission:['عمولة','Commission'],quote:['عرض سعر','Quote'],payment:['دفعة','Payment'],team:['فريق','Team'],deadline:['موعد','Deadline'],finance:['مالية','Finance'],referral:['إحالة','Referral'],update:['تحديث','Update']};
 function notificationWhen(value){try{return new Intl.DateTimeFormat(state.lang==='ar'?'ar':'en',{dateStyle:'medium',timeStyle:'short'}).format(new Date(value))}catch{return '—'}}
 function notificationEntryHtml(item){const unread=!item.readAt,severity=item.importance==='critical'||item.importance==='high'?tx('مهم','Important'):'';return `<article class="notification-item ${unread?'unread':''}"><button class="notification-open" type="button" data-notification-open="${esc(item.id)}"><b>${esc(state.lang==='ar'?item.titleAr:item.titleEn)}${severity?`<span class="notification-severity">${severity}</span>`:''}</b><small>${esc(state.lang==='ar'?item.descriptionAr:item.descriptionEn)}</small><time>${notificationWhen(item.createdAt)}</time></button>${unread?`<button class="notification-read-one" type="button" data-notification-read="${esc(item.id)}" aria-label="${tx('تحديد كمقروء','Mark as read')}">✓</button>`:''}</article>`}
@@ -925,11 +974,14 @@ document.addEventListener('submit',async event=>{
 document.addEventListener('click',async event=>{const copy=event.target.closest('[data-copy-invite]');if(copy){try{await navigator.clipboard.writeText(copy.dataset.copyInvite);showToast(tx('تم نسخ رابط التفعيل.','Activation link copied.'))}catch{showToast(tx('تعذر النسخ.','Could not copy.'),true)}}});
 
 document.addEventListener('click',async event=>{
-  if(!event.target.closest('#withdrawalRequest'))return;
+  const withdrawalButton=event.target.closest('#withdrawalRequest');
+  if(!withdrawalButton)return;
   event.preventDefault();event.stopImmediatePropagation();
+  if(withdrawalButton.dataset.zezoBusy==='true')return;
+  withdrawalButton.dataset.zezoBusy='true';withdrawalButton.disabled=true;withdrawalButton.setAttribute('aria-busy','true');
   const minimum=100,available=Number(state.dashboard?.summary?.confirmed||0),raw=window.prompt(tx(`أدخل مبلغ السحب بالشيكل (من ${minimum} إلى ${money(available)}). سيتم حجزه عند الإرسال.`,`Enter the withdrawal amount in ILS (${minimum} to ${money(available)}). It will be reserved when submitted.`),String(Math.floor(available)));
-  if(raw===null)return;
-  try{await postJson('/api/marketer/withdrawals',{amount:Number(raw),method:'binance'});await refreshDashboard('referral');showToast(tx('تم إرسال طلب السحب للإدارة.','Withdrawal request sent to management.'))}catch(error){showToast(error.message,true)}
+  if(raw===null){withdrawalButton.disabled=false;withdrawalButton.removeAttribute('aria-busy');delete withdrawalButton.dataset.zezoBusy;return}
+  try{await postJson('/api/marketer/withdrawals',{amount:Number(raw),method:'binance'});await refreshDashboard('referral');showToast(tx('تم إرسال طلب السحب للإدارة.','Withdrawal request sent to management.'))}catch(error){showToast(error.message,true)}finally{withdrawalButton.disabled=false;withdrawalButton.removeAttribute('aria-busy');delete withdrawalButton.dataset.zezoBusy}
 },true);
 document.addEventListener('submit',async event=>{
   const form=event.target;

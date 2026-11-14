@@ -14,7 +14,7 @@ export async function createPostgresEmployeeInvitation({
       FROM auth_sessions s
       JOIN user_accounts u ON u.id = s."userId"
       WHERE s.id = $1 AND s."userId" = $2 AND s."expiresAt" > NOW() AND u.active = TRUE
-      FOR UPDATE OF s, u
+      FOR SHARE OF s, u
     `, [sessionHash, inviterId]);
     const authRow = authResult.rows[0];
     if (!authRow) return { kind: 'unauthenticated' };
