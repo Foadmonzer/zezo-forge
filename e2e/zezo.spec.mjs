@@ -390,13 +390,13 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await ownerPage.locator('[data-dash-tab="permissions"]').click();
   const permissionForm = ownerPage.locator(`[data-permission-form="${marketer.id}"]`);
   await expect(permissionForm).toBeVisible();
-  await permissionForm.locator('[name="perm_conversations.read"]').selectOption('all');
+  await permissionForm.locator('[name="perm_conversations.read"]').selectOption('assigned');
   await measureDashboardAction(ownerPage, `/api/admin/permissions/${encodeURIComponent(marketer.id)}`, 'PATCH', async () => {
     await permissionForm.locator('button[type="submit"]').click();
     await expect(permissionForm.locator('button[type="submit"]')).toBeDisabled();
     await expect(ownerPage.locator('.zezo-submit-status')).toContainText('جارٍ تنفيذ العملية');
   }, async () => {
-    await expect(ownerPage.locator(`[data-permission-form="${marketer.id}"] [name="perm_conversations.read"]`)).toHaveValue('all');
+    await expect(ownerPage.locator(`[data-permission-form="${marketer.id}"] [name="perm_conversations.read"]`)).toHaveValue('assigned');
   }, { waitDashboard: true });
 
   await ownerPage.locator('[data-dash-tab="requests"]').click();

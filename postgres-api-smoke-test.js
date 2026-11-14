@@ -421,7 +421,7 @@ try {
     await permissionsLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
     permissionChange = await Promise.race([
       request('PATCH', `/api/admin/permissions/${encodeURIComponent(employees.marketer.id)}`, {
-        body: { role: 'marketer', active: true, permissions: { 'conversations.read': 'all' } }, cookie: ownerCookie
+        body: { role: 'marketer', active: true, permissions: { 'conversations.read': 'assigned' } }, cookie: ownerCookie
       }),
       new Promise(resolve => setTimeout(async () => {
         const activity = await client.query(`
@@ -441,7 +441,7 @@ try {
   assert(permissionChange?.status === 200,
     `Owner permission changes must not wait behind the legacy global PostgreSQL advisory lock (received ${permissionChange?.status ?? (permissionChange?.timedOut ? 'timeout' : 'no response')}${permissionChange ? `: ${JSON.stringify(permissionChange.data || permissionChange.activity || {})}` : ''}).`);
   console.log(`[SCOPED_API_TIMING] ${JSON.stringify({ path: `/api/admin/permissions/${encodeURIComponent(employees.marketer.id)}`, method: 'PATCH', concurrency: 1, apiMs: Date.now() - permissionStartedAt, globalAdvisoryLockHeld: true })}`);
-  assert(permissionChange.data.user?.effectivePermissions?.['conversations.read'] === 'all', 'Permission changes were not effective in the saved response.');
+  assert(permissionChange.data.user?.effectivePermissions?.['conversations.read'] === 'assigned', 'Permission changes were not effective in the saved response.');
   const permissionPersisted = await client.query(`
     SELECT u.role, u.active, u.data->'permissionOverrides'->>'conversations.read' AS conversation_scope,
       (SELECT count(*)::int FROM auth_sessions s WHERE s."userId" = u.id) AS sessions,
@@ -449,7 +449,7 @@ try {
     FROM user_accounts u WHERE u.id = $1
   `, [employees.marketer.id]);
   assert(permissionPersisted.rows[0]?.role === 'marketer' && permissionPersisted.rows[0].active === true &&
-    permissionPersisted.rows[0].conversation_scope === 'all' && Number(permissionPersisted.rows[0].sessions) === 0 &&
+    permissionPersisted.rows[0].conversation_scope === 'assigned' && Number(permissionPersisted.rows[0].sessions) === 0 &&
     Number(permissionPersisted.rows[0].audit_count) === 1,
   'Scoped permission update must save one row, revoke prior sessions, and append one audit entry atomically.');
   const ownerEscalation = await request('PATCH', `/api/admin/permissions/${encodeURIComponent(employees.marketer.id)}`, {
