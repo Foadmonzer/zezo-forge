@@ -31,13 +31,14 @@ test('staging gate protects pages, API, and static assets until a secure session
 
   const loginResponsePromise = page.waitForResponse(response => new URL(response.url()).pathname === '/api/staging/login');
   await page.getByLabel('كلمة مرور المعاينة').fill(stagingPassword);
-  await page.getByRole('button', { name: 'دخول آمن' }).click();
-  const loginResponse = await loginResponsePromise;
+  const [loginResponse] = await Promise.all([
+    loginResponsePromise,
+    page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
+    page.getByRole('button', { name: 'دخول آمن' }).click()
+  ]);
   const loginHeaders = await loginResponse.allHeaders();
   expect(loginResponse.status(), `staging login status=${loginResponse.status()} location=${loginHeaders.location || 'missing'}`).toBe(303);
   expect(loginHeaders.location || '', 'successful login should redirect to the staging home page').not.toContain('stagingError=');
-  await page.waitForLoadState('domcontentloaded');
-
   const cookies = await page.context().cookies();
   const gateCookie = cookies.find(cookie => cookie.name === 'zezo_staging_access');
   expect(gateCookie).toBeTruthy();
