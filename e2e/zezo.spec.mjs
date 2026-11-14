@@ -263,6 +263,11 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   const marketerDashboard = await json(await marketerApi.get('/api/dashboard'));
   const referralCode = marketerDashboard.user.referralCode;
   expect(referralCode).toBeTruthy();
+  const ownerNotifications = await json(await ownerApi.get('/api/notifications?limit=100'));
+  const activationNotices = ownerNotifications.notifications.filter(item => item.titleEn === 'An employee activated an account');
+  expect(activationNotices.length).toBeGreaterThanOrEqual(3);
+  const crossAccountRead = await marketerApi.patch(`/api/notifications/${encodeURIComponent(activationNotices[0].id)}`);
+  expect(crossAccountRead.status()).toBe(404);
   await marketerApi.dispose();
 
   // Create and sign in as a customer through the actual browser form, carrying the synthetic referral.
@@ -364,6 +369,13 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   // Owner: assign developer and record a synthetic, verified manual payment in the UI.
   const ownerPage = await browser.newPage({ viewport: { width: 1366, height: 900 } });
   await loginThroughUI(ownerPage, { username: ownerUsername, password: ownerPassword, accountType: 'management', mfaCode: totp(ownerMfa.secret) });
+  await ownerPage.locator('[data-dash-tab="ranks"]').click();
+  await expect(ownerPage.locator('#dashboardContent')).toContainText('20%');
+  await expect(ownerPage.locator('#dashboardContent')).toContainText('35%');
+  await expect(ownerPage.locator('#dashboardContent')).toContainText('80+');
+  await expect(ownerPage.locator('#dashboardContent')).toContainText('إشعاراتها الداخلية في ZEZO بشكل مستقل عن البريد');
+  await ownerPage.locator('[data-dash-tab="marketing"]').click();
+  await expect(ownerPage.locator('#dashboardContent')).toContainText('لا ينشر تلقائياً على Instagram أو Facebook');
   await ownerPage.locator('[data-dash-tab="team"]').click();
   const inviteForm = ownerPage.locator('#inviteForm');
   const inviteName = `Synthetic UI Invite ${suffix}`;
@@ -372,6 +384,27 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await inviteForm.locator('[name="username"]').fill(inviteUsername);
   await inviteForm.locator('[name="email"]').fill(`${inviteUsername}@example.test`);
   await inviteForm.locator('[name="role"]').selectOption('marketer');
+  let dashboardReadsAfterUnsavedInput = 0;
+  ownerPage.on('request', request => {
+    if (new URL(request.url()).pathname === '/api/dashboard' && request.method() === 'GET') dashboardReadsAfterUnsavedInput++;
+  });
+  const outsideDashboardPoint = await ownerPage.evaluate(() => {
+    const panel = document.querySelector('.dashboard').getBoundingClientRect();
+    const bounds = document.querySelector('#dashboardBackdrop').getBoundingClientRect();
+    const candidates = [
+      [bounds.left + 2, bounds.top + 2],
+      [bounds.right - 2, bounds.top + 2],
+      [bounds.left + 2, bounds.bottom - 2],
+      [bounds.right - 2, bounds.bottom - 2]
+    ];
+    return candidates.find(([x, y]) => x >= 0 && y >= 0 && x < innerWidth && y < innerHeight && !(x >= panel.left && x <= panel.right && y >= panel.top && y <= panel.bottom)) || null;
+  });
+  expect(outsideDashboardPoint, 'an outside-dashboard click target should exist').not.toBeNull();
+  await ownerPage.mouse.click(outsideDashboardPoint[0], outsideDashboardPoint[1]);
+  await expect(ownerPage.locator('#dashboardBackdrop.open')).toBeVisible();
+  await expect(inviteForm.locator('[name="name"]')).toHaveValue(inviteName);
+  await expect(inviteForm.locator('[name="username"]')).toHaveValue(inviteUsername);
+  expect(dashboardReadsAfterUnsavedInput).toBe(0);
   let uiInviteRequests = 0;
   ownerPage.on('request', request => { if (new URL(request.url()).pathname === '/api/admin/invite' && request.method() === 'POST') uiInviteRequests++; });
   await ownerPage.route('**/api/admin/invite', async route => {
