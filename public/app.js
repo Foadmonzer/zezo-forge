@@ -57,12 +57,8 @@ document.addEventListener('submit',event=>{
     event.preventDefault();event.stopImmediatePropagation();return;
   }
   form.dataset.zezoBusy='true';form.setAttribute('aria-busy','true');busyDashboardForms.add(form);
-  // Let existing submit handlers inspect the submitter before disabling it.
-  // A few handlers intentionally short-circuit when their own button is disabled.
   form.querySelectorAll('button[type="submit"]').forEach(button=>button.setAttribute('aria-busy','true'));
-  queueMicrotask(()=>{
-    if(form.dataset.zezoBusy==='true')form.querySelectorAll('button[type="submit"]').forEach(button=>{button.disabled=true;button.setAttribute('aria-busy','true')});
-  });
+  form.querySelectorAll('button[type="submit"]').forEach(button=>{button.disabled=true;button.setAttribute('aria-busy','true')});
   let status=form.nextElementSibling;
   if(!status?.matches('.zezo-submit-status')){
     status=document.createElement('div');status.className='zezo-submit-status';status.setAttribute('role','status');status.setAttribute('aria-live','polite');form.insertAdjacentElement('afterend',status);
@@ -935,8 +931,6 @@ document.addEventListener('submit',async event=>{
   if(event.target.matches('#inviteForm')){
     event.preventDefault();
     const form=event.target,submit=form.querySelector('button[type="submit"]');
-    if(submit?.disabled)return;
-    if(submit)submit.disabled=true;
     try{
       const data=await postJson('/api/admin/invite',Object.fromEntries(new FormData(form)));
       let successMessage='';
