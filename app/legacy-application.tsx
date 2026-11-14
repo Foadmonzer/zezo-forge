@@ -12,6 +12,9 @@ export default function LegacyApplication({ markup }: { markup: string }) {
     script.type = 'module';
     script.src = '/app.js';
     script.dataset.zezoLegacyApp = 'true';
+    script.addEventListener('load', () => {
+      document.documentElement.dataset.zezoAppReady = 'true';
+    }, { once: true });
     document.body.append(script);
     return () => script.remove();
   }, []);

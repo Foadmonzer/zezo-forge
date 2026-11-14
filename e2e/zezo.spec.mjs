@@ -38,6 +38,7 @@ async function json(response) {
 
 async function loginThroughUI(page, { username, password, accountType = 'employee', mfaCode }) {
   await page.goto('/team');
+  await expect(page.locator('html')).toHaveAttribute('data-zezo-app-ready', 'true');
   const form = accountType === 'management' ? '#managerLoginForm' : '#employeeLoginForm';
   await page.locator(`${form} input[name="username"]`).fill(username);
   await page.locator(`${form} input[name="password"]`).fill(password);
@@ -267,6 +268,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   // Create and sign in as a customer through the actual browser form, carrying the synthetic referral.
   await page.setViewportSize({ width: 1366, height: 900 });
   await page.goto(`/?ref=${encodeURIComponent(referralCode)}`);
+  await expect(page.locator('html')).toHaveAttribute('data-zezo-app-ready', 'true');
   await page.locator('.login-open').click();
   await expect(page.locator('#authModal.open')).toBeVisible();
   await expect(page.locator('#customerChoicePanel [data-customer-view="register"]')).toBeVisible();
@@ -336,6 +338,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
 
   // The customer reloads the saved conversation, accepts the quote, and sends a formal request.
   await page.reload();
+  await expect(page.locator('html')).toHaveAttribute('data-zezo-app-ready', 'true');
   await page.locator('.login-open').click();
   await expect(page.locator('#dashboardBackdrop.open')).toBeVisible();
   await page.locator('[data-dash-tab="conversations"]').click();
@@ -396,6 +399,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   // A successful invitation displays its one-time link immediately; the list
   // is refreshed on the next page load. Exercise the visible revoke/reissue UI.
   await ownerPage.reload();
+  await expect(ownerPage.locator('html')).toHaveAttribute('data-zezo-app-ready', 'true');
   await ownerPage.locator('[data-dash-tab="team"]').click();
   const revokeButton = ownerPage.locator(`[data-invitation-action="revoked"][data-invitation-id="${uiInviteId}"]`);
   await expect(revokeButton).toBeVisible();
