@@ -517,7 +517,7 @@ try {
         FROM referral_links WHERE "userId" = $1
       `, [activation.data.user.id, new Date().toISOString().slice(0, 7)]);
       assert(referralLinks.rows[0]?.legacy_count === 1 && referralLinks.rows[0]?.monthly_count === 1 &&
-        Boolean(activation.data.user.currentReferralCode),
+        Boolean(activation.data.user.referralCode),
         `${role} activation did not preserve and initialize the account's referral links.`);
     }
     const usedActivation = await request('POST', '/api/auth/activate', {
