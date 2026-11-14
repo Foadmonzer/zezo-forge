@@ -2,14 +2,47 @@
   "name": "zezo-digital-platform",
   "version": "0.1.0",
   "private": true,
-  "description": "ZEZO bilingual website and local-first referral workspace",
+  "packageManager": "pnpm@11.25.0",
+  "description": "ZEZO bilingual website and referral workspace",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js",
+    "start": "next start",
+    "dev": "next dev --hostname 127.0.0.1",
+    "dev:legacy": "node --watch server.js",
+    "start:legacy": "node server.js",
+    "build": "next build",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "prisma generate",
+    "db:migrate:dev": "prisma migrate dev",
+    "db:migrate:deploy": "prisma migrate deploy",
+    "db:backup:encrypted": "node scripts/postgres-encrypted-backup.mjs backup",
+    "db:restore:encrypted:test": "node scripts/postgres-encrypted-backup.mjs restore",
+    "backup:railway": "node scripts/railway-postgres-backup.mjs",
+    "owner:provision": "node scripts/provision-owner.mjs",
+    "worker:mail": "node outbox-worker.js",
     "test:smoke": "node smoke-test.js",
     "test:staging": "node staging-smoke-test.js",
-    "test": "npm run test:smoke && npm run test:staging"
+    "test:staging-auth": "node staging-auth-smoke-test.js",
+    "test:postgres": "node postgres-smoke-test.js && node postgres-api-smoke-test.js && node postgres-outbox-smoke-test.js",
+    "perf:production": "node scripts/measure-production-performance.mjs",
+    "test": "node smoke-test.js && node staging-smoke-test.js"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": "^20.19.0 || ^22.12.0 || ^24.0.0"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "^7.10.1",
+    "@prisma/client": "^7.10.1",
+    "next": "16.4.4",
+    "pg": "^8.23.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "prisma": "^7.10.1",
+    "typescript": "^7.0.2"
+  }
 }
