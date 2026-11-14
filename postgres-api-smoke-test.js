@@ -429,7 +429,8 @@ try {
     await permissionsLockHolder.query('ROLLBACK').catch(() => {});
     await permissionsLockHolder.end();
   }
-  assert(permissionChange?.status === 200, 'Owner permission changes must not wait behind the legacy global PostgreSQL advisory lock.');
+  assert(permissionChange?.status === 200,
+    `Owner permission changes must not wait behind the legacy global PostgreSQL advisory lock (received ${permissionChange?.status ?? 'timeout'}${permissionChange ? `: ${JSON.stringify(permissionChange.data)}` : ''}).`);
   console.log(`[SCOPED_API_TIMING] ${JSON.stringify({ path: `/api/admin/permissions/${encodeURIComponent(employees.marketer.id)}`, method: 'PATCH', concurrency: 1, apiMs: Date.now() - permissionStartedAt, globalAdvisoryLockHeld: true })}`);
   assert(permissionChange.data.user?.effectivePermissions?.['conversations.read'] === 'all', 'Permission changes were not effective in the saved response.');
   const permissionPersisted = await client.query(`
