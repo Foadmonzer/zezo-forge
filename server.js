@@ -17,6 +17,7 @@ import { acceptPostgresQuote, createPostgresQuote } from './src/server/postgres-
 import { claimNextOutboxMessage, completeOutboxMessage } from './src/server/outbox-repository.js';
 import { createPostgresWithdrawalRequest } from './src/server/postgres-withdrawal-repository.js';
 import { createPostgresEmployeeInvitation, revokePostgresEmployeeInvitation, reissuePostgresEmployeeInvitation } from './src/server/postgres-invitation-repository.js';
+import { activatePostgresEmployeeInvitation } from './src/server/postgres-activation-repository.js';
 import { createPostgresClientRegistration } from './src/server/postgres-client-registration-repository.js';
 import { updatePostgresEmployeePermissions } from './src/server/postgres-permission-repository.js';
 
@@ -2165,6 +2166,76 @@ function cancelWithdrawalForLead(lead, actor = null) {
   }
 }
 
+async function handlePostgresEmployeeActivation(req, res, path) {
+  if (req.method !== 'POST' || path !== '/api/auth/activate' || !stagingAuthorized(req)) return false;
+  const security = { ...responseSecurityHeaders(), 'Cache-Control': 'no-store' };
+  const respond = (status, body, headers = security) => { json(res, status, body, headers); return true; };
+  let body;
+  try {
+    body = await jsonBody(req);
+  } catch {
+    return respond(400, { error: 'تعذر قراءة بيانات التفعيل. حدّث الصفحة وحاول مجدداً / Could not read the activation form. Refresh and try again.' });
+  }
+
+  const activationToken = String(body.token || '');
+  const password = String(body.password || '');
+  if (activationToken.length < 20 || activationToken.length > 128) {
+    return respond(400, { error: 'رابط التفعيل غير صالح أو منتهي أو سبق استخدامه. اطلب رابطاً جديداً من إدارة ZEZO / This activation link is invalid, expired, or already used. Ask ZEZO management for a new link.' });
+  }
+  if (!validPassword(password)) {
+    return respond(400, { error: 'كلمة المرور يجب أن تتكون من 12 خانة على الأقل / Password must be at least 12 characters.' });
+  }
+  const ip = req.socket?.remoteAddress || 'unknown';
+  let rateAllowed;
+  try {
+    rateAllowed = await consumeRateLimitBucket('employee-activation', ip, 20, 15 * 60_000);
+  } catch (error) {
+    const code = typeof error?.code === 'string' ? error.code.slice(0, 16) : 'unknown';
+    const name = error instanceof Error ? error.name.slice(0, 40) : 'unknown';
+    console.error('ZEZO employee activation rate limiter failed', { code, name });
+    return respond(503, { error: 'تعذر التحقق من الطلب مؤقتاً. لم نغيّر حالة الدعوة؛ أعد المحاولة بعد قليل / We could not verify the request temporarily. The invitation was not changed; please retry shortly.' });
+  }
+  if (!rateAllowed) {
+    return respond(429, { error: 'محاولات تفعيل كثيرة. انتظر 15 دقيقة ثم حاول مجدداً / Too many activation attempts. Wait 15 minutes and try again.' }, { ...security, 'Retry-After': '900' });
+  }
+
+  const sid = token();
+  let result;
+  try {
+    result = await activatePostgresEmployeeInvitation({
+      activationHash: hash(activationToken),
+      credential: passwordRecord(password),
+      sessionHash: sessionKey(sid),
+      sessionExpiresAt: new Date(Date.now() + SESSION_TTL),
+      auditId: id('evt'),
+      at: now()
+    });
+  } catch (error) {
+    const code = typeof error?.code === 'string' ? error.code.slice(0, 16) : 'unknown';
+    const name = error instanceof Error ? error.name.slice(0, 40) : 'unknown';
+    console.error('ZEZO employee activation transaction failed', { code, name });
+    return respond(503, { error: 'تعذر حفظ التفعيل بسبب مشكلة مؤقتة في قاعدة البيانات. لم نعرض تفاصيل سرية؛ أعد المحاولة بعد قليل، وإن استمرت المشكلة اطلب من الإدارة إصدار رابط جديد / Activation could not be saved because of a temporary database issue. Please retry shortly; if it continues, ask management for a new link.' });
+  }
+
+  if (result.kind === 'expired') {
+    return respond(410, { error: 'انتهت صلاحية الدعوة. اطلب من الإدارة إصدار رابط جديد / This invitation has expired. Ask management to issue a new link.' });
+  }
+  if (result.kind === 'awaiting_approval') {
+    return respond(409, { error: 'الدعوة ما زالت تنتظر موافقة الإدارة / This invitation is still waiting for management approval.' });
+  }
+  if (result.kind === 'already_active') {
+    return respond(409, { error: 'الحساب مفعّل بالفعل. انتقل إلى مساحة الفريق وسجّل الدخول / This account is already active. Open the team workspace and sign in.' });
+  }
+  if (result.kind !== 'activated') {
+    return respond(400, { error: 'رابط التفعيل غير صالح أو منتهي أو سبق استخدامه. اطلب رابطاً جديداً من إدارة ZEZO / This activation link is invalid, expired, or already used. Ask ZEZO management for a new link.' });
+  }
+
+  return respond(200, { ok: true, user: publicUser(result.user) }, {
+    ...security,
+    'Set-Cookie': cookie('zezo_session', sid, SESSION_TTL / 1000, req)
+  });
+}
+
 async function handlePostgresCoreWrite(req, res, path) {
   const match = req.method === 'PATCH' && /^\/api\/admin\/permissions\/[^/]+$/.test(path)
     ? path.split('/').at(-1)
@@ -2340,6 +2411,7 @@ async function handle(req, res) {
     const lang = url.searchParams.get('lang') === 'en' ? 'en' : 'ar';
     return json(res, 200, { createdAt: lead.createdAt, service: lead.service, status: lead.status, statusText: publicStatusLabels[lead.status]?.[lang] || publicStatusLabels.new[lang], note: lead.publicStatusNote || '' }, responseSecurityHeaders());
   }
+  if (await handlePostgresEmployeeActivation(req, res, path)) return;
   const normalizedReadHandled = process.env.ZEZO_BENCH_LEGACY_CORE_READS === 'true'
     ? false
     : await handlePostgresCoreRead(req, res, path);

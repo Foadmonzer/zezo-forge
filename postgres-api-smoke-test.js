@@ -31,7 +31,8 @@ const testRateBuckets = [
   rateBucket('login:first-admin:127.0.0.1'), rateBucket(`login:127.0.0.1:${ownerUsername}`),
   rateBucket('client-registration:127.0.0.1'), rateBucket(`login:127.0.0.1:${customerEmail}`),
   rateBucket('conversation:create:127.0.0.1'), rateBucket('public-enquiry:127.0.0.1'),
-  rateBucket('quote:127.0.0.1'), rateBucket('quote:referral:127.0.0.1'), rateBucket('referral:127.0.0.1')
+  rateBucket('quote:127.0.0.1'), rateBucket('quote:referral:127.0.0.1'), rateBucket('referral:127.0.0.1'),
+  rateBucket('employee-activation:127.0.0.1')
 ];
 
 function assert(condition, message) {
@@ -437,15 +438,102 @@ try {
       activationToken = reissued.data.activationToken;
       results.push('invitation revoke and reissue use one existing account, invalidate old tokens, persist one fresh 24-hour token and reject duplicate concurrent reissues');
     }
-    const activation = await request('POST', '/api/auth/activate', {
-      body: { token: activationToken, password: `Employee!${role}${testSuffix}Long` }
-    });
+    const activationPassword = `Employee!${role}${testSuffix}Long`;
+    let activation;
+    if (role === 'order_manager') {
+      const legacyLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+      await legacyLockHolder.connect();
+      let activationPromise;
+      let concurrentActivationPromise;
+      let activationTimeout;
+      try {
+        await legacyLockHolder.query('BEGIN');
+        await legacyLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+        const activationStartedAt = Date.now();
+        const attempts = [0, 1].map(() => request('POST', '/api/auth/activate', {
+          body: { token: activationToken, password: activationPassword }
+        }));
+        [activationPromise, concurrentActivationPromise] = attempts;
+        const activationResults = await Promise.race([
+          Promise.all(attempts),
+          new Promise(resolve => {
+            activationTimeout = setTimeout(() => resolve(null), 1200);
+            activationTimeout.unref?.();
+          })
+        ]);
+        if (activationResults) {
+          activation = activationResults.find(result => result.status === 200);
+          const replay = activationResults.find(result => result !== activation);
+          activation.lockTestElapsedMs = Date.now() - activationStartedAt;
+          activation.concurrentReplayStatus = replay?.status;
+          console.log(`[SCOPED_API_TIMING] ${JSON.stringify({ path: '/api/auth/activate', method: 'POST', concurrentRequests: 2, advisoryLockHeld: true, status: activation.status, replayStatus: replay?.status, elapsedMs: activation.lockTestElapsedMs })}`);
+        }
+      } finally {
+        clearTimeout(activationTimeout);
+        await legacyLockHolder.query('ROLLBACK').catch(() => {});
+        await legacyLockHolder.end();
+      }
+      activation ||= await activationPromise;
+      assert(activation.lockTestElapsedMs < 1200,
+        'Employee activation waited on the legacy company-wide PostgreSQL advisory lock.');
+      assert(activation.concurrentReplayStatus === 400,
+        'Concurrent activation requests reused the same single-use employee invitation token.');
+      results.push('parallel activation requests consumed the invitation once and completed while the legacy company-wide advisory lock was held');
+    } else {
+      activation = await request('POST', '/api/auth/activate', {
+        body: { token: activationToken, password: activationPassword }
+      });
+    }
     assert(activation.status === 200 && activation.data.user?.role === role, `Employee activation for ${role} failed with ${activation.status}.`);
+    assert(activation.data.user?.activationHash === undefined && activation.data.user?.passwordHash === undefined && activation.data.user?.salt === undefined,
+      'Employee activation response exposed a token hash or password credential.');
+    const activationCookie = cookieFrom(activation);
+    const activatedSessionId = createHash('sha256').update(activationCookie.slice('zezo_session='.length)).digest('hex');
+    const persistedActivation = await client.query(`
+      SELECT u.active, u."passwordHash", u.data->>'passwordHash' AS json_password_hash,
+        u.data->>'salt' AS salt, u.data->>'activationHash' AS activation_hash,
+        u.data->>'inviteStatus' AS account_invite_status, i.status AS invitation_status,
+        (SELECT COUNT(*)::int FROM auth_sessions s WHERE s.id = $2 AND s."userId" = u.id AND s."expiresAt" > NOW()) AS session_count,
+        (SELECT COUNT(*)::int FROM audit_entries a WHERE a."actorId" = u.id AND a.action = 'account_activated') AS audit_count,
+        (SELECT COUNT(*)::int FROM system_notifications n WHERE n."userId" <> u.id AND n.data->>'eventKey' = (
+          SELECT 'audit:' || a.id FROM audit_entries a
+          WHERE a."actorId" = u.id AND a.action = 'account_activated'
+          ORDER BY a."createdAt" DESC, a.id DESC LIMIT 1
+        )) AS manager_notification_count
+      FROM user_accounts u JOIN employee_invitations i ON i.id = u.data->>'invitationId'
+      WHERE u.id = $1
+    `, [activation.data.user.id, activatedSessionId]);
+    const activationRow = persistedActivation.rows[0];
+    assert(activationRow?.active === true && Boolean(activationRow.passwordHash) &&
+      Boolean(activationRow.json_password_hash) && Boolean(activationRow.salt) && !activationRow.activation_hash &&
+      activationRow.account_invite_status === 'accepted' && activationRow.invitation_status === 'accepted' &&
+      activationRow.session_count === 1 && activationRow.audit_count === 1 && activationRow.manager_notification_count >= 1,
+      'Activation did not atomically persist the active account, credentials, accepted invitation, session, audit, and manager notification.');
+    if (['marketer', 'developer'].includes(role)) {
+      const referralLinks = await client.query(`
+        SELECT COUNT(*)::int AS link_count,
+          COUNT(*) FILTER (WHERE month = 'legacy' AND data->>'kind' = 'legacy')::int AS legacy_count,
+          COUNT(*) FILTER (WHERE month = $2 AND data->>'kind' = 'monthly')::int AS monthly_count
+        FROM referral_links WHERE "userId" = $1
+      `, [activation.data.user.id, new Date().toISOString().slice(0, 7)]);
+      assert(referralLinks.rows[0]?.legacy_count === 1 && referralLinks.rows[0]?.monthly_count === 1 &&
+        Boolean(activation.data.user.currentReferralCode),
+        `${role} activation did not preserve and initialize the account's referral links.`);
+    }
     const usedActivation = await request('POST', '/api/auth/activate', {
       body: { token: activationToken, password: `Employee!replay${role}${testSuffix}Long` }
     });
     assert(usedActivation.status === 400, 'Employee activation links must remain single-use after reissue.');
-    const employeeCookie = cookieFrom(activation);
+    await request('POST', '/api/auth/logout', { cookie: activationCookie });
+    const username = `pg_${role}_${testSuffix}`;
+    testRateBuckets.push(rateBucket(`login:127.0.0.1:${username}`));
+    const employeeLogin = await request('POST', '/api/auth/login', {
+      body: { username, password: activationPassword, accountType: ['marketer', 'developer'].includes(role) ? 'employee' : 'management' }
+    });
+    assert(employeeLogin.status === 200 && employeeLogin.data.user?.role === role,
+      `Activated ${role} account could not sign in after invitation use (${employeeLogin.status}).`);
+    const employeeCookie = cookieFrom(employeeLogin);
+    results.push(`${role} invitation activation persisted and the employee signed in with the new password`);
     if (['order_manager', 'hr_manager', 'marketing_manager'].includes(role)) {
       const mfaSetup = await request('GET', '/api/auth/mfa/setup', { cookie: employeeCookie });
       assert(mfaSetup.status === 200 && mfaSetup.data.secret, `MFA setup for ${role} failed with ${mfaSetup.status}.`);
