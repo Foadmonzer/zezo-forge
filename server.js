@@ -2172,6 +2172,13 @@ async function handlePostgresCoreWrite(req, res, path) {
   if (!match) return false;
   if (!stagingAuthorized(req)) return false;
 
+  // Core write handlers use a boolean dispatch contract. json() writes the
+  // response but returns undefined, which would otherwise fall through to the
+  // legacy company-wide transaction and wait on its advisory lock.
+  const respond = (status, body, headers) => {
+    json(res, status, body, headers);
+    return true;
+  };
   const security = responseSecurityHeaders();
   const auth = await directPostgresSessionUser(req);
   if (!directRequireAuth(req, res, auth?.user, ['admin'])) return true;
@@ -2207,16 +2214,16 @@ async function handlePostgresCoreWrite(req, res, path) {
     }
   });
 
-  if (result.kind === 'unauthenticated') return json(res, 401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' }, security);
-  if (result.kind === 'forbidden') return json(res, 403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }, security);
-  if (result.kind === 'missing') return json(res, 404, { error: 'الحساب غير موجود / Account not found' }, security);
-  if (result.kind === 'owner_protected') return json(res, 409, { error: 'حساب المالك محمي من تغيير الدور أو الصلاحيات من لوحة التفويض / Owner account is protected from permission changes here' }, security);
-  if (result.kind === 'invalid_role') return json(res, 400, { error: 'اختر دور موظف صالحاً؛ تعيين Owner يحتاج دعوة مالك منفصلة / Choose a valid employee role; Owner accounts require a separate owner invitation' }, security);
-  if (result.kind === 'invalid_permissions') return json(res, 400, { error: 'صيغة الصلاحيات غير صالحة / Invalid permission settings' }, security);
-  if (result.kind === 'unknown_permission') return json(res, 400, { error: `صلاحية غير معروفة / Unknown permission: ${result.key}` }, security);
-  if (result.kind === 'invalid_scope') return json(res, 400, { error: `نطاق غير مسموح / Unsupported scope for ${result.key}` }, security);
+  if (result.kind === 'unauthenticated') return respond(401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' }, security);
+  if (result.kind === 'forbidden') return respond(403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }, security);
+  if (result.kind === 'missing') return respond(404, { error: 'الحساب غير موجود / Account not found' }, security);
+  if (result.kind === 'owner_protected') return respond(409, { error: 'حساب المالك محمي من تغيير الدور أو الصلاحيات من لوحة التفويض / Owner account is protected from permission changes here' }, security);
+  if (result.kind === 'invalid_role') return respond(400, { error: 'اختر دور موظف صالحاً؛ تعيين Owner يحتاج دعوة مالك منفصلة / Choose a valid employee role; Owner accounts require a separate owner invitation' }, security);
+  if (result.kind === 'invalid_permissions') return respond(400, { error: 'صيغة الصلاحيات غير صالحة / Invalid permission settings' }, security);
+  if (result.kind === 'unknown_permission') return respond(400, { error: `صلاحية غير معروفة / Unknown permission: ${result.key}` }, security);
+  if (result.kind === 'invalid_scope') return respond(400, { error: `نطاق غير مسموح / Unsupported scope for ${result.key}` }, security);
   const target = result.target;
-  return json(res, 200, {
+  return respond(200, {
     ok: true,
     user: {
       ...publicUser(target), department: target.department, permissionOverrides: target.permissionOverrides,
@@ -2228,8 +2235,6 @@ async function handlePostgresCoreWrite(req, res, path) {
 async function handle(req, res) {
   if (!postgresConfigured()) return handleRequest(req, res);
   const path = new URL(req.url, `http://localhost:${PORT}`).pathname;
-  const permissionRouteTrace = process.env.ZEZO_PERMISSION_ROUTE_TRACE === 'true' && path.startsWith('/api/admin/permissions/');
-  if (permissionRouteTrace) console.log(`[PERMISSION_ROUTE_TRACE] request method=${req.method} staging=${STAGING_MODE} authorized=${stagingAuthorized(req)}`);
   // Public Owner setup is permanently closed. The first Owner is provisioned
   // only by scripts/provision-owner.mjs with direct administrative DB access.
   if (req.method === 'POST' && path === '/api/setup') return handleRequest(req, res);
@@ -2268,10 +2273,8 @@ async function handle(req, res) {
   const normalizedReadHandled = process.env.ZEZO_BENCH_LEGACY_CORE_READS === 'true'
     ? false
     : await handlePostgresCoreRead(req, res, path);
-  if (permissionRouteTrace) console.log(`[PERMISSION_ROUTE_TRACE] readHandled=${normalizedReadHandled}`);
   if (normalizedReadHandled) return;
   const normalizedWriteHandled = await handlePostgresCoreWrite(req, res, path);
-  if (permissionRouteTrace) console.log(`[PERMISSION_ROUTE_TRACE] writeHandled=${normalizedWriteHandled}`);
   if (normalizedWriteHandled) return;
   if (!path.startsWith('/api/')) {
     return withPostgresTransaction(async client => {
