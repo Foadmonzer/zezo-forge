@@ -423,14 +423,23 @@ try {
       request('PATCH', `/api/admin/permissions/${encodeURIComponent(employees.marketer.id)}`, {
         body: { role: 'marketer', active: true, permissions: { 'conversations.read': 'all' } }, cookie: ownerCookie
       }),
-      new Promise(resolve => setTimeout(() => resolve(null), 1200))
+      new Promise(resolve => setTimeout(async () => {
+        const activity = await client.query(`
+          SELECT wait_event_type, wait_event, left(query, 140) AS query
+          FROM pg_stat_activity
+          WHERE datname = current_database() AND pid <> pg_backend_pid() AND state = 'active'
+            AND backend_type = 'client backend'
+          ORDER BY query_start DESC LIMIT 8
+        `).catch(() => ({ rows: [] }));
+        resolve({ timedOut: true, activity: activity.rows });
+      }, 1200))
     ]);
   } finally {
     await permissionsLockHolder.query('ROLLBACK').catch(() => {});
     await permissionsLockHolder.end();
   }
   assert(permissionChange?.status === 200,
-    `Owner permission changes must not wait behind the legacy global PostgreSQL advisory lock (received ${permissionChange?.status ?? 'timeout'}${permissionChange ? `: ${JSON.stringify(permissionChange.data)}` : ''}).`);
+    `Owner permission changes must not wait behind the legacy global PostgreSQL advisory lock (received ${permissionChange?.status ?? (permissionChange?.timedOut ? 'timeout' : 'no response')}${permissionChange ? `: ${JSON.stringify(permissionChange.data || permissionChange.activity || {})}` : ''}).`);
   console.log(`[SCOPED_API_TIMING] ${JSON.stringify({ path: `/api/admin/permissions/${encodeURIComponent(employees.marketer.id)}`, method: 'PATCH', concurrency: 1, apiMs: Date.now() - permissionStartedAt, globalAdvisoryLockHeld: true })}`);
   assert(permissionChange.data.user?.effectivePermissions?.['conversations.read'] === 'all', 'Permission changes were not effective in the saved response.');
   const permissionPersisted = await client.query(`
