@@ -16,7 +16,7 @@ import { changePostgresPassword, enablePostgresMfa, logoutPostgresSession, setup
 import { acceptPostgresQuote, createPostgresQuote } from './src/server/postgres-conversation-repository.js';
 import { claimNextOutboxMessage, completeOutboxMessage } from './src/server/outbox-repository.js';
 import { createPostgresWithdrawalRequest } from './src/server/postgres-withdrawal-repository.js';
-import { createPostgresEmployeeInvitation } from './src/server/postgres-invitation-repository.js';
+import { createPostgresEmployeeInvitation, revokePostgresEmployeeInvitation, reissuePostgresEmployeeInvitation } from './src/server/postgres-invitation-repository.js';
 import { createPostgresClientRegistration } from './src/server/postgres-client-registration-repository.js';
 import { updatePostgresEmployeePermissions } from './src/server/postgres-permission-repository.js';
 
@@ -2232,6 +2232,76 @@ async function handlePostgresCoreWrite(req, res, path) {
   }, security);
 }
 
+async function handlePostgresInvitationWrite(req, res, path) {
+  const revokeMatch = req.method === 'PATCH' && /^\/api\/admin\/invitations\/[^/]+$/.test(path);
+  const reissueMatch = req.method === 'POST' && /^\/api\/admin\/invitations\/[^/]+\/resend$/.test(path);
+  if (!revokeMatch && !reissueMatch) return false;
+  if (!stagingAuthorized(req)) return false;
+
+  const security = responseSecurityHeaders();
+  const respond = (status, body) => { json(res, status, body, security); return true; };
+  const auth = await directPostgresSessionUser(req);
+  const allowed = reissueMatch ? ['admin', 'hr_manager'] : ['admin'];
+  if (!directRequireAuth(req, res, auth?.user, allowed)) return true;
+  const employeeId = decodeURIComponent(path.split('/').at(reissueMatch ? -2 : -1));
+  const at = now();
+
+  if (revokeMatch) {
+    const body = await jsonBody(req);
+    if (clean(body.status || body.action, 20) !== 'revoked') {
+      return respond(400, { error: 'الإجراء المسموح هو إلغاء الدعوة / Only revoking an invitation is supported' });
+    }
+    const result = await revokePostgresEmployeeInvitation({
+      sessionHash: sessionKey(auth.sid), actorId: auth.user.id, employeeId,
+      auditId: id('evt'), revokedAt: at,
+      authorize: actor => actor.role === 'admin' ? null : { status: 403, error: 'إلغاء الدعوات متاح للمالك فقط / Only the Owner can revoke invitations' }
+    });
+    if (result.kind === 'unauthenticated') return respond(401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' });
+    if (result.kind === 'forbidden') return respond(result.status || 403, { error: result.error || 'ليس لديك صلاحية لإلغاء هذه الدعوة / Not permitted to revoke this invitation' });
+    if (result.kind === 'missing') return respond(404, { error: 'الدعوة غير موجودة / Invitation not found' });
+    if (result.kind === 'accepted') return respond(409, { error: 'تم تفعيل الحساب بالفعل؛ لا يمكن إلغاء دعوته / This account is already active and cannot be revoked as an invitation' });
+    if (result.kind === 'not_pending') return respond(409, { error: 'الدعوة لم تعد معلّقة / Invitation is no longer pending' });
+    return respond(200, { ok: true, user: publicUser(result.employee) });
+  }
+
+  const body = await jsonBody(req);
+  const activation = token(32);
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
+  const mailId = id('mail');
+  const activationUrl = `${siteBase(req)}/activate?token=${encodeURIComponent(activation)}`;
+  const message = `مرحباً،\n\nتم إصدار رابط تفعيل جديد لحسابك في مساحة فريق ZEZO. الرابط صالح لمرة واحدة ولمدة 24 ساعة:\n${activationUrl}\n\nبوابة الفريق: ${siteBase(req)}/team\n\n---\nرسالة تلقائية من ZEZO Forge. يرجى عدم الرد على هذه الرسالة.\nThis is an automated message from ZEZO Forge. Please do not reply.`;
+  const result = await reissuePostgresEmployeeInvitation({
+    sessionHash: sessionKey(auth.sid), actorId: auth.user.id, employeeId,
+    activationHash: hash(activation), activationExpires: Date.parse(expiresAt), expiresAt,
+    issuedAt: at, auditId: id('evt'),
+    outboxMessage: { id: mailId, recipient: null, data: {
+      id: mailId, to: null, recipientType: 'direct', kind: 'team_invitation',
+      subject: 'تجديد دعوة ZEZO', text: message, state: 'pending', attempts: 0,
+      lastError: '', createdAt: at, updatedAt: at
+    } },
+    authorize: (actor, employee) => {
+      if (actor.role === 'hr_manager' &&
+          (employee.inviteCreatedBy !== actor.id || !inviteableEmployeeRoles.includes(employee.role) ||
+           !hasPermission(actor, 'team.invite', { department: 'people' }))) {
+        return { status: 403, error: 'يمكن لمسؤول الموظفين تجديد الدعوات التشغيلية التي أنشأها فقط / HR can only reissue operational invitations they created' };
+      }
+      if (employee.role === 'admin' &&
+          (actor.role !== 'admin' || !actor.mfaEnabledAt || !validTotp(actor.mfaSecret, body.ownerMfaCode))) {
+        return { status: 403, error: 'إعادة دعوة المالك تحتاج رمز تحقق جديداً من تطبيق المصادقة / Reissuing an Owner invitation requires a fresh authenticator code' };
+      }
+      return null;
+    }
+  });
+  if (result.kind === 'unauthenticated') return respond(401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' });
+  if (result.kind === 'forbidden') return respond(result.status || 403, { error: result.error || 'ليس لديك صلاحية لهذه الدعوة / Not permitted to reissue this invitation' });
+  if (result.kind === 'missing') return respond(404, { error: 'الدعوة غير موجودة / Invitation not found' });
+  if (result.kind === 'accepted') return respond(409, { error: 'تم تفعيل الحساب بالفعل؛ لا يمكن إصدار دعوة له / This account is already active and cannot be re-invited' });
+  if (result.kind === 'not_reissuable') return respond(409, { error: 'الدعوة ما زالت صالحة. ألغها أولاً أو انتظر انتهاءها / This invitation is still valid. Revoke it first or wait until it expires' });
+  if (result.kind === 'recently_reissued') return respond(409, { error: 'تم إصدار رابط جديد خلال آخر دقيقة. انتظر دقيقة ثم أعد الإصدار إذا لم يظهر الرابط / A link was issued within the last minute. Wait one minute before reissuing if it is not visible' });
+  if (result.kind === 'duplicate') return respond(409, { error: 'تعذر تدوير رابط الدعوة بسبب تعارض. حدّث القائمة وحاول مرة واحدة / Invitation link rotation conflicted. Refresh the list and retry once' });
+  return respond(200, { ok: true, user: publicUser(result.employee), activationToken: activation, expiresInHours: 24, emailQueued: emailReady() });
+}
+
 async function handle(req, res) {
   if (!postgresConfigured()) return handleRequest(req, res);
   const path = new URL(req.url, `http://localhost:${PORT}`).pathname;
@@ -2274,6 +2344,8 @@ async function handle(req, res) {
     ? false
     : await handlePostgresCoreRead(req, res, path);
   if (normalizedReadHandled) return;
+  const invitationWriteHandled = await handlePostgresInvitationWrite(req, res, path);
+  if (invitationWriteHandled) return;
   const normalizedWriteHandled = await handlePostgresCoreWrite(req, res, path);
   if (normalizedWriteHandled) return;
   if (!path.startsWith('/api/')) {

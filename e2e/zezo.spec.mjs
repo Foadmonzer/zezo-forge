@@ -387,6 +387,33 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   expect(uiInviteRequests).toBe(1);
   await ownerPage.unroute('**/api/admin/invite');
 
+  const uiInviteId = await ownerPage.evaluate(async username => {
+    const response = await fetch('/api/dashboard');
+    const dashboard = await response.json();
+    return dashboard.invitations?.find(invitation => invitation.username === username)?.id || '';
+  }, inviteUsername);
+  expect(uiInviteId).toBeTruthy();
+  const revokeUiInvite = await ownerPage.evaluate(async id => {
+    const response = await fetch(`/api/admin/invitations/${encodeURIComponent(id)}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'revoked' })
+    });
+    return { status: response.status, body: await response.json() };
+  }, uiInviteId);
+  expect(revokeUiInvite.status).toBe(200);
+  await ownerPage.locator('[data-dash-tab="permissions"]').click();
+  await ownerPage.locator('[data-dash-tab="team"]').click();
+  const resendButton = ownerPage.locator(`[data-invitation-resend="${uiInviteId}"]`);
+  await expect(resendButton).toBeVisible();
+  await measureDashboardAction(ownerPage, `/api/admin/invitations/${encodeURIComponent(uiInviteId)}/resend`, 'POST', async () => {
+    await resendButton.click();
+    await expect(resendButton).toBeDisabled();
+    await expect(resendButton).toHaveAttribute('aria-busy', 'true');
+    await expect(ownerPage.locator('#inviteResult [role="status"]')).toContainText('جارٍ إصدار رابط تفعيل جديد');
+  }, async () => {
+    await expect(ownerPage.locator('#inviteResult a[href*="/activate?token="]')).toBeVisible();
+    await expect(ownerPage.locator('#inviteResult [data-copy-invite]')).toBeVisible();
+  });
+
   await ownerPage.locator('[data-dash-tab="permissions"]').click();
   const permissionForm = ownerPage.locator(`[data-permission-form="${marketer.id}"]`);
   await expect(permissionForm).toBeVisible();

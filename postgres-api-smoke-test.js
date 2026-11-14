@@ -378,10 +378,73 @@ try {
       `Invitation for ${role} was not saved atomically with its hashed activation token and durable outbox message.`);
     const duplicateInvite = await inviteRequest();
     assert(duplicateInvite.status === 409, `Replaying the same ${role} invitation must not create a duplicate account.`);
+    let activationToken = invite.data.activationToken;
+    const invitationApiPath = `/api/admin/invitations/${encodeURIComponent(invite.data.user.id)}`;
+    if (role === 'developer') {
+      const rotations = await Promise.all([0, 1].map(() => request('POST', `${invitationApiPath}/resend`, {
+        body: {}, cookie: ownerCookie
+      })));
+      const reissued = rotations.find(value => value.status === 200);
+      assert(reissued?.data.activationToken && rotations.filter(value => value.status === 409).length === 1,
+        'A pending invitation rotation must issue exactly one replacement link under concurrent requests.');
+      const oldToken = await request('POST', '/api/auth/activate', {
+        body: { token: activationToken, password: `Employee!old${role}${testSuffix}Long` }
+      });
+      assert(oldToken.status === 400, 'Rotating a pending invite must invalidate the previous activation link.');
+      activationToken = reissued.data.activationToken;
+      results.push('concurrent rotation of a still-valid invitation produced one new link and invalidated the previous token');
+    }
+    if (role === 'hr_manager') {
+      const revoked = await request('PATCH', invitationApiPath, {
+        body: { status: 'revoked' }, cookie: ownerCookie
+      });
+      assert(revoked.status === 200, `Revoking a pending invitation failed with ${revoked.status}.`);
+      const revokedRow = await client.query(
+        `SELECT i.status, u.data->>'inviteStatus' AS account_status, u.data->>'activationHash' AS activation_hash
+         FROM employee_invitations i JOIN user_accounts u ON u.id = i.data->>'employeeId' WHERE i.id = $1`,
+        [`invitation_${invite.data.user.id}`]
+      );
+      assert(revokedRow.rowCount === 1 && revokedRow.rows[0].status === 'revoked' && revokedRow.rows[0].account_status === 'revoked' && !revokedRow.rows[0].activation_hash,
+        'Revocation must invalidate the token and update both invitation and account state atomically.');
+      const revokedToken = await request('POST', '/api/auth/activate', {
+        body: { token: activationToken, password: `Employee!old${role}${testSuffix}Long` }
+      });
+      assert(revokedToken.status === 400, 'A revoked invitation activation token must not be accepted.');
+      const reissues = await Promise.all([0, 1].map(() => request('POST', `${invitationApiPath}/resend`, {
+        body: {}, cookie: ownerCookie
+      })));
+      const reissued = reissues.find(value => value.status === 200);
+      assert(reissued?.data.activationToken && reissued.data.expiresInHours === 24 && reissues.filter(value => value.status === 409).length === 1,
+        'Reissuing a revoked invitation must return one fresh 24-hour link and reject its concurrent duplicate.');
+      const refreshed = await client.query(
+        `SELECT i.status, i."expiresAt", u.active, u.data->>'activationHash' AS activation_hash,
+          (SELECT count(*)::int FROM employee_invitations i2 WHERE i2.data->>'employeeId' = u.id) AS account_invitation_count,
+          (SELECT count(*)::int FROM outbox_messages o WHERE o.recipient = i.email AND o.data->>'kind' = 'team_invitation') AS invitation_mail_count
+         FROM employee_invitations i JOIN user_accounts u ON u.id = i.data->>'employeeId' WHERE i.id = $1`,
+        [`invitation_${invite.data.user.id}`]
+      );
+      const row = refreshed.rows[0];
+      const remainingMs = new Date(row?.expiresAt).getTime() - Date.now();
+      assert(refreshed.rowCount === 1 && row.status === 'pending' && row.active === false &&
+        row.account_invitation_count === 1 && row.invitation_mail_count === 2 &&
+        row.activation_hash === createHash('sha256').update(reissued.data.activationToken).digest('hex') &&
+        remainingMs > 23 * 60 * 60_000 && remainingMs <= 24 * 60 * 60_000,
+        'Reissue must update the same account and invitation row, hash only the fresh token, and persist a 24-hour expiry/outbox message.');
+      const revokedTokenAgain = await request('POST', '/api/auth/activate', {
+        body: { token: activationToken, password: `Employee!old${role}${testSuffix}Long` }
+      });
+      assert(revokedTokenAgain.status === 400, 'Reissuing a revoked invite must keep the old activation token invalid.');
+      activationToken = reissued.data.activationToken;
+      results.push('invitation revoke and reissue use one existing account, invalidate old tokens, persist one fresh 24-hour token and reject duplicate concurrent reissues');
+    }
     const activation = await request('POST', '/api/auth/activate', {
-      body: { token: invite.data.activationToken, password: `Employee!${role}${testSuffix}Long` }
+      body: { token: activationToken, password: `Employee!${role}${testSuffix}Long` }
     });
     assert(activation.status === 200 && activation.data.user?.role === role, `Employee activation for ${role} failed with ${activation.status}.`);
+    const usedActivation = await request('POST', '/api/auth/activate', {
+      body: { token: activationToken, password: `Employee!replay${role}${testSuffix}Long` }
+    });
+    assert(usedActivation.status === 400, 'Employee activation links must remain single-use after reissue.');
     const employeeCookie = cookieFrom(activation);
     if (['order_manager', 'hr_manager', 'marketing_manager'].includes(role)) {
       const mfaSetup = await request('GET', '/api/auth/mfa/setup', { cookie: employeeCookie });
