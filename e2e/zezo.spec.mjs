@@ -393,15 +393,13 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
     return dashboard.invitations?.find(invitation => invitation.username === username)?.id || '';
   }, inviteUsername);
   expect(uiInviteId).toBeTruthy();
-  const revokeUiInvite = await ownerPage.evaluate(async id => {
-    const response = await fetch(`/api/admin/invitations/${encodeURIComponent(id)}`, {
-      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: 'revoked' })
-    });
-    return { status: response.status, body: await response.json() };
-  }, uiInviteId);
-  expect(revokeUiInvite.status).toBe(200);
-  await ownerPage.locator('[data-dash-tab="permissions"]').click();
+  // A successful invitation displays its one-time link immediately; the list
+  // is refreshed on the next page load. Exercise the visible revoke/reissue UI.
+  await ownerPage.reload();
   await ownerPage.locator('[data-dash-tab="team"]').click();
+  const revokeButton = ownerPage.locator(`[data-invitation-action="revoked"][data-invitation-id="${uiInviteId}"]`);
+  await expect(revokeButton).toBeVisible();
+  await revokeButton.click();
   const resendButton = ownerPage.locator(`[data-invitation-resend="${uiInviteId}"]`);
   await expect(resendButton).toBeVisible();
   await measureDashboardAction(ownerPage, `/api/admin/invitations/${encodeURIComponent(uiInviteId)}/resend`, 'POST', async () => {
