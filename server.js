@@ -3282,7 +3282,9 @@ async function handleRequest(req, res) {
       const auth=requireAuth(req,res,['admin']); if(!auth)return; const b=await jsonBody(req); const lead=store.leads.find(l=>l.id===b.leadId);
       const amount=Number(b.amount); if(!lead||!Number.isFinite(amount)||amount<=0||amount>10000000||!['payment','refund'].includes(b.kind)||b.verified!==true) return json(res,400,{error:'سجّل مبلغاً صحيحاً وأكد التحقق اليدوي / Enter a valid amount and confirm manual verification'},security);
       const idempotencyKey=clean(b.idempotencyKey,80);
-      if(idempotencyKey){if(!/^[a-zA-Z0-9_-]{12,80}$/.test(idempotencyKey))return json(res,400,{error:'مفتاح الحركة غير صالح / Invalid transaction key'},security);const existing=store.payments.find(row=>row.idempotencyKey===idempotencyKey);if(existing)return json(res,200,{payment:existing,lead:safeLead(lead,true),duplicate:true},security);}
+      if(!idempotencyKey)return json(res,400,{error:'مفتاح فريد مطلوب لمنع تكرار الحركة / A unique key is required to prevent duplicate transactions'},security);
+      if(!/^[a-zA-Z0-9_-]{12,80}$/.test(idempotencyKey))return json(res,400,{error:'مفتاح الحركة غير صالح / Invalid transaction key'},security);
+      const existing=store.payments.find(row=>row.idempotencyKey===idempotencyKey);if(existing)return json(res,200,{payment:existing,lead:safeLead(lead,true),duplicate:true},security);
       if(b.kind==='payment'&&(!lead.contractAmount||!['active','waiting_payment','completed'].includes(lead.status))) return json(res,409,{error:'حدّد قيمة العقد وفعّل المشروع قبل تسجيل دفعة / Set the contract amount and activate the project before recording a payment'},security);
       const payment={id:id('pay'),idempotencyKey:idempotencyKey||null,leadId:lead.id,at:now(),kind:b.kind,amount:money(amount),note:clean(b.note,300),verifiedBy:auth.user.username};
       if(b.kind==='refund'){

@@ -854,6 +854,10 @@ try {
     body: { decision: 'accept', note: 'Synthetic acceptance for the database test.' }, cookie: employees.developer.cookie
   });
   assert(developerDecision.status === 200, `Developer could not accept the assigned project (${developerDecision.status}).`);
+  const missingPaymentKey = await request('POST', '/api/admin/payment', {
+    body: { leadId: syntheticLeadId, amount: 1, kind: 'payment', verified: true }, cookie: ownerCookie
+  });
+  assert(missingPaymentKey.status === 400, 'Payment endpoint accepted a payment without an idempotency key.');
   const idempotencyKey = `synthetic_${testSuffix}_payment`;
   const payment = await request('POST', '/api/admin/payment', {
     body: { leadId: syntheticLeadId, amount: 200, kind: 'payment', verified: true, idempotencyKey }, cookie: ownerCookie

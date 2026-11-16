@@ -8,15 +8,28 @@ import { buildWhatsAppUrl, buildTemplateEnquiryMessage } from './whatsapp.js';
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[char]));
+const initialAuthParams = new URLSearchParams(location.search);
+const initialActivationToken = initialAuthParams.get('token') || '';
+const initialVerifyEmailToken = initialAuthParams.get('verifyEmail') || '';
+const initialResetPasswordToken = initialAuthParams.get('resetPassword') || '';
+const initialTrackingToken = initialAuthParams.get('track') || '';
+if (location.pathname === '/activate' || initialActivationToken || initialVerifyEmailToken || initialResetPasswordToken || initialTrackingToken) history.replaceState({}, '', location.pathname);
 const savedMotion = localStorage.getItem('zezo-motion');
 const IS_STAGING_MODE = document.documentElement.dataset.zezoStaging === 'true';
 const state = { lang: 'ar', stagingMode:IS_STAGING_MODE, prices: [], publicConfig: {}, category: 'all', templateService:'all', templateSearch:'', currentTemplate:null, templateCart:0, dashboard: null, dashboardTab: 'overview', notifications:[],notificationUnread:0,notificationAuthenticated:false,notificationFilters:{type:'',status:'unread',from:'',to:''},crmView:'table',crmFilters:{},crmOpenId:'',activationToken: '', resetToken:'', authMode:'team', pendingProjectSubmit:false, pendingTemplate:null,activeConversationId:'',conversationPoll:null, referralCode:'', referralVisitorId:'', referralAnalytics:localStorage.getItem('zezo-referral-analytics')==='yes', referralReport:null, motion: savedMotion === null ? matchMedia('(prefers-reduced-motion: reduce)').matches : savedMotion };
+state.activationToken=initialActivationToken;
+state.resetToken=initialResetPasswordToken;
 let referralViewObserver=null;
 if(savedMotion==='off')document.documentElement.classList.add('motion-allowed');
 const money = amount => Number.isFinite(Number(amount)) ? `${new Intl.NumberFormat(state.lang === 'ar' ? 'ar' : 'en', { maximumFractionDigits: 2 }).format(Number(amount))} ₪` : '—';
 const date = value => { try { return new Intl.DateTimeFormat(state.lang === 'ar' ? 'ar' : 'en', { dateStyle:'medium' }).format(new Date(value)); } catch { return '—'; } };
 const tx = (ar, en) => state.lang === 'ar' ? ar : en;
 const busyDashboardForms = new Set();
+let notificationPreviewPoll = 0;
+function syncNotificationPreviewPolling(){
+  if(state.notificationAuthenticated&&!notificationPreviewPoll)notificationPreviewPoll=setInterval(refreshNotificationPreview,30000);
+  else if(!state.notificationAuthenticated&&notificationPreviewPoll){clearInterval(notificationPreviewPoll);notificationPreviewPoll=0}
+}
 let dashboardRequestsInFlight = 0;
 let dashboardBusyReleaseTimer = 0;
 const dashboardActionFormSelector = [
@@ -70,7 +83,7 @@ const notificationTypeLabels={project:['مشروع','Project'],inquiry:['است�
 function notificationWhen(value){try{return new Intl.DateTimeFormat(state.lang==='ar'?'ar':'en',{dateStyle:'medium',timeStyle:'short'}).format(new Date(value))}catch{return '—'}}
 function notificationEntryHtml(item){const unread=!item.readAt,severity=item.importance==='critical'||item.importance==='high'?tx('مهم','Important'):'';return `<article class="notification-item ${unread?'unread':''}"><button class="notification-open" type="button" data-notification-open="${esc(item.id)}"><b>${esc(state.lang==='ar'?item.titleAr:item.titleEn)}${severity?`<span class="notification-severity">${severity}</span>`:''}</b><small>${esc(state.lang==='ar'?item.descriptionAr:item.descriptionEn)}</small><time>${notificationWhen(item.createdAt)}</time></button>${unread?`<button class="notification-read-one" type="button" data-notification-read="${esc(item.id)}" aria-label="${tx('تحديد كمقروء','Mark as read')}">✓</button>`:''}</article>`}
 function renderNotificationPreview(){const bell=$('#notificationBell'),count=$('#notificationCount'),items=$('#notificationPreview');if(!bell||!count||!items)return;bell.hidden=!state.notificationAuthenticated;if(!state.notificationAuthenticated)return;count.hidden=state.notificationUnread<1;count.textContent=state.notificationUnread>99?'99+':String(state.notificationUnread);bell.setAttribute('aria-label',state.lang==='ar'?`الإشعارات، غير المقروء ${state.notificationUnread}`:`Notifications, ${state.notificationUnread} unread`);items.innerHTML=state.notifications.length?state.notifications.slice(0,6).map(notificationEntryHtml).join(''):`<div class="notification-empty">${tx('لا توجد إشعارات حالياً.','No notifications yet.')}</div>`}
-async function refreshNotificationPreview(){try{const response=await fetch('/api/notifications?limit=8');if(response.status===401){state.notificationAuthenticated=false;state.notifications=[];state.notificationUnread=0;renderNotificationPreview();return}if(!response.ok)return;const data=await response.json();state.notificationAuthenticated=Boolean(data.authenticated);state.notifications=data.notifications||[];state.notificationUnread=Number(data.unreadCount||0);renderNotificationPreview()}catch{}}
+async function refreshNotificationPreview(){try{const response=await fetch('/api/notifications?limit=8');if(response.status===401){state.notificationAuthenticated=false;state.notifications=[];state.notificationUnread=0;renderNotificationPreview();syncNotificationPreviewPolling();return}if(!response.ok)return;const data=await response.json();state.notificationAuthenticated=Boolean(data.authenticated);state.notifications=data.notifications||[];state.notificationUnread=Number(data.unreadCount||0);renderNotificationPreview();syncNotificationPreviewPolling()}catch{}}
 function notificationFiltersMarkup(){const f=state.notificationFilters;return `<form id="notificationFilterForm" class="notification-filters"><label>${tx('النوع','Type')}<select name="type"><option value="">${tx('كل الأنواع','All types')}</option>${Object.entries(notificationTypeLabels).map(([key,label])=>`<option value="${key}" ${f.type===key?'selected':''}>${label[state.lang==='ar'?0:1]}</option>`).join('')}</select></label><label>${tx('الحالة','Status')}<select name="status"><option value="all" ${f.status==='all'?'selected':''}>${tx('الكل','All')}</option><option value="unread" ${f.status==='unread'?'selected':''}>${tx('غير مقروء','Unread')}</option><option value="read" ${f.status==='read'?'selected':''}>${tx('مقروء','Read')}</option></select></label><label>${tx('من تاريخ','From')}<input type="date" name="from" value="${esc(f.from)}"></label><label>${tx('إلى تاريخ','To')}<input type="date" name="to" value="${esc(f.to)}"></label><div class="notification-filter-actions"><button class="small-button accent" type="submit">${tx('تطبيق الفلاتر','Apply filters')}</button><button class="small-button" type="button" id="notificationPageReadAll">${tx('تحديد الكل كمقروء','Mark all read')}</button></div></form>`}
 function notificationCenterMarkup(){return `${pageTitle(tx('مركز الإشعارات','Notification center'),tx('سجل شخصي للإشعارات والتنبيهات المرتبطة بحسابك.','Your personal log of account notifications and alerts.'),'ZEZO / NOTIFY')}${notificationFiltersMarkup()}<div class="notification-list" id="notificationList">${state.notifications.length?state.notifications.map(notificationEntryHtml).join(''):`<div class="notification-empty">${tx('لا توجد إشعارات تطابق هذه الفلاتر.','No notifications match these filters.')}</div>`}</div>`}
 async function loadNotificationCenter(){const content=$('#dashboardContent');if(!content)return;try{const params=new URLSearchParams({...state.notificationFilters,limit:'100'});const response=await fetch(`/api/notifications?${params}`);if(!response.ok)throw new Error('Could not load notifications');const data=await response.json();state.notifications=data.notifications||[];state.notificationUnread=Number(data.unreadCount||0);state.notificationAuthenticated=true;renderNotificationPreview();if(state.dashboardTab==='notifications'){content.innerHTML=notificationCenterMarkup();content.scrollTop=0}}catch(error){const list=$('#notificationList');if(list)list.innerHTML=`<div class="notification-empty">${tx('تعذر تحميل سجل الإشعارات. حاول التحديث.','Could not load notifications. Try again.')}</div>`}}
@@ -100,6 +113,7 @@ function openWhatsAppWindow(url){
 }
 function openWhatsAppEnquiry(message,resourceId='',kind='orders'){
   const phone=whatsappPhone(kind);if(!phone){showToast(tx('واتساب غير مربوط حالياً.','WhatsApp is not connected yet.'),true);return}
+  window.zezoAnalyticsCapture?.('begin_enquiry',{source:'whatsapp',kind});
   const followupId=shortToken('ZRI-'),parts=[message,`ZEZO ${tx('رقم المتابعة','follow-up ID')}: ${followupId}`];
   if(state.referralCode)parts.push(`${tx('رمز الإحالة','Referral code')}: ${state.referralCode}`);
   emitReferralEvent('whatsapp_click',resourceId,followupId);openWhatsAppWindow(buildWhatsAppUrl(phone,parts.join('\n')));
@@ -107,6 +121,7 @@ function openWhatsAppEnquiry(message,resourceId='',kind='orders'){
 function openTemplateWhatsApp(item,action='customize'){
   if(!item)return;
   const phone=whatsappPhone('orders');if(!phone){showToast(tx('واتساب قسم الطلبات غير مربوط حالياً.','Orders WhatsApp is not connected yet.'),true);return}
+  window.zezoAnalyticsCapture?.('begin_enquiry',{source:'template_whatsapp',template_id:item.id,action});
   const followupId=shortToken('ZRI-'),message=buildTemplateEnquiryMessage({title:item.title[state.lang],code:item.code,price:state.publicConfig.templatePrices?.[item.id],referralCode:state.referralCode,language:state.lang});
   const actionLine=state.lang==='ar'?`نوع الطلب: ${action==='order'?'طلب قالب':'تخصيص قالب'}`:`Request type: ${action==='order'?'Template request':'Template customization'}`;
   const text=[message,actionLine,`ZEZO ${tx('رقم المتابعة','follow-up ID')}: ${followupId}`].join('\n');
@@ -115,7 +130,7 @@ function openTemplateWhatsApp(item,action='customize'){
 function setAnalyticsConsent(allowed){
   const revokeId=state.referralVisitorId||localStorage.getItem('zezo-referral-visitor');
   if(!allowed&&state.referralAnalytics&&revokeId){const body=JSON.stringify({visitorId:revokeId});if(navigator.sendBeacon)navigator.sendBeacon('/api/referral-consent/revoke',new Blob([body],{type:'application/json'}));else fetch('/api/referral-consent/revoke',{method:'POST',headers:{'Content-Type':'application/json'},body,keepalive:true}).catch(()=>{})}
-  state.referralAnalytics=allowed;localStorage.setItem('zezo-referral-analytics',allowed?'yes':'no');
+  state.referralAnalytics=allowed;localStorage.setItem('zezo-referral-analytics',allowed?'yes':'no');window.dispatchEvent(new CustomEvent('zezo-analytics-consent',{detail:{allowed}}));
   const banner=$('#analyticsConsent');if(banner)banner.hidden=true;
   if(allowed){state.referralVisitorId=localStorage.getItem('zezo-referral-visitor')||shortToken('V');localStorage.setItem('zezo-referral-visitor',state.referralVisitorId);const prior=savedReferral();if(state.referralCode&&!prior)localStorage.setItem(referralStorageKey,JSON.stringify({code:state.referralCode,expiresAt:Date.now()+30*86400000}));if(prior)state.referralCode=prior.code;if(state.referralCode)emitReferralEvent('visit');syncReferralField();observeReferralCards()}
   else{localStorage.removeItem(referralStorageKey);localStorage.removeItem('zezo-referral-visitor');state.referralCode=(new URLSearchParams(location.search).get('ref')||'').trim();referralViewObserver?.disconnect();referralViewObserver=null;$$('[data-referral-observed]').forEach(element=>delete element.dataset.referralObserved);syncReferralField()}
@@ -129,7 +144,7 @@ function initReferralIntelligence(){
 }
 function observeReferralCards(){
   if(!state.referralAnalytics||!('IntersectionObserver'in window))return;
-  if(!referralViewObserver)referralViewObserver=new IntersectionObserver(entries=>{for(const entry of entries){if(!entry.isIntersecting)continue;const element=entry.target,type=element.hasAttribute('data-service-card')?'service_view':'template_view',id=element.dataset.serviceCard||element.dataset.templateId;emitReferralEvent(type,id);element.dataset.referralObserved='true';referralViewObserver.unobserve(element)}},{threshold:.45});
+  if(!referralViewObserver)referralViewObserver=new IntersectionObserver(entries=>{for(const entry of entries){if(!entry.isIntersecting)continue;const element=entry.target,isService=element.hasAttribute('data-service-card'),type=isService?'service_view':'template_view',id=element.dataset.serviceCard||element.dataset.templateId;emitReferralEvent(type,id);window.zezoAnalyticsCapture?.(type,isService?{service_id:id}:{template_id:id});element.dataset.referralObserved='true';referralViewObserver.unobserve(element)}},{threshold:.45});
   $$('[data-service-card], [data-template-id]').filter(element=>!element.dataset.referralObserved).forEach(element=>referralViewObserver.observe(element));
 }
 
@@ -211,6 +226,7 @@ function renderTemplateLibrary(){
   $('#templateTotal').textContent=String(list.length).padStart(2,'0')+' / 40';
 }
 function setTemplateRequest(id,action){
+  window.zezoAnalyticsCapture?.('begin_enquiry',{source:'template',template_id:id,action});
   const item=templateById.get(id);if(!item)return;
   state.pendingTemplate={id:item.id,action};$('#templateOrderTitle').textContent=item.title[state.lang];$('#templateOrderPrice').textContent=templatePriceText(item);$('#templateOrderModal').classList.add('open');$('#templateOrderModal').setAttribute('aria-hidden','false');document.body.style.overflow='hidden';return;
   (document.getElementById('zezo-legacy-root')||document.body).classList.remove('template-preview-mode');
@@ -480,9 +496,9 @@ function showCustomerView(view='choices'){
 function openAuth(mode='team'){
   state.authMode=location.pathname==='/team'?'team':mode==='client'?'client':'team';$('#customerAccessPanel').hidden=state.authMode!=='client';$('#loginPanel').hidden=state.authMode==='client';$('#activatePanel').hidden=true;$('#firstPasswordChangePanel').hidden=true;$('#mfaSetupPanel').hidden=true;showCustomerView('choices');
   const title=$('#authTitle'),lede=$('.auth-lede');if(state.authMode==='team'){title.dataset.ar='مساحة فريق ZEZO';title.dataset.en='ZEZO Team Portal';lede.dataset.ar='دخول آمن للحسابات المعتمدة من الإدارة فقط.';lede.dataset.en='Secure sign-in for management-approved accounts only.'}else{title.dataset.ar='حسابي';title.dataset.en='My account';lede.dataset.ar='سجّل الدخول أو أنشئ حساب عميل جديد.';lede.dataset.en='Sign in or create a new client account.'}applyLanguage();
-  const params=new URLSearchParams(location.search);state.activationToken=params.get('token')||'';
+  state.activationToken=initialActivationToken;
   if(location.pathname==='/activate'||state.activationToken){$('#customerAccessPanel').hidden=true;$('#loginPanel').hidden=true;$('#firstPasswordChangePanel').hidden=true;$('#activatePanel').hidden=false;setModal(true);return}
-  if(params.has('resetPassword')){state.resetToken=params.get('resetPassword')||'';$('#customerAccessPanel').hidden=false;$('#loginPanel').hidden=true;showCustomerView('reset');setModal(true);return}
+  if(state.resetToken){$('#customerAccessPanel').hidden=false;$('#loginPanel').hidden=true;showCustomerView('reset');setModal(true);return}
   fetch('/api/dashboard').then(async r=>{if(r.ok){const data=await r.json(),isClient=data.role==='client';if((state.authMode==='client')!==isClient){setModal(true);return}state.dashboard=data;if(isClient)fillClientContact(data.profile);state.dashboardTab=dashboardTabForRole(state.dashboard.role);renderDashboard(state.dashboard,state.dashboardTab);openDashboard()}else setModal(true)}).catch(()=>setModal(true));
 }
 const sensitiveManagementRole=role=>['admin','marketing_manager','hr_manager'].includes(role);
@@ -862,7 +878,7 @@ document.addEventListener('click',async event=>{
   const clientQuote=event.target.closest('[data-client-quote-accept]');if(clientQuote){try{await postJson(`/api/client/orders/${encodeURIComponent(clientQuote.dataset.clientQuoteAccept)}/quote-accept`,{});await refreshDashboard('orders');showToast(tx('تم قبول عرض السعر وتحديث حالة طلبك.','Quote accepted and request status updated.'))}catch(e){showToast(e.message,true)}return}
   if(event.target.closest('[data-client-new-request]')){setDashboardOpen(false);$('#contact').scrollIntoView({behavior:state.motion?'auto':'smooth'});$('#serviceSelect').focus();return}
   const serviceToggle=event.target.closest('[data-service-toggle]');if(serviceToggle){const card=serviceToggle.closest('.service-card'),open=!card.classList.contains('is-open');card.classList.toggle('is-open',open);serviceToggle.setAttribute('aria-expanded',String(open));return}
-  const selectService=event.target.closest('[data-select-service]');if(selectService){event.preventDefault();$('#serviceSelect').value=selectService.dataset.selectService;updateCategoryOptions();$('#contact').scrollIntoView({behavior:state.motion?'auto':'smooth'});$('#serviceSelect').focus();return}
+  const selectService=event.target.closest('[data-select-service]');if(selectService){window.zezoAnalyticsCapture?.('begin_enquiry',{source:'service',service_id:selectService.dataset.selectService});event.preventDefault();$('#serviceSelect').value=selectService.dataset.selectService;updateCategoryOptions();$('#contact').scrollIntoView({behavior:state.motion?'auto':'smooth'});$('#serviceSelect').focus();return}
   const selectCategory=event.target.closest('[data-select-category]');if(selectCategory){event.preventDefault();const [serviceId,categoryId]=selectCategory.dataset.selectCategory.split(':');$('#serviceSelect').value=serviceId;updateCategoryOptions();$('#categorySelect').value=categoryId;$('#detailsField').value=categoryId==='audit'?tx('أرغب بتحليل مصغّر مجاني لهذه الصفحة: ','I would like a free mini review of this page: '):categoryId==='maintenance'?tx('أرغب بمعرفة نطاق وخيارات الصيانة الشهرية لموقعي.','I would like to discuss monthly maintenance options for my site.'):tx('أنا طالب أو أعمل على مشروع ناشئ، وأرغب بمناقشة نطاق مناسب.','I am a student or working on an early-stage project and would like to discuss a suitable scope.');$('#contact').scrollIntoView({behavior:state.motion?'auto':'smooth'});$('#detailsField').focus();return}
   const startRequest=event.target.closest('[data-start-request]');if(startRequest){event.preventDefault();$('#contact').scrollIntoView({behavior:state.motion?'auto':'smooth'});$('#serviceSelect').focus();return}
   const filter=event.target.closest('[data-work-filter]');if(filter){state.category=filter.dataset.workFilter;renderWork();return}
@@ -885,7 +901,7 @@ document.addEventListener('click',async event=>{
   if(event.target.closest('#whatsappOrder')){const phone=whatsappPhone('orders');if(!phone){showToast(tx('واتساب قسم الطلبات غير مربوط بعد.','Orders WhatsApp is not connected yet.'),true);return}const data=new FormData($('#projectForm')),followupId=shortToken('ZRI-'),parts=[tx('طلب إلى ZEZO','Enquiry to ZEZO'),`${tx('الخدمة','Service')}: ${$('#serviceSelect').selectedOptions[0]?.textContent||'—'}`,`${tx('التفاصيل','Details')}: ${data.get('details')||'—'}`,`ZEZO ${tx('رقم المتابعة','follow-up ID')}: ${followupId}`];if(state.referralCode)parts.push(`${tx('رمز الإحالة','Referral code')}: ${state.referralCode}`);emitReferralEvent('whatsapp_click',$('#serviceSelect').value||'',followupId);openWhatsAppWindow(buildWhatsAppUrl(phone,parts.join('\n')));return}
   const supportLink=event.target.closest('#customerSupport');if(supportLink){const phone=whatsappPhone('support');if(!phone){event.preventDefault();showToast(tx('خدمة العملاء عبر واتساب غير متاحة حالياً.','Customer support WhatsApp is unavailable right now.'),true);return}const followupId=shortToken('ZRI-'),parts=[tx('مرحباً ZEZO، أود الاستفسار عن خدماتكم.','Hello ZEZO, I would like to ask about your services.'),`ZEZO ${tx('رقم المتابعة','follow-up ID')}: ${followupId}`];if(state.referralCode)parts.push(`${tx('رمز الإحالة','Referral code')}: ${state.referralCode}`);supportLink.href=buildWhatsAppUrl(phone,parts.join('\n'));emitReferralEvent('whatsapp_click','',followupId);return}
   const userActive=event.target.closest('[data-user-active]');if(userActive){try{await fetch(`/api/admin/team/${encodeURIComponent(userActive.dataset.userActive)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:userActive.dataset.active==='true'})}).then(async r=>{let d=await r.json();if(!r.ok)throw new Error(d.error)});await refreshDashboard(state.dashboard.role==='hr_manager'?'people':'team');showToast(tx('تم تحديث حساب الموظف.','Employee account updated.'))}catch(e){showToast(e.message,true)}return}
-  if(event.target.closest('#dashboardLogout')){try{await postJson('/api/auth/logout',{});state.dashboard=null;state.notificationAuthenticated=false;state.notifications=[];state.notificationUnread=0;renderNotificationPreview();setDashboardOpen(false);if(location.pathname==='/team')openAuth('team');showToast(tx('تم تسجيل الخروج.','You are signed out.'))}catch(e){showToast(e.message,true)}return}
+  if(event.target.closest('#dashboardLogout')){try{await postJson('/api/auth/logout',{});state.dashboard=null;state.notificationAuthenticated=false;state.notifications=[];state.notificationUnread=0;syncNotificationPreviewPolling();renderNotificationPreview();setDashboardOpen(false);if(location.pathname==='/team')openAuth('team');showToast(tx('تم تسجيل الخروج.','You are signed out.'))}catch(e){showToast(e.message,true)}return}
 });
 
 document.addEventListener('change',async event=>{if(event.target===$('#serviceSelect'))updateCategoryOptions();if(event.target===$('#clientStudentSelect'))$('#clientUniversityField').hidden=event.target.value!=='true';const roleSelect=event.target.closest('[data-user-role]');if(roleSelect){try{await fetch(`/api/admin/team/${encodeURIComponent(roleSelect.dataset.userRole)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({role:roleSelect.value})}).then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.error)});await refreshDashboard('team');showToast(tx('تم تحديث دور الموظف.','Employee role updated.'))}catch(e){showToast(e.message,true);await refreshDashboard('team')}}});
@@ -923,6 +939,7 @@ document.addEventListener('submit',async event=>{
           :tx('تم حفظ الطلب، لكن البريد غير مفعّل حالياً؛ احتفظ برابط المتابعة أدناه.','Your request was saved, but email is not configured yet; keep the tracking link below.');
         result.innerHTML=esc(mailNote)+' <a class="form-track-link" href="'+esc(trackingUrl.toString())+'">'+tx('متابعة الطلب ↗','Track your request ↗')+'</a>';
       }else result.textContent=tx('وصلنا طلبك.','Your request was received.');
+      window.zezoAnalyticsCapture?.('enquiry_submitted',{service_id:$('#serviceSelect').value||'',template_id:form.elements.templateId.value||'',template_action:form.elements.templateAction.value||''});
       result.focus?.();
     }catch(error){result.classList.add('error');result.textContent=error.message}
     finally{button.disabled=false}
@@ -1019,7 +1036,7 @@ $('#year').textContent=new Date().getFullYear();
 $('#serviceSelect').addEventListener('change',updateCategoryOptions);
 $('#dashboardClose').addEventListener('click',()=>setDashboardOpen(false));
 $('#dashboardLogout').addEventListener('click',()=>{});
-renderServices();renderWork();applyLanguage();loadPublic();observeReveals();setupHero();setupAboutMark();initReferralIntelligence();refreshNotificationPreview();setInterval(refreshNotificationPreview,30000);
+renderServices();renderWork();applyLanguage();loadPublic();observeReveals();setupHero();setupAboutMark();initReferralIntelligence();refreshNotificationPreview();
 document.addEventListener('input',event=>{if(event.target===$('#templateSearch'))updateTemplateFilters();if(event.target.id==='studentSearch')$$('#studentList li').forEach(li=>li.hidden=!li.textContent.toLowerCase().includes(event.target.value.toLowerCase()));if(event.target.id==='demoPropertySearch'){const q=event.target.value.toLowerCase(),type=$('#demoPropertyType')?.value||'all';$$('.property-card').forEach(card=>card.hidden=!card.dataset.demoSearchItem.includes(q)||(type!=='all'&&card.dataset.property!==type))}});
 document.addEventListener('click',async event=>{
   if(event.target.closest('[data-close-template-order]')){closeTemplateOrder();return}
@@ -1089,10 +1106,9 @@ document.addEventListener('submit',async event=>{
 });
 const previewId=new URLSearchParams(location.search).get('preview');if(previewId&&templateById.has(previewId))renderTemplatePreview(templateById.get(previewId));
 const requestId=new URLSearchParams(location.search).get('templateRequest');if(requestId&&templateById.has(requestId))setTimeout(()=>setTemplateRequest(requestId,new URLSearchParams(location.search).get('templateAction')||'order'),0);
-const trackingTokenFromUrl=new URLSearchParams(location.search).get('track');if(trackingTokenFromUrl)showTracking(trackingTokenFromUrl);
-const initialAuthParams=new URLSearchParams(location.search);
-if(location.pathname==='/activate'||initialAuthParams.has('token')){state.activationToken=initialAuthParams.get('token')||'';$('#loginPanel').hidden=true;$('#firstPasswordChangePanel').hidden=true;$('#activatePanel').hidden=false;setModal(true)}
-else if(initialAuthParams.has('verifyEmail')){state.authMode='client';$('#customerAccessPanel').hidden=false;$('#loginPanel').hidden=true;showCustomerView('login');setModal(true);postJson('/api/auth/verify-email',{token:initialAuthParams.get('verifyEmail')||''}).then(()=>{history.replaceState({},'',location.pathname);return openClientWorkspace()}).catch(error=>{$('#clientLoginError').textContent=error.message})}
-else if(initialAuthParams.has('resetPassword'))openAuth('client');
+if(initialTrackingToken)showTracking(initialTrackingToken);
+if(location.pathname==='/activate'||initialActivationToken){$('#loginPanel').hidden=true;$('#firstPasswordChangePanel').hidden=true;$('#activatePanel').hidden=false;setModal(true)}
+else if(initialVerifyEmailToken){state.authMode='client';$('#customerAccessPanel').hidden=false;$('#loginPanel').hidden=true;showCustomerView('login');setModal(true);postJson('/api/auth/verify-email',{token:initialVerifyEmailToken}).then(()=>openClientWorkspace()).catch(error=>{$('#clientLoginError').textContent=error.message})}
+else if(initialResetPasswordToken)openAuth('client');
 else if(location.pathname==='/team'){document.body.classList.add('team-portal-route');openAuth('team')}
 

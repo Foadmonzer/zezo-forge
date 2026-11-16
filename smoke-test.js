@@ -555,6 +555,7 @@ try {
   assertStatus(await call(app.handle,'GET','/api/admin/attachment/'+lead.id+'/0',{cookie:developer.cookie}),200,'assigned developer can access files after accepting task');
   assertStatus(await call(app.handle,'POST',`/api/developer/projects/${lead.id}/decision`,{cookie:developer.cookie,body:{decision:'accept'}}),404,'developer cannot accept the same task twice');
   const depositKey='PAYMENT-RETRY-0001';
+  assertStatus(await call(app.handle,'POST','/api/admin/payment',{cookie:adminCookie,body:{leadId:lead.id,amount:1,kind:'payment',note:'Missing idempotency key test',verified:true}}),400,'payment requires an idempotency key');
   const deposit = await call(app.handle, 'POST', '/api/admin/payment', { cookie:adminCookie, body:{leadId:lead.id,amount:100,kind:'payment',note:'Temporary test',verified:true,idempotencyKey:depositKey} });
   assertStatus(deposit, 201, 'verified deposit');
   const repeatedDeposit=await call(app.handle,'POST','/api/admin/payment',{cookie:adminCookie,body:{leadId:lead.id,amount:100,kind:'payment',note:'Retry after timeout',verified:true,idempotencyKey:depositKey}});
@@ -562,7 +563,7 @@ try {
   assert.equal(asJson(repeatedDeposit).lead.paidTotal,100,'payment retry cannot double-charge the local ledger');
   assert.equal(asJson(deposit).lead.commissionStatus, 'none', 'commission should not accrue until the contract is fully paid');
   assert.equal(asJson(await call(app.handle, 'GET', '/api/dashboard', { cookie:marketer.cookie })).summary.confirmed, 0);
-  const balance = await call(app.handle, 'POST', '/api/admin/payment', { cookie:adminCookie, body:{leadId:lead.id,amount:200,kind:'payment',note:'Temporary test',verified:true} });
+  const balance = await call(app.handle, 'POST', '/api/admin/payment', { cookie:adminCookie, body:{leadId:lead.id,amount:200,kind:'payment',note:'Temporary test',verified:true,idempotencyKey:'PAYMENT-FINAL-0002'} });
   assertStatus(balance, 201, 'verified final payment');
   assert.equal(asJson(balance).lead.commissionStatus, 'pending','fully paid referral commission waits for project completion');
   assert.equal(asJson(balance).lead.commissionAmount, 45);
@@ -632,7 +633,7 @@ try {
   assertStatus(await call(app.handle,'PATCH',`/api/admin/leads/${secondDeveloperLead.id}`,{cookie:adminCookie,body:{status:'active',contractAmount:100,developerUserId:developer.user.id}}),200,'owner assigns a second small project');
   assertStatus(await call(app.handle,'POST',`/api/developer/projects/${secondDeveloperLead.id}/decision`,{cookie:developer.cookie,body:{decision:'accept'}}),200,'developer accepts the second project');
   assertStatus(await call(app.handle,'PATCH',`/api/admin/leads/${secondDeveloperLead.id}`,{cookie:adminCookie,body:{status:'completed'}}),200,'owner marks second project complete');
-  assertStatus(await call(app.handle,'POST','/api/admin/payment',{cookie:adminCookie,body:{leadId:secondDeveloperLead.id,amount:100,kind:'payment',note:'Temporary developer test',verified:true}}),201,'owner records second project collection');
+  assertStatus(await call(app.handle,'POST','/api/admin/payment',{cookie:adminCookie,body:{leadId:secondDeveloperLead.id,amount:100,kind:'payment',note:'Temporary developer test',verified:true,idempotencyKey:'PAYMENT-SECOND-DEV-0001'}}),201,'owner records second project collection');
   assertStatus(await call(app.handle,'PATCH',`/api/developer/projects/${secondDeveloperLead.id}`,{cookie:developer.cookie,body:{status:'review_requested'}}),200,'developer requests review for second project');
   assertStatus(await call(app.handle,'PATCH',`/api/admin/developer-projects/${secondDeveloperLead.id}/review`,{cookie:adminCookie,body:{decision:'approved'}}),200,'owner approves second project delivery');
   const developerWithdrawalResponse=await call(app.handle,'POST','/api/marketer/withdrawals',{cookie:developer.cookie,body:{amount:100,method:'binance'}});
@@ -693,7 +694,7 @@ try {
   const projectComplete=await call(app.handle,'PATCH',`/api/admin/projects/${lifecycleId}/stage`,{cookie:adminCookie,body:{stage:'completed',note:'Project accepted and closed.'}});
   assertStatus(projectComplete,200,'owner completes delivery separately from payment');
   assert.equal(asJson(projectComplete).lead.developerCommissionAmount,0,'completion alone does not pay an uncollected developer entitlement');
-  const lifecyclePayment=await call(app.handle,'POST','/api/admin/payment',{cookie:adminCookie,body:{leadId:lifecycleId,amount:300,kind:'payment',note:'Lifecycle test verified receipt',verified:true}});
+  const lifecyclePayment=await call(app.handle,'POST','/api/admin/payment',{cookie:adminCookie,body:{leadId:lifecycleId,amount:300,kind:'payment',note:'Lifecycle test verified receipt',verified:true,idempotencyKey:'PAYMENT-LIFECYCLE-0001'}});
   assertStatus(lifecyclePayment,201,'owner records verified project collection');
   assert.equal(asJson(lifecyclePayment).lead.developerCommissionRate,25,'verified payment retains the agreed 25% rate');
   assert.equal(asJson(lifecyclePayment).lead.developerCommissionAmount,75,'eligible collected amount of 300 ILS yields 75 ILS implementation commission');
@@ -717,7 +718,7 @@ try {
     const leadId=asJson(order).id;
     assertStatus(await call(app.handle,'PATCH',`/api/admin/leads/${leadId}`,{cookie:adminCookie,body:{status:'active',contractAmount:amount}}),200,`rank test agreement ${sequence}`);
     assertStatus(await call(app.handle,'PATCH',`/api/admin/leads/${leadId}`,{cookie:adminCookie,body:{status:'completed'}}),200,`rank project completion ${sequence}`);
-    const payment=await call(app.handle,'POST','/api/admin/payment',{cookie:adminCookie,body:{leadId,amount,kind:'payment',note:'Temporary rank test',verified:true}});
+    const payment=await call(app.handle,'POST','/api/admin/payment',{cookie:adminCookie,body:{leadId,amount,kind:'payment',note:'Temporary rank test',verified:true,idempotencyKey:`RANK-SALE-${sequence}-${randomBytes(6).toString('hex')}`}});
     assertStatus(payment,201,`rank test paid sale ${sequence}`);
     return asJson(payment).lead;
   }
@@ -760,7 +761,7 @@ try {
   assert.match(privateFile.bytes.toString('utf8'), /^%PDF-1\.4/);
   const forbiddenFile = await call(app.handle, 'GET', `/api/admin/attachment/${lead.id}/0`, { cookie:marketer.cookie });
   assertStatus(forbiddenFile, 403, 'marketer attachment boundary');
-  const refund = await call(app.handle, 'POST', '/api/admin/payment', { cookie:adminCookie, body:{leadId:lead.id,amount:50,kind:'refund',note:'Temporary test reversal',verified:true} });
+  const refund = await call(app.handle, 'POST', '/api/admin/payment', { cookie:adminCookie, body:{leadId:lead.id,amount:50,kind:'refund',note:'Temporary test reversal',verified:true,idempotencyKey:'PAYMENT-REFUND-0001'} });
   assertStatus(refund, 201, 'verified refund');
   assert.equal(asJson(refund).lead.commissionStatus, 'reversed');
   assert.equal(asJson(await call(app.handle,'GET','/api/dashboard',{cookie:marketer.cookie})).summary.debt,7.5,'partial refunds after payout create a balance offset');
