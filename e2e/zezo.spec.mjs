@@ -439,7 +439,15 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await revokeButton.click();
   const resendButton = ownerPage.locator(`[data-invitation-resend="${uiInviteId}"]`);
   await expect(resendButton).toBeVisible();
-  await measureDashboardAction(ownerPage, `/api/admin/invitations/${encodeURIComponent(uiInviteId)}/resend`, 'POST', async () => {
+  const resendPath = `/api/admin/invitations/${encodeURIComponent(uiInviteId)}/resend`;
+  // Keep the server response pending long enough to assert the visible busy
+  // state; the synthetic database can otherwise finish before Playwright's
+  // next locator check runs.
+  await ownerPage.route(`**${resendPath}`, async route => {
+    await new Promise(resolve => setTimeout(resolve, 400));
+    await route.continue();
+  });
+  await measureDashboardAction(ownerPage, resendPath, 'POST', async () => {
     await resendButton.click();
     await expect(resendButton).toBeDisabled();
     await expect(resendButton).toHaveAttribute('aria-busy', 'true');
@@ -448,6 +456,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
     await expect(ownerPage.locator('#inviteResult a[href*="/activate?token="]')).toBeVisible();
     await expect(ownerPage.locator('#inviteResult [data-copy-invite]')).toBeVisible();
   });
+  await ownerPage.unroute(`**${resendPath}`);
 
   await ownerPage.locator('[data-dash-tab="permissions"]').click();
   const permissionForm = ownerPage.locator(`[data-permission-form="${marketer.id}"]`);
