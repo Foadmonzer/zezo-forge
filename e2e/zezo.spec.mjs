@@ -437,7 +437,9 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   const revokeButton = ownerPage.locator(`[data-invitation-action="revoked"][data-invitation-id="${uiInviteId}"]`);
   await expect(revokeButton).toBeVisible();
   await revokeButton.click();
-  const resendButton = ownerPage.locator(`[data-invitation-resend="${uiInviteId}"]`);
+  const resendButton = ownerPage.locator(`[data-invitation-resend="${uiInviteId}"][data-invitation-status="revoked"]`);
+  // The revoke click starts an async API call; wait for its refreshed status
+  // before reissuing, otherwise a pending invite still opens a confirmation.
   await expect(resendButton).toBeVisible();
   const resendPath = `/api/admin/invitations/${encodeURIComponent(uiInviteId)}/resend`;
   // Keep the server response pending long enough to assert the visible busy
