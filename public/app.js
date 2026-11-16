@@ -78,7 +78,7 @@ const dashboardActionFormSelector = [
 ].join(',');
 function releaseDashboardBusyForms(){
   for(const form of busyDashboardForms){
-    form.dataset.zezoBusy='false';form.removeAttribute('aria-busy');
+    delete form.dataset.zezoSubmitCaptured;form.removeAttribute('aria-busy');
     form.querySelectorAll('button[type="submit"]').forEach(button=>{button.disabled=false;button.removeAttribute('aria-busy')});
     if(form.nextElementSibling?.matches('.zezo-submit-status'))form.nextElementSibling.remove();
   }
@@ -101,10 +101,12 @@ window.fetch=(...args)=>{
 document.addEventListener('submit',event=>{
   const form=event.target;
   if(!(form instanceof HTMLFormElement)||!form.matches(dashboardActionFormSelector))return;
-  if(form.dataset.zezoBusy==='true'){
+  if(form.dataset.zezoSubmitCaptured==='true'||form.dataset.zezoBusy==='true'){
     event.preventDefault();event.stopImmediatePropagation();return;
   }
-  form.dataset.zezoBusy='true';form.setAttribute('aria-busy','true');busyDashboardForms.add(form);
+  // Keep the capture-phase retry guard separate from handler-owned zezoBusy.
+  // The bubble-phase submit handler must still process this first submission.
+  form.dataset.zezoSubmitCaptured='true';form.setAttribute('aria-busy','true');busyDashboardForms.add(form);
   form.querySelectorAll('button[type="submit"]').forEach(button=>button.setAttribute('aria-busy','true'));
   form.querySelectorAll('button[type="submit"]').forEach(button=>{button.disabled=true;button.setAttribute('aria-busy','true')});
   let status=form.nextElementSibling;
