@@ -19,6 +19,8 @@ body.reduced-motion *,body.reduced-motion *:before,body.reduced-motion *:after{s
 @media(max-width:410px){.service-grid{grid-template-columns:1fr}.service-card{min-height:0}.service-card>p{min-height:0}.service-card h3{margin:20px 0 8px}.service-expand{margin-top:14px}.work-grid{grid-template-columns:1fr}.work-thumb{height:220px}.form-row{grid-template-columns:1fr}.hero-buttons .button{width:100%;justify-content:space-between}.footer-meta{font-size:8px}.motion-toggle,.footer-team{font-size:8px}.project-form{padding:16px 12px}}
 @media(prefers-reduced-motion:reduce){html:not(.motion-allowed) *,html:not(.motion-allowed) *:before,html:not(.motion-allowed) *:after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}html:not(.motion-allowed) .reveal{opacity:1;transform:none}}
 .demo-stamp{position:absolute;top:11px;inset-inline-end:11px;padding:4px 6px;border:1px solid rgba(163,255,18,.4);background:rgba(5,7,10,.72);color:var(--lime);font:8px monospace;letter-spacing:.14em;z-index:2}
+.main-nav .mobile-account-link{display:none}
+@media(max-width:760px){.main-nav .mobile-account-link{display:block;width:100%;padding:13px 2px;margin-top:5px;text-align:start;border:0;border-top:1px solid rgba(163,255,18,.25);background:transparent;color:var(--lime);font-size:12px;font-weight:650;cursor:pointer}}
 
 /* Large, continuously turning Saturn scene for the landing hero */
 .hero{min-height:min(900px,calc(100svh - 82px));padding-top:34px;overflow:clip;display:flex;flex-direction:column}

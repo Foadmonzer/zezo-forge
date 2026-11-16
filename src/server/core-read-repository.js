@@ -57,7 +57,7 @@ export async function claimGuestConversations(clientId, guestHash, updatedAt) {
   const result = await queryPostgres(`
     UPDATE conversations
     SET "customerId" = $1,
-        data = (data - 'guestSessionHash') || jsonb_build_object('clientId', $1),
+        data = (data - 'guestSessionHash') || jsonb_build_object('clientId', $1::text),
         "updatedAt" = $3
     WHERE "customerId" IS NULL AND data ->> 'guestSessionHash' = $2
   `, [clientId, guestHash, updatedAt]);

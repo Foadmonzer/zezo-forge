@@ -418,19 +418,29 @@ try {
       assert(reissued?.data.activationToken && reissued.data.expiresInHours === 24 && reissues.filter(value => value.status === 409).length === 1,
         'Reissuing a revoked invitation must return one fresh 24-hour link and reject its concurrent duplicate.');
       const refreshed = await client.query(
-        `SELECT i.status, i."expiresAt", u.active, u.data->>'activationHash' AS activation_hash,
+        `SELECT i.status, EXTRACT(EPOCH FROM (i."expiresAt" - CURRENT_TIMESTAMP)) * 1000 AS remaining_ms, u.active, u.data->>'activationHash' AS activation_hash,
           (SELECT count(*)::int FROM employee_invitations i2 WHERE i2.data->>'employeeId' = u.id) AS account_invitation_count,
           (SELECT count(*)::int FROM outbox_messages o WHERE o.recipient = i.email AND o.data->>'kind' = 'team_invitation') AS invitation_mail_count
          FROM employee_invitations i JOIN user_accounts u ON u.id = i.data->>'employeeId' WHERE i.id = $1`,
         [`invitation_${invite.data.user.id}`]
       );
       const row = refreshed.rows[0];
-      const remainingMs = new Date(row?.expiresAt).getTime() - Date.now();
+      const remainingMs = Number(row?.remaining_ms || 0);
+      const reissueChecks = {
+        rowFound: refreshed.rowCount === 1,
+        pending: row?.status === 'pending',
+        inactiveAccount: row?.active === false,
+        singleInvitation: row?.account_invitation_count === 1,
+        twoOutboxMessages: row?.invitation_mail_count === 2,
+        tokenHashMatches: row?.activation_hash === createHash('sha256').update(reissued.data.activationToken).digest('hex'),
+        expiryBetween23And24Hours: remainingMs > 23 * 60 * 60_000 && remainingMs <= 24 * 60 * 60_000,
+        remainingHours: Number.isFinite(remainingMs) ? Number((remainingMs / 3_600_000).toFixed(2)) : null
+      };
       assert(refreshed.rowCount === 1 && row.status === 'pending' && row.active === false &&
         row.account_invitation_count === 1 && row.invitation_mail_count === 2 &&
         row.activation_hash === createHash('sha256').update(reissued.data.activationToken).digest('hex') &&
         remainingMs > 23 * 60 * 60_000 && remainingMs <= 24 * 60 * 60_000,
-        'Reissue must update the same account and invitation row, hash only the fresh token, and persist a 24-hour expiry/outbox message.');
+        `Reissue must update the same account and invitation row, hash only the fresh token, and persist a 24-hour expiry/outbox message. Checks: ${JSON.stringify(reissueChecks)}`);
       const revokedTokenAgain = await request('POST', '/api/auth/activate', {
         body: { token: activationToken, password: `Employee!old${role}${testSuffix}Long` }
       });

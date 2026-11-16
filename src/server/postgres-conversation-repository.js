@@ -1,6 +1,6 @@
 import { withPostgresScopedTransaction } from './postgres-runtime.js';
 import { loadConversationViews } from './core-read-repository.js';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 const object = value => value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 
@@ -49,6 +49,153 @@ async function insertNotification(client, { id, userId, eventKey, copy, tab, tar
         SELECT 1 FROM system_notifications n WHERE n."userId" = u.id AND n.data ->> 'eventKey' = $6
       )
   `, [id, userId, copy.type || 'inquiry', JSON.stringify(data), at, eventKey]);
+}
+
+async function notifyConversationTeam(client, { conversation, actorId = '', eventKey, copy, at, authorizeRecipient }) {
+  const users = await client.query(`
+    SELECT id, role, active, data FROM user_accounts
+    WHERE active = TRUE AND role <> 'client'
+      AND COALESCE(data ->> 'accountDisabledAt', '') IN ('', 'false', '0')
+      AND id <> COALESCE($1, '')
+  `, [actorId]);
+  const resource = {
+    assigneeId: conversation.assignedUserId || '',
+    ownerId: conversation.clientId || '',
+    department: conversation.department || 'orders'
+  };
+  for (const row of users.rows) {
+    const data = object(row.data);
+    const recipient = {
+      ...data, id: row.id, role: row.role, active: row.active,
+      department: data.department || '', permissionOverrides: object(data.permissionOverrides)
+    };
+    if (authorizeRecipient && !authorizeRecipient(recipient, resource)) continue;
+    await insertNotification(client, {
+      id: stableId('ntf', `${row.id}:${eventKey}`), userId: row.id, eventKey, copy,
+      tab: 'conversations', targetId: conversation.id, at
+    });
+  }
+}
+
+function stableId(prefix, value) {
+  const digest = createHash('sha256').update(String(value)).digest('hex').slice(0, 40);
+  return `${prefix}_${digest}`;
+}
+
+async function storeAttachment(client, file, ownerId) {
+  if (!file) return null;
+  const attachmentId = `att_${randomUUID().replaceAll('-', '')}`;
+  const name = String(file.filename || 'attachment').slice(0, 120);
+  const type = String(file.contentType || 'application/octet-stream').toLowerCase();
+  await client.query(`
+    INSERT INTO stored_attachments (id, "ownerId", "fileName", "contentType", "sizeBytes", content)
+    VALUES ($1, $2, $3, $4, $5, $6)
+  `, [attachmentId, ownerId || null, name, type, file.content.length, file.content]);
+  return { attachmentId, storedName: attachmentId, originalName: name, type, size: file.content.length };
+}
+
+async function insertConversationMessage(client, { id, conversationId, actor, senderType, text, attachment, at, idempotencyHash = '' }) {
+  const attachments = attachment ? [attachment] : [];
+  const messageData = { id, senderType, senderId: actor?.id || '', text, createdAt: at, attachments };
+  if (idempotencyHash) messageData.idempotencyHash = idempotencyHash;
+  await client.query(`
+    INSERT INTO conversation_messages (id, "conversationId", "senderId", body, "attachmentId", data, "createdAt")
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+  `, [id, conversationId, actor?.id || null, text, attachment?.attachmentId || null, JSON.stringify(messageData), at]);
+  return messageData;
+}
+
+export async function createPostgresConversation({ conversation, message, attachmentFile, actor, guestHash, idempotencyHash, auditId, messageId, referral, at, authorizeRecipient }) {
+  return withPostgresScopedTransaction(async client => {
+    const data = { ...conversation, idempotencyHash };
+    delete data.messages;
+    const inserted = await client.query(`
+      INSERT INTO conversations (id, "customerId", "assignedToId", status, "templateId", source, data, "createdAt", "updatedAt")
+      VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $8)
+      ON CONFLICT (id) DO NOTHING
+      RETURNING id
+    `, [conversation.id, conversation.clientId || null, conversation.assignedUserId || null, conversation.status, conversation.templateId, conversation.source, JSON.stringify(data), at]);
+    if (!inserted.rowCount) {
+      const existing = await client.query('SELECT id, "customerId", data FROM conversations WHERE id = $1 FOR UPDATE', [conversation.id]);
+      const data = object(existing.rows[0].data);
+      const sameSubmitter = actor?.role === 'client'
+        ? existing.rows[0].customerId === actor.id
+        : !existing.rows[0].customerId && data.guestSessionHash === guestHash;
+      if (!sameSubmitter || data.idempotencyHash !== idempotencyHash) return { kind: 'conflict' };
+      const view = await loadResponse(client, actor || { id: '', role: 'guest' }, conversation.id, guestHash);
+      return { kind: 'duplicate', conversation: view };
+    }
+
+    const attachment = await storeAttachment(client, attachmentFile, actor?.id || null);
+    await insertConversationMessage(client, {
+      id: messageId, conversationId: conversation.id, actor, senderType: actor ? 'client' : 'guest',
+      text: message, attachment, at, idempotencyHash
+    });
+
+    await insertAudit(client, {
+      id: auditId, actor, action: 'template_conversation_created', targetId: conversation.id,
+      detail: `${conversation.templateId}; referral=${conversation.referralCode || 'none'}`, at
+    });
+    if (referral?.userId) {
+      await client.query(`
+        INSERT INTO referral_events (id, "userId", code, "eventType", "resourceId", "idempotencyKey", data, "createdAt")
+        VALUES ($1, $2, $3, 'inquiry_confirmed', $4, $5, $6::jsonb, $7)
+        ON CONFLICT ("idempotencyKey") DO NOTHING
+      `, [stableId('rfe', `conversation:${conversation.id}`), referral.userId, referral.code, conversation.id, `conversation_inquiry:${conversation.id}`, JSON.stringify({ conversationId: conversation.id, referralLinkId: referral.linkId || null }), at]);
+    }
+
+    const eventKey = `conversation:${conversation.id}:created`;
+    const copy = {
+      type: 'inquiry', importance: 'high', titleAr: 'محادثة قالب جديدة', titleEn: 'New template conversation',
+      descriptionAr: `وصل استفسار حول ${conversation.templateName}. عيّن مسؤول متابعة للرد.`,
+      descriptionEn: `A new enquiry arrived for ${conversation.templateName}. Assign an owner to reply.`
+    };
+    await notifyConversationTeam(client, { conversation, actorId: actor?.id || '', eventKey, copy, at, authorizeRecipient });
+
+    const view = await loadResponse(client, actor || { id: '', role: 'guest' }, conversation.id, guestHash);
+    return { kind: 'created', conversation: view, messageId };
+  });
+}
+
+export async function createPostgresConversationMessage({ conversationId, actor, guestHash = '', text, attachmentFile, idempotencyHash, messageId, auditId, at, permissionScope = '', authorize, authorizeRecipient }) {
+  return withPostgresScopedTransaction(async client => {
+    const conversation = await selectConversationForUpdate(client, conversationId);
+    if (!conversation) return { kind: 'missing' };
+    if (!authorize(conversation)) return { kind: 'forbidden' };
+
+    const duplicate = await client.query(`
+      SELECT id FROM conversation_messages
+      WHERE "conversationId" = $1 AND data ->> 'idempotencyHash' = $2
+      LIMIT 1
+    `, [conversationId, idempotencyHash]);
+    if (duplicate.rowCount) {
+      const view = await loadResponse(client, actor, conversationId, guestHash, permissionScope);
+      return { kind: 'duplicate', conversation: view };
+    }
+
+    const attachment = await storeAttachment(client, attachmentFile, actor?.id || null);
+    const senderType = actor?.role === 'guest' ? 'guest' : ['admin', 'hr_manager', 'marketing_manager', 'order_manager'].includes(actor?.role) ? 'staff' : 'client';
+    const message = await insertConversationMessage(client, { id: messageId, conversationId, actor, senderType, text, attachment, at, idempotencyHash });
+    const nextStatus = conversation.status === 'waiting_customer' ? 'in_progress' : conversation.status;
+    await client.query('UPDATE conversations SET status = $2, "updatedAt" = $3 WHERE id = $1', [conversationId, nextStatus, at]);
+    await insertAudit(client, { id: auditId, actor: actor?.role === 'guest' ? null : actor, action: 'conversation_message_sent', targetId: conversationId, detail: `${senderType}; ${message.id}; attachment=${Boolean(attachment)}`, at });
+
+    const eventKey = `conversation:${conversationId}:message:${message.id}`;
+    const copy = {
+      type: 'inquiry', importance: senderType === 'staff' ? 'normal' : 'high',
+      titleAr: senderType === 'staff' ? 'رد فريق ZEZO على محادثتك' : 'رسالة جديدة في محادثة قالب',
+      titleEn: senderType === 'staff' ? 'ZEZO replied to your conversation' : 'New message in template conversation',
+      descriptionAr: senderType === 'staff' ? 'افتح المحادثة لمتابعة الرد.' : `توجد رسالة جديدة في محادثة ${conversation.templateName}.`,
+      descriptionEn: senderType === 'staff' ? 'Open your conversation to read the reply.' : `There is a new message in the ${conversation.templateName} conversation.`
+    };
+    if (senderType === 'staff' && conversation.clientId) {
+      await insertNotification(client, { id: stableId('ntf', `${conversation.clientId}:${eventKey}`), userId: conversation.clientId, eventKey, copy, tab: 'conversations', targetId: conversationId, at });
+    } else {
+      await notifyConversationTeam(client, { conversation, actorId: actor?.id || '', eventKey, copy, at, authorizeRecipient });
+    }
+    const view = await loadResponse(client, actor, conversationId, guestHash, permissionScope);
+    return { kind: 'created', conversation: view, messageId: message.id };
+  });
 }
 
 async function loadResponse(client, actor, conversationId, guestHash = '', permissionScope = '') {

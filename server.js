@@ -7,19 +7,20 @@ import { randomBytes, scryptSync, timingSafeEqual, createHash, createHmac } from
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { templateCatalog, templateById } from './public/template-catalog.js';
 import { buildWhatsAppUrl, normalizeWhatsAppNumber } from './public/whatsapp.js';
-import { consumeRateLimitBucket, currentPostgresClient, deleteRateLimitBucket, postgresConfigured, withPostgresReadTransaction, withPostgresScopedTransaction, withPostgresTransaction } from './src/server/postgres-runtime.js';
+import { consumeRateLimitBucket, currentPostgresClient, deleteRateLimitBucket, postgresConfigured, queryPostgres, withPostgresReadTransaction, withPostgresScopedTransaction, withPostgresTransaction } from './src/server/postgres-runtime.js';
 import { createStagingSession, isStagingSessionValid, STAGING_ACCESS_COOKIE, STAGING_SESSION_TTL_SECONDS, stagingPasswordMatches } from './src/server/staging-auth.js';
 import { deleteReferralTrackingForVisitor, loadNormalizedStore, persistNormalizedStore } from './src/server/postgres-store.js';
 import { loadPublicRuntimeSnapshot, loadPublicTrackRecord } from './src/server/public-read-repository.js';
 import { claimGuestConversations, findLoginAccount, loadClientDashboardData, loadConversationAssignees, loadConversationViews, loadCrmRecordsForViewer, loadCrmRelatedRows, loadEmployeeDashboardData, loadOrderManagerOrders, loadReferralEventsForUsers, loadSessionAccount, storeLoginSessionAndAudit } from './src/server/core-read-repository.js';
 import { changePostgresPassword, enablePostgresMfa, logoutPostgresSession, setupPostgresMfa } from './src/server/postgres-auth-repository.js';
-import { acceptPostgresQuote, createPostgresQuote } from './src/server/postgres-conversation-repository.js';
+import { acceptPostgresQuote, createPostgresConversation, createPostgresConversationMessage, createPostgresQuote } from './src/server/postgres-conversation-repository.js';
 import { claimNextOutboxMessage, completeOutboxMessage } from './src/server/outbox-repository.js';
 import { createPostgresWithdrawalRequest } from './src/server/postgres-withdrawal-repository.js';
 import { createPostgresEmployeeInvitation, revokePostgresEmployeeInvitation, reissuePostgresEmployeeInvitation } from './src/server/postgres-invitation-repository.js';
 import { activatePostgresEmployeeInvitation } from './src/server/postgres-activation-repository.js';
 import { createPostgresClientRegistration } from './src/server/postgres-client-registration-repository.js';
 import { updatePostgresEmployeePermissions } from './src/server/postgres-permission-repository.js';
+import { consumePostgresPasswordReset, issuePostgresPasswordReset } from './src/server/postgres-password-recovery-repository.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const STAGING_MODE = process.env.ZEZO_STAGING === 'true';
@@ -725,6 +726,31 @@ function referralForRequest(req, body={}){
   const resolved=code?referralLinkForCode(code):null;
   return resolved?{...resolved,code,link:resolved.link}:null;
 }
+async function resolvePostgresReferralForConversation(req, body={}){
+  const visitorId=clean(body.referralVisitorId,80);
+  if(/^[\-_a-zA-Z0-9]{12,80}$/.test(visitorId)){
+    const attributed=await queryPostgres(`
+      SELECT a."userId", a.code, a.data, u.role, u.active
+      FROM referral_attributions a JOIN user_accounts u ON u.id=a."userId"
+      WHERE a."visitorHash"=$1 AND a."expiresAt">NOW()
+      LIMIT 1
+    `,[hash(visitorId)]);
+    const row=attributed.rows[0];
+    if(row)return row.active&&['marketer','developer'].includes(row.role)?{userId:row.userId,code:row.code||'',linkId:row.data?.linkId||null}:null;
+  }
+  const code=clean(cookieValue(req,'zezo_ref')||body.referralCode,40);
+  if(!code)return null;
+  const found=await queryPostgres(`
+    SELECT u.id AS "userId", $1::text AS code, l.id AS "linkId", u.role
+    FROM user_accounts u
+    LEFT JOIN referral_links l ON l."userId"=u.id AND l.code=$1 AND l.active=TRUE
+    WHERE u.active=TRUE AND u.role=ANY($2::text[])
+      AND (l.id IS NOT NULL OR u.data->>'referralCode'=$1 OR u.data->>'currentReferralCode'=$1)
+    ORDER BY (l.id IS NOT NULL) DESC
+    LIMIT 1
+  `,[code,['marketer','developer']]);
+  return found.rows[0]?{userId:found.rows[0].userId,code:found.rows[0].code,linkId:found.rows[0].linkId||null}:null;
+}
 function bindClientReferral(user, attribution){
   if(user.referralUserId||!attribution?.user?.id)return false;
   if(attribution.user.id===user.id||normalizeEmail(attribution.user.email)===normalizeEmail(user.email))return false;
@@ -1018,6 +1044,68 @@ async function loadNotificationDeadlineSnapshot(client) {
 async function handlePostgresCoreRead(req, res, path) {
   if (!stagingAuthorized(req)) return false;
   const security = responseSecurityHeaders();
+  if (req.method === 'GET' && path === '/api/auth/session') {
+    const auth = await directPostgresSessionUser(req);
+    json(res, 200, auth ? { authenticated: true, user: publicUser(auth.user) } : { authenticated: false }, security);
+    return true;
+  }
+
+  if (req.method === 'POST' && path === '/api/auth/forgot-password') {
+    const body = await jsonBody(req);
+    const email = normalizeEmail(body.email);
+    const ip = req.socket?.remoteAddress || 'unknown';
+    if (!await consumeRateLimitBucket('password-reset-ip', ip, 8, 60 * 60_000) ||
+        (email && !await consumeRateLimitBucket('password-reset-email', hash(email), 4, 60 * 60_000))) {
+      json(res, 429, { error: 'محاولات كثيرة لاستعادة كلمة المرور. حاول لاحقاً / Too many password reset attempts. Try again later.' }, security);
+      return true;
+    }
+    if (!emailReady()) {
+      json(res, 503, { error: 'استعادة كلمة المرور عبر البريد غير مفعّلة حالياً. تواصل مع خدمة العملاء لاستعادة الحساب / Email password recovery is not configured yet. Contact ZEZO support to recover your account.' }, security);
+      return true;
+    }
+    if (email) {
+      const rawToken = token(32);
+      const resetUrl = `${siteBase(req)}/#resetPassword=${encodeURIComponent(rawToken)}`;
+      const at = now();
+      const mailId = id('mail');
+      await issuePostgresPasswordReset({
+        email, resetHash: hash(rawToken), expiresAt: Date.now() + 60 * 60_000, at,
+        outboxMessage: {
+          id: mailId, to: email, recipientType: 'direct', kind: 'account_password_reset',
+          subject: 'إعادة تعيين كلمة مرور ZEZO',
+          text: `استخدم الرابط خلال ساعة لإعادة تعيين كلمة المرور:\n${resetUrl}\n\nإذا لم تطلب ذلك، تجاهل الرسالة.\n\nرسالة آلية من ZEZO Forge. يرجى عدم الرد.`,
+          state: 'pending', attempts: 0, createdAt: at, updatedAt: at
+        }
+      });
+      // The delivery worker claims from the persistent Outbox; the API response
+      // does not wait on the provider or the legacy company-state transaction.
+      void processMailQueue().catch(() => {});
+    }
+    json(res, 202, { ok: true, message: 'إذا كان البريد مرتبطاً بحساب نشط وخدمة البريد مفعّلة، فستصلك رسالة بالخطوات / If the email belongs to an active account and mail is configured, recovery instructions will arrive shortly.' }, security);
+    return true;
+  }
+
+  if (req.method === 'POST' && path === '/api/auth/reset-password') {
+    const body = await jsonBody(req);
+    const rawToken = String(body.token || '').slice(0, 200);
+    if (!validPassword(String(body.password || ''))) {
+      json(res, 400, { error: 'كلمة المرور يجب أن تكون 12 خانة على الأقل / Password must contain at least 12 characters' }, security);
+      return true;
+    }
+    const at = now();
+    const result = await consumePostgresPasswordReset({
+      resetHash: hash(rawToken), credential: passwordRecord(String(body.password)), auditId: id('evt'), at
+    });
+    if (result.kind !== 'reset') {
+      json(res, 400, { error: 'رابط إعادة التعيين غير صالح أو منتهي / Reset link is invalid or expired' }, security);
+      return true;
+    }
+    // Password recovery revokes every existing session and deliberately does
+    // not mint a replacement session, so it cannot bypass MFA for staff.
+    json(res, 200, { ok: true, user: publicUser(result.user) }, { ...security, 'Set-Cookie': cookie('zezo_session', '', 0, req) });
+    return true;
+  }
+
   if (req.method === 'POST' && path === '/api/client/register') {
     const body = await jsonBody(req);
     const ip = req.socket?.remoteAddress || 'unknown';
@@ -1286,11 +1374,12 @@ async function handlePostgresCoreRead(req, res, path) {
       }
 
       if (generated.length) {
-        // This narrow lock serializes only notification inserts; it does not
-        // block unrelated reads, conversations, orders, or financial writes.
-        await client.query('LOCK TABLE system_notifications IN SHARE ROW EXCLUSIVE MODE');
+        // Use a per-recipient deterministic primary key instead of locking the
+        // whole notifications table. Concurrent polls can now race safely: the
+        // unique id deduplicates the same event without serializing unrelated writes.
         for (const row of generated) {
           if (!row.eventKey) continue;
+          const notificationId = `ntf_${hash(`${row.userId}:${row.eventKey}`).slice(0, 40)}`;
           await client.query(`
             INSERT INTO system_notifications (id, "userId", type, "readAt", data, "createdAt")
             SELECT $1, $2, $3, $4, $5::jsonb, $6
@@ -1299,7 +1388,7 @@ async function handlePostgresCoreRead(req, res, path) {
               WHERE existing."userId" = $2 AND existing.data->>'eventKey' = $7
             )
             ON CONFLICT (id) DO NOTHING
-          `, [row.id, row.userId, row.type || null, row.readAt ? new Date(row.readAt) : null, JSON.stringify(row), new Date(row.createdAt), row.eventKey]);
+          `, [notificationId, row.userId, row.type || null, row.readAt ? new Date(row.readAt) : null, JSON.stringify(row), new Date(row.createdAt), row.eventKey]);
         }
       }
 
@@ -1782,6 +1871,9 @@ function conversationAccess(user,conversation,permission='conversations.read'){
   if(user.role==='client')return conversation.clientId===user.id;
   return hasPermission(user,permission,{assigneeId:conversation.assignedUserId||'',ownerId:conversation.clientId||'',department:conversation.department||'orders'});
 }
+function canReceiveConversationNotification(user,resource){
+  return user?.role==='admin'||hasPermission(user,'conversations.read',resource);
+}
 function conversationAssigneesFor(user){
   if(!user||!hasPermission(user,'conversations.assign',{department:'orders'}))return [];
   return store.users.filter(row=>row.active&&!row.accountDisabledAt&&row.role!=='admin'&&hasPermission(row,'conversations.read',{assigneeId:row.id,department:'orders'})).map(row=>({id:row.id,name:row.name,role:row.role,active:true}));
@@ -2237,20 +2329,139 @@ async function handlePostgresEmployeeActivation(req, res, path) {
 }
 
 async function handlePostgresCoreWrite(req, res, path) {
+  if (!stagingAuthorized(req)) return false;
+  const security = responseSecurityHeaders();
+  const respond = (status, body, headers = security) => { json(res, status, body, headers); return true; };
+
+  if (req.method === 'POST' && path === '/api/conversations') {
+    const ip = req.socket?.remoteAddress || 'unknown';
+    if (!await consumeRateLimitBucket('conversation-start', ip, 15, 60 * 60_000)) {
+      return respond(429, { error: 'وصلنا الحد المؤقت للمحادثات. حاول لاحقاً / Conversation limit reached. Try again later.' });
+    }
+    let body = {}, file = null;
+    if ((req.headers['content-type'] || '').toLowerCase().startsWith('multipart/form-data')) {
+      const parsed = parseMultipart(await bodyBuffer(req), req.headers['content-type']);
+      body = parsed.fields; file = parsed.file;
+    } else body = await jsonBody(req);
+
+    const auth = await directPostgresSessionUser(req);
+    if (auth && !directRequireAuth(req, res, auth.user, ['client'])) return true;
+    const templateId = clean(body.templateId, 80);
+    const template = templateById.get(templateId);
+    const message = clean(body.message, 2000);
+    if (!template || message.length < 5) return respond(400, { error: 'اختر قالباً متاحاً واكتب استفسارك / Choose an available template and enter your question' });
+    const settings = await queryPostgres('SELECT value FROM app_settings WHERE key=$1', ['zezo-runtime']);
+    if (settings.rows[0]?.value?.templateActive?.[templateId] === false) {
+      return respond(404, { error: 'القالب غير متاح حالياً / This template is not currently available' });
+    }
+
+    let attachmentFile = null;
+    if (file) {
+      const extension = extname(file.filename).toLowerCase();
+      const rules = {
+        '.pdf': { type: 'application/pdf', signature: Buffer.from('%PDF-') },
+        '.png': { type: 'image/png', signature: Buffer.from([0x89, 0x50, 0x4e, 0x47]) },
+        '.jpg': { type: 'image/jpeg', signature: Buffer.from([0xff, 0xd8, 0xff]) },
+        '.jpeg': { type: 'image/jpeg', signature: Buffer.from([0xff, 0xd8, 0xff]) },
+        '.webp': { type: 'image/webp', signature: Buffer.from('RIFF') }
+      };
+      const rule = rules[extension];
+      if (!rule || file.content.length > 4 * 1024 * 1024 || !file.content.subarray(0, rule.signature.length).equals(rule.signature)) {
+        return respond(400, { error: 'الملف غير مدعوم أو يتجاوز 4MB / Unsupported file or over 4MB' });
+      }
+      attachmentFile = { ...file, contentType: rule.type };
+    }
+
+    const suppliedKey = clean(req.headers['idempotency-key'] || body.idempotencyKey, 120);
+    const idempotencyKey = /^[A-Za-z0-9_-]{32,120}$/.test(suppliedKey) ? suppliedKey : token(24);
+    const idempotencyHash = hash(idempotencyKey);
+    const guest = guestSessionValue(req) || (!auth ? token(32) : '');
+    const headers = !auth && !guestSessionValue(req)
+      ? { ...security, 'Set-Cookie': cookie('zezo_guest', guest, 30 * 24 * 60 * 60, req) }
+      : security;
+    const referral = await resolvePostgresReferralForConversation(req, body);
+    const createdAt = now();
+    const conversation = {
+      id: `chat_${idempotencyHash.slice(0, 40)}`, createdAt, updatedAt: createdAt,
+      templateId: template.id, templateName: template.title.ar, templateService: template.service,
+      templateCategory: template.category, source: clean(body.source, 40) || 'template_catalog',
+      department: 'orders', status: 'new', clientId: auth?.user.role === 'client' ? auth.user.id : null,
+      guestSessionHash: auth ? null : hash(guest), assignedUserId: null,
+      referralCode: referral?.code || '', referralLinkId: referral?.linkId || null,
+      referralUserId: referral?.userId || null, leadId: null, messages: []
+    };
+    const result = await createPostgresConversation({
+      conversation, message, attachmentFile, actor: auth?.user || null, guestHash: auth ? '' : hash(guest),
+      idempotencyHash, auditId: id('evt'), messageId: id('msg'), referral, at: createdAt,
+      authorizeRecipient: canReceiveConversationNotification
+    });
+    if (result.kind === 'conflict') return respond(409, { error: 'تعذر إكمال المحادثة بهذا الطلب. حدّث الصفحة وحاول مجدداً / This conversation request could not be completed. Refresh and try again.' });
+    return respond(result.kind === 'duplicate' ? 200 : 201, { ok: true, conversation: result.conversation, messageId: result.messageId || result.conversation?.messages?.at(-1)?.id }, headers);
+  }
+
+  const conversationMessageMatch = req.method === 'POST' && /^\/api\/conversations\/([^/]+)\/messages$/.exec(path);
+  if (conversationMessageMatch) {
+    const ip = req.socket?.remoteAddress || 'unknown';
+    if (!await consumeRateLimitBucket('conversation-message', ip, 40, 60 * 60_000)) {
+      return respond(429, { error: 'وصلنا الحد المؤقت للرسائل. حاول لاحقاً / Message limit reached. Try again later.' });
+    }
+    let body = {}, file = null;
+    if ((req.headers['content-type'] || '').toLowerCase().startsWith('multipart/form-data')) {
+      const parsed = parseMultipart(await bodyBuffer(req), req.headers['content-type']);
+      body = parsed.fields; file = parsed.file;
+    } else body = await jsonBody(req);
+    const auth = await directPostgresSessionUser(req);
+    const guest = guestSessionValue(req);
+    if (auth && !directRequireAuth(req, res, auth.user, allRoles)) return true;
+    if (!auth && !guest) return respond(401, { error: 'انتهت جلسة المحادثة. أعد فتح المحادثة من حسابك / Conversation session expired. Reopen this conversation from your account.' });
+    const actor = auth?.user || { id: '', role: 'guest' };
+    if (auth && !['client', 'admin', 'hr_manager', 'marketing_manager', 'order_manager'].includes(actor.role)) {
+      return respond(403, { error: 'ليس لديك صلاحية الرد على هذه المحادثة / You cannot reply to this conversation' });
+    }
+    const text = clean(body.message, 2000);
+    if (!text && !file) return respond(400, { error: 'اكتب رسالة أو أرفق ملفاً / Enter a message or attach a file' });
+    let attachmentFile = null;
+    if (file) {
+      const extension = extname(file.filename).toLowerCase();
+      const rules = {
+        '.pdf': { type: 'application/pdf', signature: Buffer.from('%PDF-') },
+        '.png': { type: 'image/png', signature: Buffer.from([0x89, 0x50, 0x4e, 0x47]) },
+        '.jpg': { type: 'image/jpeg', signature: Buffer.from([0xff, 0xd8, 0xff]) },
+        '.jpeg': { type: 'image/jpeg', signature: Buffer.from([0xff, 0xd8, 0xff]) },
+        '.webp': { type: 'image/webp', signature: Buffer.from('RIFF') }
+      };
+      const rule = rules[extension];
+      if (!rule || file.content.length > 4 * 1024 * 1024 || !file.content.subarray(0, rule.signature.length).equals(rule.signature)) {
+        return respond(400, { error: 'الملف غير مدعوم أو يتجاوز 4MB / Unsupported file or over 4MB' });
+      }
+      attachmentFile = { ...file, contentType: rule.type };
+    }
+    const suppliedKey = clean(req.headers['idempotency-key'] || body.idempotencyKey, 120);
+    const idempotencyKey = /^[A-Za-z0-9_-]{32,120}$/.test(suppliedKey) ? suppliedKey : token(24);
+    const result = await createPostgresConversationMessage({
+      conversationId: decodeURIComponent(conversationMessageMatch[1]), actor, guestHash: guest ? hash(guest) : '',
+      text, attachmentFile, idempotencyHash: hash(idempotencyKey), messageId: id('msg'), auditId: id('evt'), at: now(),
+      permissionScope: auth ? effectivePermission(actor, 'conversations.read') : '',
+      authorizeRecipient: canReceiveConversationNotification,
+      authorize: conversation => {
+        if (actor.role === 'client') return conversation.clientId === actor.id || Boolean(guest && conversation.guestSessionHash === hash(guest));
+        if (actor.role === 'guest') return Boolean(guest && conversation.guestSessionHash === hash(guest));
+        return conversationAccess(actor, conversation, 'conversations.read') &&
+          hasPermission(actor, 'conversations.reply', { assigneeId: conversation.assignedUserId || '', ownerId: conversation.clientId || '', department: conversation.department || 'orders' });
+      }
+    });
+    if (result.kind === 'missing' || result.kind === 'forbidden') return respond(404, { error: 'المحادثة غير موجودة أو لا تملك صلاحية الوصول إليها / Conversation not found or unavailable' });
+    return respond(result.kind === 'duplicate' ? 200 : 201, { ok: true, conversation: result.conversation, messageId: result.messageId });
+  }
+
   const match = req.method === 'PATCH' && /^\/api\/admin\/permissions\/[^/]+$/.test(path)
     ? path.split('/').at(-1)
     : '';
   if (!match) return false;
-  if (!stagingAuthorized(req)) return false;
 
   // Core write handlers use a boolean dispatch contract. json() writes the
   // response but returns undefined, which would otherwise fall through to the
   // legacy company-wide transaction and wait on its advisory lock.
-  const respond = (status, body, headers) => {
-    json(res, status, body, headers);
-    return true;
-  };
-  const security = responseSecurityHeaders();
   const auth = await directPostgresSessionUser(req);
   if (!directRequireAuth(req, res, auth?.user, ['admin'])) return true;
   const targetId = decodeURIComponent(match);

@@ -23,6 +23,7 @@
     "test:smoke": "node smoke-test.js",
     "test:staging": "node staging-smoke-test.js",
     "test:staging-auth": "node staging-auth-smoke-test.js",
+    "test:account-notifications": "node scripts/account-notification-regression.mjs",
     "test:postgres": "node postgres-smoke-test.js && node postgres-api-smoke-test.js && node postgres-outbox-smoke-test.js",
     "perf:production": "node scripts/measure-production-performance.mjs",
     "test": "node smoke-test.js && node staging-smoke-test.js"
@@ -33,7 +34,7 @@
   "dependencies": {
     "@prisma/adapter-pg": "^7.10.1",
     "@prisma/client": "^7.10.1",
-    "next": "16.4.4",
+    "next": "16.4.5",
     "pg": "^8.23.1",
     "posthog-js": "^1.449.2",
     "react": "^19.3.1",
