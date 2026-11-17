@@ -13,6 +13,10 @@ async function templateIds() {
   return [...source.matchAll(/^\['([^']+)','(?:web|apps|ai|ideas)'/gm)].map(match => match[1]);
 }
 
+async function waitForZezoApp(page) {
+  await expect(page.locator('html')).toHaveAttribute('data-zezo-app-ready', 'true', { timeout: 30_000 });
+}
+
 function totp(secret) {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
   let buffer = 0, bits = 0;
@@ -38,7 +42,7 @@ async function json(response) {
 
 async function loginThroughUI(page, { username, password, accountType = 'employee', mfaCode }) {
   await page.goto('/team');
-  await expect(page.locator('html')).toHaveAttribute('data-zezo-app-ready', 'true');
+  await waitForZezoApp(page);
   const form = accountType === 'management' ? '#managerLoginForm' : '#employeeLoginForm';
   await page.locator(`${form} input[name="username"]`).fill(username);
   await page.locator(`${form} input[name="password"]`).fill(password);
@@ -107,12 +111,28 @@ async function workspaceViewportMatrix(page, tab, name, testInfo) {
         viewport: document.documentElement.clientWidth,
         page: document.documentElement.scrollWidth,
         left: rect.left,
-        right: rect.right
+        right: rect.right,
+        contentWidth: document.querySelector('#dashboardContent')?.scrollWidth || 0,
+        contentViewport: document.querySelector('#dashboardContent')?.clientWidth || 0,
+        dashboardWidth: document.querySelector('.dashboard')?.getBoundingClientRect().width || 0,
+        layoutWidth: document.querySelector('.dashboard-layout')?.getBoundingClientRect().width || 0,
+        contentRectWidth: document.querySelector('#dashboardContent')?.getBoundingClientRect().width || 0,
+        notes: [...document.querySelectorAll('#dashboardContent .subtle-note')].map(note => {
+          const style = getComputedStyle(note);
+          const rect = note.getBoundingClientRect();
+          return { width: note.clientWidth, rectWidth: rect.width, left: rect.left, right: rect.right, scroll: note.scrollWidth, whiteSpace: style.whiteSpace, wrap: style.overflowWrap };
+        })
       };
     });
     expect(bounds.page, `${name} page overflow at ${width}px`).toBeLessThanOrEqual(bounds.viewport + 1);
     expect(bounds.left, `${name} workspace clipped on the left at ${width}px`).toBeGreaterThanOrEqual(-1);
     expect(bounds.right, `${name} workspace clipped on the right at ${width}px`).toBeLessThanOrEqual(bounds.viewport + 1);
+    expect(bounds.layoutWidth, `${name} dashboard grid expanded past its container at ${width}px`).toBeLessThanOrEqual(bounds.dashboardWidth + 1);
+    expect(bounds.contentRectWidth, `${name} content column expanded past the dashboard grid at ${width}px`).toBeLessThanOrEqual(bounds.layoutWidth + 1);
+    expect(bounds.contentWidth, `${name} dashboard content overflows internally at ${width}px`).toBeLessThanOrEqual(bounds.contentViewport + 1);
+    expect(bounds.notes.some(note => note.scroll > note.width), `${name} dashboard text is clipped at ${width}px`).toBe(false);
+    expect(bounds.notes.some(note => note.rectWidth > bounds.contentRectWidth + 1), `${name} helper text extends past the content column at ${width}px`).toBe(false);
+    if (name === 'owner-projects' && width === 390) console.log(`[MOBILE_NOTE_LAYOUT] ${JSON.stringify(bounds)}`);
     await page.screenshot({ path: testInfo.outputPath(`workspace-${name}-${width}.png`) });
   }
 }
@@ -120,10 +140,12 @@ async function workspaceViewportMatrix(page, tab, name, testInfo) {
 test('browser navigation works in Chromium, Firefox, and WebKit', async ({ page, browserName }) => {
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
-  await page.goto('/');
+  await page.goto('/', { waitUntil: 'domcontentloaded' });
+  await waitForZezoApp(page);
   await expect(page.locator('#heroTitle')).toBeVisible();
   await expect(page.locator('#templateGrid .template-card')).toHaveCount(40);
-  await page.goto('/?preview=web-thread-studio');
+  await page.goto('/?preview=web-thread-studio', { waitUntil: 'domcontentloaded' });
+  await waitForZezoApp(page);
   await expect(page.locator('#templatePreviewApp .template-preview-shell h1')).toBeVisible();
   await expect(page.locator('#templatePreviewApp .template-preview-actions a')).toHaveCount(2);
   await page.locator('#templatePreviewLanguage').click();
@@ -273,7 +295,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   // Create and sign in as a customer through the actual browser form, carrying the synthetic referral.
   await page.setViewportSize({ width: 1366, height: 900 });
   await page.goto(`/?ref=${encodeURIComponent(referralCode)}`);
-  await expect(page.locator('html')).toHaveAttribute('data-zezo-app-ready', 'true');
+  await waitForZezoApp(page);
   await page.locator('.login-open').click();
   await expect(page.locator('#authModal.open')).toBeVisible();
   await expect(page.locator('#customerChoicePanel [data-customer-view="register"]')).toBeVisible();
@@ -343,7 +365,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
 
   // The customer reloads the saved conversation, accepts the quote, and sends a formal request.
   await page.reload();
-  await expect(page.locator('html')).toHaveAttribute('data-zezo-app-ready', 'true');
+  await waitForZezoApp(page);
   await page.locator('.login-open').click();
   await expect(page.locator('#dashboardBackdrop.open')).toBeVisible();
   await page.locator('[data-dash-tab="conversations"]').click();
@@ -432,7 +454,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   // A successful invitation displays its one-time link immediately; the list
   // is refreshed on the next page load. Exercise the visible revoke/reissue UI.
   await ownerPage.reload();
-  await expect(ownerPage.locator('html')).toHaveAttribute('data-zezo-app-ready', 'true');
+  await waitForZezoApp(ownerPage);
   await ownerPage.locator('[data-dash-tab="team"]').click();
   const revokeButton = ownerPage.locator(`[data-invitation-action="revoked"][data-invitation-id="${uiInviteId}"]`);
   await expect(revokeButton).toBeVisible();
