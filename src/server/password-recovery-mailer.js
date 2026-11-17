@@ -1,7 +1,6 @@
 import nodemailer from 'nodemailer';
 
 export const PASSWORD_RECOVERY_SENDER = 'zezo.info.2026@gmail.com';
-const productionOrigin = 'https://zezo-forge-fouad.netlify.app';
 
 const escapeHtml = value => String(value).replace(/[&<>"']/g, char => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -18,7 +17,10 @@ export function passwordRecoveryEmailReady(env = process.env) {
 }
 
 export function passwordRecoveryOrigin(env = process.env) {
-  const configured = String(env.ZEZO_PUBLIC_URL || productionOrigin).trim();
+  // Fail closed instead of silently sending a preview reset link to Production.
+  // Netlify's preview URL must be configured explicitly for that deploy context.
+  const configured = String(env.ZEZO_PUBLIC_URL || '').trim();
+  if (!configured) return '';
   try {
     const url = new URL(configured);
     const testHttpAllowed = env.NODE_ENV === 'test' && ['localhost', '127.0.0.1', '::1'].includes(url.hostname);

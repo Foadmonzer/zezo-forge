@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import pg from 'pg';
-import { passwordRecoveryEmailReady, renderPasswordRecoveryEmail } from '../src/server/password-recovery-mailer.js';
+import { createPasswordResetUrl, passwordRecoveryEmailReady, passwordRecoveryOrigin, renderPasswordRecoveryEmail } from '../src/server/password-recovery-mailer.js';
 
 const { Pool } = pg;
 const databaseUrl = process.env.DATABASE_URL || '';
@@ -168,6 +168,11 @@ try {
   const copyAr = renderPasswordRecoveryEmail({ resetUrl: `${baseUrl}/#resetPassword=synthetic-token`, language: 'ar' });
   const copyEn = renderPasswordRecoveryEmail({ resetUrl: `${baseUrl}/#resetPassword=synthetic-token`, language: 'en' });
   assert.equal(passwordRecoveryEmailReady({ ZEZO_GMAIL_SMTP_USER: 'zezo.info.2026@gmail.com', ZEZO_GMAIL_SMTP_APP_PASSWORD: 'test', ZEZO_PUBLIC_URL: 'https://zezo-forge-fouad.netlify.app' }), true, 'the explicit Gmail credentials should enable recovery when no separate toggle exists');
+  assert.equal(passwordRecoveryOrigin({}), '', 'missing public origin must fail closed rather than target Production');
+  assert.equal(passwordRecoveryEmailReady({ ZEZO_GMAIL_SMTP_USER: 'zezo.info.2026@gmail.com', ZEZO_GMAIL_SMTP_APP_PASSWORD: 'test' }), false, 'Gmail credentials alone must not enable recovery without an environment URL');
+  const previewOrigin = 'https://deploy-preview-3--zezo-forge-fouad.netlify.app';
+  assert.equal(passwordRecoveryOrigin({ ZEZO_PUBLIC_URL: previewOrigin }), previewOrigin, 'recovery must use the explicitly configured preview origin');
+  assert.equal(createPasswordResetUrl('preview-token', { ZEZO_PUBLIC_URL: previewOrigin }), `${previewOrigin}/#resetPassword=preview-token`);
   assert.equal(passwordRecoveryEmailReady({ ZEZO_ENABLE_PASSWORD_RECOVERY_EMAIL: 'false', ZEZO_GMAIL_SMTP_USER: 'zezo.info.2026@gmail.com', ZEZO_GMAIL_SMTP_APP_PASSWORD: 'test', ZEZO_PUBLIC_URL: 'https://zezo-forge-fouad.netlify.app' }), false);
   assert.equal(passwordRecoveryEmailReady({ ZEZO_ENABLE_PASSWORD_RECOVERY_EMAIL: 'true', ZEZO_GMAIL_SMTP_USER: 'someone-else@gmail.com', ZEZO_GMAIL_SMTP_APP_PASSWORD: 'test', ZEZO_PUBLIC_URL: 'https://zezo-forge-fouad.netlify.app' }), false);
   assert.equal(passwordRecoveryEmailReady({ ZEZO_ENABLE_PASSWORD_RECOVERY_EMAIL: 'true', ZEZO_GMAIL_SMTP_USER: 'zezo.info.2026@gmail.com', ZEZO_GMAIL_SMTP_APP_PASSWORD: 'test', ZEZO_PUBLIC_URL: 'http://zezo-forge-fouad.netlify.app' }), false);
