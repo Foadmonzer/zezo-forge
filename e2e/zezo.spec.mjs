@@ -120,10 +120,12 @@ async function workspaceViewportMatrix(page, tab, name, testInfo) {
 test('browser navigation works in Chromium, Firefox, and WebKit', async ({ page, browserName }) => {
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
-  await page.goto('/');
+  await page.goto('/', { waitUntil: 'domcontentloaded' });
+  await expect(page.locator('html')).toHaveAttribute('data-zezo-app-ready', 'true');
   await expect(page.locator('#heroTitle')).toBeVisible();
   await expect(page.locator('#templateGrid .template-card')).toHaveCount(40);
-  await page.goto('/?preview=web-thread-studio');
+  await page.goto('/?preview=web-thread-studio', { waitUntil: 'domcontentloaded' });
+  await expect(page.locator('html')).toHaveAttribute('data-zezo-app-ready', 'true');
   await expect(page.locator('#templatePreviewApp .template-preview-shell h1')).toBeVisible();
   await expect(page.locator('#templatePreviewApp .template-preview-actions a')).toHaveCount(2);
   await page.locator('#templatePreviewLanguage').click();

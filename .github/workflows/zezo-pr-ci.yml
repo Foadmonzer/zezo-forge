@@ -7,7 +7,7 @@ permissions:
 
 jobs:
   verify-pr-2:
-    if: (github.event_name == 'pull_request' && (github.event.pull_request.base.ref == 'codex/nextjs-migration-20261104' || github.event.pull_request.head.ref == 'codex/nextjs-migration-20261104')) || (github.event_name == 'push' && github.ref == 'refs/heads/codex/nextjs-migration-20261104')
+    if: (github.event_name == 'pull_request' && (github.event.pull_request.base.ref == 'codex/nextjs-migration-20261104' || github.event.pull_request.head.ref == 'codex/nextjs-migration-20261104' || startsWith(github.event.pull_request.head.ref, 'codex/zezo-stability-'))) || (github.event_name == 'push' && (github.ref == 'refs/heads/codex/nextjs-migration-20261104' || startsWith(github.ref, 'refs/heads/codex/zezo-stability-')))
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -38,6 +38,8 @@ jobs:
       - run: pnpm test:staging
       - run: pnpm test:staging-auth
       - run: pnpm exec prisma validate
+      - name: Verify safe API error responses
+        run: node --test scripts/api-error-response.test.mjs
       - name: Migrate, test, and benchmark isolated PostgreSQL
         env:
           PGHOST: 127.0.0.1
@@ -50,7 +52,7 @@ jobs:
       - run: pnpm build
 
   browser-e2e-pr-2:
-    if: (github.event_name == 'pull_request' && (github.event.pull_request.base.ref == 'codex/nextjs-migration-20261104' || github.event.pull_request.head.ref == 'codex/nextjs-migration-20261104')) || (github.event_name == 'push' && github.ref == 'refs/heads/codex/nextjs-migration-20261104')
+    if: (github.event_name == 'pull_request' && (github.event.pull_request.base.ref == 'codex/nextjs-migration-20261104' || github.event.pull_request.head.ref == 'codex/nextjs-migration-20261104' || startsWith(github.event.pull_request.head.ref, 'codex/zezo-stability-'))) || (github.event_name == 'push' && (github.ref == 'refs/heads/codex/nextjs-migration-20261104' || startsWith(github.ref, 'refs/heads/codex/zezo-stability-')))
     runs-on: ubuntu-latest
     container:
       image: mcr.microsoft.com/playwright:v1.64.1-noble
