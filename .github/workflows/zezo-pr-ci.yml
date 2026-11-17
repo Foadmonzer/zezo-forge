@@ -7,7 +7,7 @@ permissions:
 
 jobs:
   verify-pr-2:
-    if: (github.event_name == 'pull_request' && github.event.pull_request.number == 2 && github.event.pull_request.head.ref == 'codex/nextjs-migration-20261104') || (github.event_name == 'push' && github.ref == 'refs/heads/codex/nextjs-migration-20261104')
+    if: (github.event_name == 'pull_request' && (github.event.pull_request.base.ref == 'codex/nextjs-migration-20261104' || github.event.pull_request.head.ref == 'codex/nextjs-migration-20261104')) || (github.event_name == 'push' && github.ref == 'refs/heads/codex/nextjs-migration-20261104')
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -50,7 +50,7 @@ jobs:
       - run: pnpm build
 
   browser-e2e-pr-2:
-    if: (github.event_name == 'pull_request' && github.event.pull_request.number == 2 && github.event.pull_request.head.ref == 'codex/nextjs-migration-20261104') || (github.event_name == 'push' && github.ref == 'refs/heads/codex/nextjs-migration-20261104')
+    if: (github.event_name == 'pull_request' && (github.event.pull_request.base.ref == 'codex/nextjs-migration-20261104' || github.event.pull_request.head.ref == 'codex/nextjs-migration-20261104')) || (github.event_name == 'push' && github.ref == 'refs/heads/codex/nextjs-migration-20261104')
     runs-on: ubuntu-latest
     container:
       image: mcr.microsoft.com/playwright:v1.64.1-noble
