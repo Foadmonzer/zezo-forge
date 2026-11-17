@@ -2,6 +2,7 @@ import { Readable, Writable } from 'node:stream';
 import type { IncomingHttpHeaders } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { NextResponse, type NextRequest } from 'next/server';
+import { buildApiFailure } from '../../../src/server/api-error-response.js';
 import { handle, init } from '../../../server.js';
 import { consumeRateLimitBucket, postgresConfigured } from '../../../src/server/postgres-runtime.js';
 import { createStagingSession, stagingPasswordMatches, STAGING_ACCESS_COOKIE, STAGING_SESSION_TTL_SECONDS } from '../../../src/server/staging-edge-auth.js';
@@ -192,10 +193,21 @@ async function dispatch(request: NextRequest) {
   return new Response(noBody ? null : new Uint8Array(body), { status: response.statusCode, headers });
 }
 
-export const GET = dispatch;
-export const HEAD = dispatch;
-export const POST = dispatch;
-export const PUT = dispatch;
-export const PATCH = dispatch;
-export const DELETE = dispatch;
+async function dispatchSafely(request: NextRequest) {
+  try {
+    return await dispatch(request);
+  } catch (error) {
+    const failure = buildApiFailure(error, request.method);
+    // Never log raw errors, URLs, request bodies, credentials, or token values.
+    console.error('ZEZO API request failed', failure.log);
+    return failure.response;
+  }
+}
+
+export const GET = dispatchSafely;
+export const HEAD = dispatchSafely;
+export const POST = dispatchSafely;
+export const PUT = dispatchSafely;
+export const PATCH = dispatchSafely;
+export const DELETE = dispatchSafely;
 
