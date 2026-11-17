@@ -964,6 +964,19 @@ document.addEventListener('click',async event=>{
 });
 
 document.addEventListener('change',async event=>{if(event.target===$('#serviceSelect'))updateCategoryOptions();if(event.target===$('#clientStudentSelect'))$('#clientUniversityField').hidden=event.target.value!=='true';const roleSelect=event.target.closest('[data-user-role]');if(roleSelect){try{await fetch(`/api/admin/team/${encodeURIComponent(roleSelect.dataset.userRole)}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({role:roleSelect.value})}).then(async r=>{const d=await readApiJson(r);if(!r.ok)throw new Error(d.error)});await refreshDashboard('team');showToast(tx('تم تحديث دور الموظف.','Employee role updated.'))}catch(e){showToast(e.message,true);await refreshDashboard('team')}}});
+function projectRequestIdempotencyKey(form){
+  const payload=Array.from(new FormData(form).entries())
+    .filter(([name])=>name!=='idempotencyKey')
+    .map(([name,value])=>[name,typeof File!=='undefined'&&value instanceof File?[value.name,value.size,value.lastModified]:value]);
+  const fingerprint=JSON.stringify(payload),keyField=form.elements.idempotencyKey;
+  if(!keyField.value||form.dataset.projectRequestFingerprint!==fingerprint){
+    const bytes=new Uint8Array(24);crypto.getRandomValues(bytes);
+    keyField.value=btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+  }
+  form.dataset.projectRequestFingerprint=fingerprint;
+  return keyField.value;
+}
+
 document.addEventListener('submit',async event=>{
   if(event.target.id==='notificationFilterForm'){event.preventDefault();state.notificationFilters=Object.fromEntries(new FormData(event.target));await loadNotificationCenter();return}
   if(event.target.id==='crmFilters'||event.target.id==='crmServiceFilter'){event.preventDefault();const values=Object.fromEntries(new FormData(event.target)),next={...state.crmFilters,...values};for(const [key,value] of Object.entries(next))if(!value)delete next[key];await loadCrmWorkspace(next);return}
@@ -986,12 +999,13 @@ document.addEventListener('submit',async event=>{
     const countryCode=form.elements.whatsappCountryCode.value,localNumber=form.elements.whatsappLocalNumber.value.replace(/\D/g,'').replace(/^0+/,''),contactPhone=`${countryCode}${localNumber}`;
     if(!/^\+[1-9]\d{7,14}$/.test(contactPhone)){form.elements.whatsappLocalNumber.setCustomValidity(tx('أدخل رقم واتساب صالحاً مع مفتاح الدولة.','Enter a valid WhatsApp number with the country code.'));form.elements.whatsappLocalNumber.reportValidity();form.elements.whatsappLocalNumber.setCustomValidity('');return}
     form.elements.name.value=client.profile?.name||client.user.name;form.elements.email.value=client.profile?.email||client.user.email;
+    const idempotencyKey=projectRequestIdempotencyKey(form);
     setFormSubmitting(form,true,'جارٍ إرسال طلب المشروع…','Sending project request…');
     try{
-      const response=await fetch('/api/leads',{method:'POST',body:new FormData(form)});
+      const response=await fetch('/api/leads',{method:'POST',headers:{'Idempotency-Key':idempotencyKey},body:new FormData(form)});
       const data=await readApiJson(response);
       if(!response.ok)throw new Error(data.error||tx('تعذر إرسال الطلب. حاول مرة أخرى.','Could not send the request. Please try again.'));
-      form.reset();form.elements.lang.value=state.lang;syncReferralField();updateCategoryOptions();$('#fileName').textContent='';state.dashboard.profile.phone=contactPhone;fillClientContact(state.dashboard.profile);
+      form.reset();delete form.dataset.projectRequestFingerprint;form.elements.lang.value=state.lang;syncReferralField();updateCategoryOptions();$('#fileName').textContent='';state.dashboard.profile.phone=contactPhone;fillClientContact(state.dashboard.profile);
       if(data.trackingToken){
         const trackingUrl=new URL(location.pathname,location.origin);trackingUrl.searchParams.set('track',data.trackingToken);
         const mailNote=data.mail?.customerConfigured&&data.mail?.adminConfigured
