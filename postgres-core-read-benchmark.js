@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { Readable, Writable } from 'node:stream';
-import { createHash, randomBytes, randomUUID, scryptSync } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID, scryptSync } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import pg from 'pg';
 import { createStagingSession, STAGING_ACCESS_COOKIE } from './src/server/staging-auth.js';
@@ -22,6 +22,29 @@ const now = new Date();
 const password = `Synthetic!Phase6-${suffix}`;
 const salt = randomBytes(16).toString('hex');
 const passwordHash = scryptSync(password, salt, 64).toString('hex');
+function syntheticTotp(secret) {
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(Math.floor(Date.now() / 30_000)));
+  const digest = createHmac('sha1', secret).update(counter).digest();
+  const offset = digest[digest.length - 1] & 15;
+  return String((digest.readUInt32BE(offset) & 0x7fffffff) % 1_000_000).padStart(6, '0');
+}
+const base32Alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function base32Encode(bytes) {
+  let bits = 0;
+  let value = 0;
+  let output = '';
+  for (const byte of bytes) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5) {
+      output += base32Alphabet[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits) output += base32Alphabet[(value << (5 - bits)) & 31];
+  return output;
+}
 const sampleCount = Math.max(12, Number(process.env.BENCH_SAMPLES) || 36);
 const concurrency = Math.max(2, Math.min(sampleCount, Number(process.env.BENCH_CONCURRENCY) || 12));
 const waves = Math.ceil(sampleCount / concurrency);
@@ -114,24 +137,26 @@ try {
   orderManagerId = `phase6_order_manager_${suffix}`;
   const orderManagerSessionId = randomBytes(32).toString('base64url');
   const orderManagerSessionHash = createHash('sha256').update(orderManagerSessionId).digest('hex');
-  const orderManagerData = { name: 'Synthetic Phase 6 Order Manager', department: 'orders', mfaEnabledAt: now.toISOString() };
+  const orderManagerMfaSecret = randomBytes(20);
+  const orderManagerData = { name: 'Synthetic Phase 6 Order Manager', department: 'orders', salt, mfaEnabledAt: now.toISOString(), mfaSecret: base32Encode(orderManagerMfaSecret) };
   await client.query(`
     INSERT INTO user_accounts (id,email,username,role,active,"fullName","passwordHash",data,"createdAt","updatedAt")
     VALUES ($1,$2,$2,'order_manager',TRUE,$3,$4,$5::jsonb,NOW(),NOW())
   `, [orderManagerId, `phase6_order_manager_${suffix}@example.test`, orderManagerData.name, passwordHash, JSON.stringify(orderManagerData)]);
   await client.query('INSERT INTO auth_sessions (id,"userId","expiresAt",data,"createdAt") VALUES ($1,$2,NOW() + INTERVAL \'2 hours\',$3::jsonb,NOW())', [orderManagerSessionHash, orderManagerId, '{}']);
-  const orderManagerCookie = `zezo_session=${encodeURIComponent(orderManagerSessionId)}`;
+  let orderManagerCookie = `zezo_session=${encodeURIComponent(orderManagerSessionId)}`;
 
   adminId = `phase6_admin_${suffix}`;
   const adminSessionId = randomBytes(32).toString('base64url');
   const adminSessionHash = createHash('sha256').update(adminSessionId).digest('hex');
-  const adminData = { name: 'Synthetic Phase 6 Owner', department: 'owner', mfaEnabledAt: now.toISOString() };
+  const adminMfaSecret = randomBytes(20);
+  const adminData = { name: 'Synthetic Phase 6 Owner', department: 'owner', salt, mfaEnabledAt: now.toISOString(), mfaSecret: base32Encode(adminMfaSecret) };
   await client.query(`
     INSERT INTO user_accounts (id,email,username,role,active,"fullName","passwordHash",data,"createdAt","updatedAt")
     VALUES ($1,$2,$2,'admin',TRUE,$3,$4,$5::jsonb,NOW(),NOW())
   `, [adminId, `phase6_admin_${suffix}@example.test`, adminData.name, passwordHash, JSON.stringify(adminData)]);
   await client.query('INSERT INTO auth_sessions (id,"userId","expiresAt",data,"createdAt") VALUES ($1,$2,NOW() + INTERVAL \'2 hours\',$3::jsonb,NOW())', [adminSessionHash, adminId, '{}']);
-  const adminCookie = `zezo_session=${encodeURIComponent(adminSessionId)}`;
+  let adminCookie = `zezo_session=${encodeURIComponent(adminSessionId)}`;
 
   for (let index = 0; index < usersToSeed; index++) {
     const leadId = `phase6_order_${suffix}_${index}`;
@@ -177,6 +202,19 @@ try {
   for (const legacy of [true, false]) {
     process.env.ZEZO_BENCH_LEGACY_CORE_READS = legacy ? 'true' : 'false';
     const mode = legacy ? 'before-lock-path' : 'targeted-postgres-read';
+    // The legacy branch keeps sessions in a per-process map. Seeded DB-only
+    // sessions authenticate direct reads, but cannot exercise that comparison
+    // path; log these two management roles in through the app before measuring.
+    const orderManagerLogin = await request('POST', '/api/auth/login', {
+      body: { username: `phase6_order_manager_${suffix}@example.test`, password, accountType: 'management', mfaCode: syntheticTotp(orderManagerMfaSecret) }
+    });
+    assert.equal(orderManagerLogin.status, 200, `Synthetic order manager login failed for ${mode}: ${orderManagerLogin.body}`);
+    orderManagerCookie = orderManagerLogin.sessionCookie;
+    const adminLogin = await request('POST', '/api/auth/login', {
+      body: { username: `phase6_admin_${suffix}@example.test`, password, accountType: 'management', mfaCode: syntheticTotp(adminMfaSecret) }
+    });
+    assert.equal(adminLogin.status, 200, `Synthetic Owner login failed for ${mode}: ${adminLogin.body}`);
+    adminCookie = adminLogin.sessionCookie;
     const crmLogin = await request('POST', '/api/auth/login', { body: { username: `phase6_marketer_${suffix}@example.test`, password, accountType: 'employee' } });
     assert.equal(crmLogin.status, 200, `Synthetic marketer login failed for ${mode}.`);
     ownerCookie = crmLogin.sessionCookie;

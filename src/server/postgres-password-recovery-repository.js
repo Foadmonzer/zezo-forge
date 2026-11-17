@@ -21,10 +21,33 @@ export async function issuePostgresPasswordReset({ email, resetHash, expiresAt, 
     if (outboxMessage) {
       await client.query(`
         INSERT INTO outbox_messages (id, recipient, state, attempts, data, "createdAt", "updatedAt")
-        VALUES ($1, $2, 'pending', 0, $3::jsonb, $4, $4)
+        VALUES ($1, $2, 'sending', 1, $3::jsonb, $4, $4)
       `, [outboxMessage.id, row.email || email, JSON.stringify(outboxMessage), at]);
     }
     return { kind: 'queued' };
+  });
+}
+
+/** Record synchronous password-reset SMTP delivery without putting the token or
+ * message body in the general outbox. Reset messages are never retried by the
+ * background worker because SMTP's delivery result can be ambiguous. */
+export async function completePostgresPasswordResetEmail({ id, state, failureCode = '', at }) {
+  if (!['sent', 'uncertain'].includes(state)) throw new Error('Invalid password reset mail state.');
+  return withPostgresScopedTransaction(async client => {
+    const result = await client.query(`
+      UPDATE outbox_messages
+      SET state = $2,
+          data = data || jsonb_build_object(
+            'sentAt', CASE WHEN $2 = 'sent' THEN ($3::timestamptz)::text ELSE data ->> 'sentAt' END,
+            'lastError', $4::text,
+            'workerLeaseUntil', NULL,
+            'leaseToken', NULL
+          ),
+          "updatedAt" = $3::timestamptz
+      WHERE id = $1 AND state = 'sending' AND data ->> 'kind' = 'account_password_reset'
+      RETURNING id
+    `, [id, state, at, failureCode]);
+    return Boolean(result.rows[0]);
   });
 }
 
