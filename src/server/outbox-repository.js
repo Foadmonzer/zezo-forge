@@ -23,6 +23,7 @@ export async function claimNextOutboxMessage({ allowAdmin = false, messageIds = 
           ),
           "updatedAt" = NOW()
       WHERE state = 'sending'
+        AND data ->> 'kind' IS DISTINCT FROM 'account_password_reset'
         AND COALESCE(NULLIF(data ->> 'workerLeaseUntil', '')::timestamptz, '-infinity'::timestamptz) <= NOW()
         AND (
           attempts >= 5
@@ -36,6 +37,7 @@ export async function claimNextOutboxMessage({ allowAdmin = false, messageIds = 
         SELECT id
         FROM outbox_messages
         WHERE attempts < 5
+          AND data ->> 'kind' IS DISTINCT FROM 'account_password_reset'
           AND ($2::text[] IS NULL OR id = ANY($2::text[]))
           AND (
             state IN ('pending', 'retry')

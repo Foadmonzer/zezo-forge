@@ -20,7 +20,8 @@ import { createPostgresEmployeeInvitation, revokePostgresEmployeeInvitation, rei
 import { activatePostgresEmployeeInvitation } from './src/server/postgres-activation-repository.js';
 import { createPostgresClientRegistration } from './src/server/postgres-client-registration-repository.js';
 import { updatePostgresEmployeePermissions } from './src/server/postgres-permission-repository.js';
-import { consumePostgresPasswordReset, issuePostgresPasswordReset } from './src/server/postgres-password-recovery-repository.js';
+import { completePostgresPasswordResetEmail, consumePostgresPasswordReset, issuePostgresPasswordReset } from './src/server/postgres-password-recovery-repository.js';
+import { createPasswordResetUrl, passwordRecoveryEmailReady, passwordRecoveryFailureCode, sendPasswordRecoveryEmail, verifyPasswordRecoveryTransport } from './src/server/password-recovery-mailer.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const STAGING_MODE = process.env.ZEZO_STAGING === 'true';
@@ -1059,29 +1060,48 @@ async function handlePostgresCoreRead(req, res, path) {
       json(res, 429, { error: 'محاولات كثيرة لاستعادة كلمة المرور. حاول لاحقاً / Too many password reset attempts. Try again later.' }, security);
       return true;
     }
-    if (!emailReady()) {
+    if (!passwordRecoveryEmailReady()) {
       json(res, 503, { error: 'استعادة كلمة المرور عبر البريد غير مفعّلة حالياً. تواصل مع خدمة العملاء لاستعادة الحساب / Email password recovery is not configured yet. Contact ZEZO support to recover your account.' }, security);
       return true;
     }
     if (email) {
       const rawToken = token(32);
-      const resetUrl = `${siteBase(req)}/#resetPassword=${encodeURIComponent(rawToken)}`;
+      const resetUrl = createPasswordResetUrl(rawToken);
       const at = now();
       const mailId = id('mail');
-      await issuePostgresPasswordReset({
+      const issued = await issuePostgresPasswordReset({
         email, resetHash: hash(rawToken), expiresAt: Date.now() + 60 * 60_000, at,
         outboxMessage: {
-          id: mailId, to: email, recipientType: 'direct', kind: 'account_password_reset',
-          subject: 'إعادة تعيين كلمة مرور ZEZO',
-          text: `استخدم الرابط خلال ساعة لإعادة تعيين كلمة المرور:\n${resetUrl}\n\nإذا لم تطلب ذلك، تجاهل الرسالة.\n\nرسالة آلية من ZEZO Forge. يرجى عدم الرد.`,
-          state: 'pending', attempts: 0, createdAt: at, updatedAt: at
+          id: mailId, recipientType: 'direct', kind: 'account_password_reset',
+          state: 'sending', attempts: 1, createdAt: at, updatedAt: at
         }
       });
-      // The delivery worker claims from the persistent Outbox; the API response
-      // does not wait on the provider or the legacy company-state transaction.
-      void processMailQueue().catch(() => {});
+      if (issued.kind === 'queued') {
+        let delivered = false;
+        try {
+          // Netlify functions may stop as soon as the request ends. Await SMTP
+          // delivery within this request; never hand reset mail to a background timer.
+          await sendPasswordRecoveryEmail({ to: email, resetUrl, language: body.lang === 'en' ? 'en' : 'ar' });
+          delivered = true;
+        } catch (error) {
+          const failureCode = passwordRecoveryFailureCode(error);
+          await completePostgresPasswordResetEmail({ id: mailId, state: 'uncertain', failureCode, at: now() }).catch(() => false);
+          // Log only a coarse error category. Never log address, message, URL, or token.
+          console.warn('Password recovery SMTP delivery failed:', failureCode);
+        }
+        if (delivered && !await completePostgresPasswordResetEmail({ id: mailId, state: 'sent', at: now() }).catch(() => false)) {
+          // SMTP may have accepted the message even if the delivery receipt write
+          // fails. Keep the API response generic and never retry an ambiguous send.
+          console.warn('Password recovery delivery receipt could not be stored.');
+        }
+      } else {
+        // Run the same SMTP connection/authentication path for unknown addresses
+        // to reduce response-time differences without sending a message.
+        try { await verifyPasswordRecoveryTransport(); }
+        catch (error) { console.warn('Password recovery SMTP verification failed:', passwordRecoveryFailureCode(error)); }
+      }
     }
-    json(res, 202, { ok: true, message: 'إذا كان البريد مرتبطاً بحساب نشط وخدمة البريد مفعّلة، فستصلك رسالة بالخطوات / If the email belongs to an active account and mail is configured, recovery instructions will arrive shortly.' }, security);
+    json(res, 202, { ok: true, message: 'إذا كان البريد مرتبطاً بحساب نشط وتمكن النظام من إرسال الرسالة، فستصلك تعليمات الاستعادة. لا تؤكد هذه الصفحة وصول الرسالة / If this email belongs to an active account and the system can send the message, recovery instructions will arrive. This page does not confirm delivery.' }, security);
     return true;
   }
 
