@@ -19,6 +19,7 @@ import { createPostgresWithdrawalRequest } from './src/server/postgres-withdrawa
 import { createPostgresEmployeeInvitation, revokePostgresEmployeeInvitation, reissuePostgresEmployeeInvitation } from './src/server/postgres-invitation-repository.js';
 import { activatePostgresEmployeeInvitation } from './src/server/postgres-activation-repository.js';
 import { createPostgresClientRegistration } from './src/server/postgres-client-registration-repository.js';
+import { createPostgresProjectRequest } from './src/server/postgres-project-request-repository.js';
 import { updatePostgresEmployeePermissions } from './src/server/postgres-permission-repository.js';
 import { completePostgresPasswordResetEmail, consumePostgresPasswordReset, issuePostgresPasswordReset } from './src/server/postgres-password-recovery-repository.js';
 import { createPasswordResetUrl, passwordRecoveryEmailReady, passwordRecoveryFailureCode, sendPasswordRecoveryEmail, verifyPasswordRecoveryTransport } from './src/server/password-recovery-mailer.js';
@@ -2348,6 +2349,96 @@ async function handlePostgresEmployeeActivation(req, res, path) {
   });
 }
 
+async function handlePostgresProjectRequest(req, res, path) {
+  if (req.method !== 'POST' || path !== '/api/leads') return false;
+  if (!stagingAuthorized(req)) return false;
+  const security = responseSecurityHeaders();
+  const respond = (status, body, headers = security) => { json(res, status, body, headers); return true; };
+  const auth = await directPostgresSessionUser(req);
+  if (!auth) return respond(401, { error: 'سجّل الدخول بحساب العميل لإرسال طلب رسمي / Sign in with a client account to submit an official request' });
+  if (!directRequireAuth(req, res, auth.user, ['client'])) return true;
+  const ip = req.socket?.remoteAddress || 'unknown';
+  if (!await consumeRateLimitBucket('public-enquiry', ip, 8, 60 * 60_000)) {
+    return respond(429, { error: 'وصلنا الحد المؤقت للطلبات من هذا الاتصال. حاول لاحقاً / Too many enquiries from this connection. Please try again later.' });
+  }
+
+  let body = {}, file = null;
+  if ((req.headers['content-type'] || '').toLowerCase().startsWith('multipart/form-data')) {
+    const parsed = parseMultipart(await bodyBuffer(req), req.headers['content-type']);
+    body = parsed.fields; file = parsed.file;
+  } else body = await jsonBody(req);
+  if (clean(body.website, 120)) return respond(201, { ok: true });
+
+  const phone = internationalPhone(body.whatsappCountryCode, body.whatsappLocalNumber, body.phone);
+  const details = clean(body.details, 3000);
+  const service = clean(body.service, 60);
+  const category = clean(body.category, 80);
+  const templateId = clean(body.templateId, 80);
+  const template = templateId ? templateById.get(templateId) : null;
+  const templateAction = clean(body.templateAction, 24);
+  if (!auth.user.name || auth.user.name.length < 2 || !normalizeEmail(auth.user.email) || !isE164Phone(phone) ||
+      details.length < 12 || !serviceCategories[service]?.includes(category) || body.consent !== 'true') {
+    return respond(400, { error: 'أكمل بيانات الطلب وأدخل رقم واتساب صحيحاً مع مفتاح الدولة / Complete the request and enter a valid WhatsApp number with country code' });
+  }
+  if (templateId && (!template || template.service !== service || template.category !== category || !['order', 'customize'].includes(templateAction))) {
+    return respond(400, { error: 'القالب المختار غير صالح لهذا الطلب / The selected template does not match this request' });
+  }
+
+  let attachmentFile = null;
+  if (file) {
+    const extension = extname(file.filename).toLowerCase();
+    const rules = {
+      '.pdf': { type: 'application/pdf', signature: Buffer.from('%PDF-') },
+      '.png': { type: 'image/png', signature: Buffer.from([0x89, 0x50, 0x4e, 0x47]) },
+      '.jpg': { type: 'image/jpeg', signature: Buffer.from([0xff, 0xd8, 0xff]) },
+      '.jpeg': { type: 'image/jpeg', signature: Buffer.from([0xff, 0xd8, 0xff]) },
+      '.webp': { type: 'image/webp', signature: Buffer.from('RIFF') }
+    };
+    const rule = rules[extension];
+    if (!rule || file.content.length > 4 * 1024 * 1024 || !file.content.subarray(0, rule.signature.length).equals(rule.signature)) {
+      return respond(400, { error: 'الملف غير مدعوم أو يتجاوز 4MB / Unsupported file or over 4MB' });
+    }
+    attachmentFile = { ...file, contentType: rule.type };
+  }
+
+  const conversationId = clean(body.conversationId, 80);
+  const referralVisitorId = clean(body.referralVisitorId, 80);
+  const referralVisitorHash = /^[\-_a-zA-Z0-9]{12,80}$/.test(referralVisitorId) ? hash(referralVisitorId) : '';
+  const requestedCode = clean(cookieValue(req, 'zezo_ref') || body.referralCode, 40);
+  const suppliedKey = clean(req.headers['idempotency-key'] || body.idempotencyKey, 120);
+  const idempotencyKey = /^[A-Za-z0-9_-]{32,120}$/.test(suppliedKey)
+    ? suppliedKey
+    : randomBytes(32).toString('base64url');
+  const createdAt = now();
+  const result = await createPostgresProjectRequest({
+    sessionHash: sessionKey(auth.sid), idempotencyKey,
+    payload: {
+      customerId: auth.user.id, phone, service, category, details,
+      budget: clean(body.budget, 80), templateId, templateAction, conversationId,
+      guestHash: guestSessionValue(req) ? hash(guestSessionValue(req)) : '',
+      referralVisitorHash, requestedCode, language: body.lang === 'en' ? 'en' : 'ar'
+    },
+    template: template ? { id: template.id, titleAr: template.title?.ar || '' } : null,
+    siteBase: siteBase(req), trackingTtlMs: TRACKING_TTL_MS,
+    defaultTemplateInclusion,
+    auditId: id('evt'), messageId: id('msg'), at: createdAt, file: attachmentFile
+  });
+  if (result.kind === 'unauthenticated') return respond(401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' });
+  if (result.kind === 'forbidden') return respond(403, { error: 'استخدم حساب العميل لإرسال الطلب / Use a client account to submit this request' });
+  if (result.kind === 'conversation_forbidden') return respond(403, { error: 'لا يمكن ربط الطلب بهذه المحادثة / This conversation cannot be linked to your request' });
+  if (result.kind === 'conversation_converted') return respond(409, { error: 'هذه المحادثة مرتبطة بطلب رسمي مسبقاً / This conversation already has an official request' });
+  if (result.kind === 'template_mismatch') return respond(400, { error: 'القالب لا يطابق المحادثة / Template does not match the conversation' });
+  if (result.kind === 'template_unavailable') return respond(409, { error: 'هذا القالب متوقف للطلبات حالياً؛ تواصل معنا لطلب بديل / This template is temporarily unavailable for orders; contact us for an alternative' });
+  if (result.kind === 'idempotency_conflict') return respond(409, { error: 'تغيّرت بيانات الطلب بعد محاولة سابقة. أعد الإرسال مرة واحدة لتسجيل الطلب المحدّث / The request changed after a previous attempt. Submit once more to save the updated request' });
+
+  const duplicate = result.kind === 'duplicate';
+  return respond(duplicate ? 200 : 201, {
+    ok: true, id: result.id, duplicate, attributed: Boolean(result.attributed), trackingToken: result.trackingToken,
+    emailQueued: emailReady() && adminEmailReady(),
+    mail: { customerConfigured: emailReady(), adminConfigured: emailReady() && adminEmailReady() }
+  });
+}
+
 async function handlePostgresCoreWrite(req, res, path) {
   if (!stagingAuthorized(req)) return false;
   const security = responseSecurityHeaders();
@@ -2643,6 +2734,8 @@ async function handle(req, res) {
     return json(res, 200, { createdAt: lead.createdAt, service: lead.service, status: lead.status, statusText: publicStatusLabels[lead.status]?.[lang] || publicStatusLabels.new[lang], note: lead.publicStatusNote || '' }, responseSecurityHeaders());
   }
   if (await handlePostgresEmployeeActivation(req, res, path)) return;
+  const projectRequestHandled = await handlePostgresProjectRequest(req, res, path);
+  if (projectRequestHandled) return;
   const normalizedReadHandled = process.env.ZEZO_BENCH_LEGACY_CORE_READS === 'true'
     ? false
     : await handlePostgresCoreRead(req, res, path);

@@ -780,16 +780,40 @@ try {
   assert(Number(acceptedMessageCount.rows[0].count) === 1, 'Concurrent repeated acceptances wrote more than one acceptance message.');
   results.push('two-account conversation, protected attachments, quote and acceptance complete under the legacy lock using row-scoped PostgreSQL transactions');
 
-  const officialOrder = await request('POST', '/api/leads', {
-    body: {
+  const projectRequestIdempotencyKey = randomUUID().replaceAll('-', '');
+  const projectRequestBody = {
       service: 'web', category: 'site', details: 'Synthetic landing page project request for PostgreSQL persistence checks.',
       budget: '100–300 ILS', consent: 'true', phone: '+971501234567', whatsappCountryCode: '+971',
       whatsappLocalNumber: '501234567', templateId: 'web-copper-table', templateAction: 'customize',
-      conversationId: syntheticConversationId, referralCode: marketerHome.data.user.referralCode, lang: 'en'
-    }, cookie: customerCookie
-  });
+      conversationId: syntheticConversationId, referralCode: marketerHome.data.user.referralCode,
+      idempotencyKey: projectRequestIdempotencyKey, lang: 'en'
+  };
+  const officialOrder = await request('POST', '/api/leads', { body: projectRequestBody, cookie: customerCookie });
   assert(officialOrder.status === 201 && officialOrder.data.id, `Customer official order creation failed with ${officialOrder.status}.`);
   syntheticLeadId = officialOrder.data.id;
+  const orderLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await orderLockHolder.connect();
+  let orderRetriesWhileLocked;
+  try {
+    await orderLockHolder.query('BEGIN');
+    await orderLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+    orderRetriesWhileLocked = await Promise.race([
+      Promise.all(Array.from({ length: 6 }, () => request('POST', '/api/leads', { body: projectRequestBody, cookie: customerCookie })))
+        .then(values => ({ done: true, values })),
+      new Promise(resolve => setTimeout(() => resolve({ done: false }), 1500))
+    ]);
+  } finally {
+    await orderLockHolder.query('ROLLBACK').catch(() => {});
+    await orderLockHolder.end();
+  }
+  assert(orderRetriesWhileLocked?.done && orderRetriesWhileLocked.values.every(row => row.status === 200 && row.data.id === syntheticLeadId && row.data.duplicate),
+    'Project request retries queued behind the legacy global lock or were not idempotent.');
+  const idempotentRequestRows = await client.query('SELECT count(*)::int AS count FROM project_requests WHERE id = $1', [syntheticLeadId]);
+  assert(Number(idempotentRequestRows.rows[0].count) === 1, 'Repeated concurrent project-request submissions created duplicate rows.');
+  const retryTimes = orderRetriesWhileLocked.values.map(row => row.durationMs).sort((a, b) => a - b);
+  const retryPercentile = percentile => retryTimes[Math.min(retryTimes.length - 1, Math.ceil(retryTimes.length * percentile) - 1)];
+  console.log(`[PROJECT_REQUEST_TIMING] ${JSON.stringify({ createMs: Number(officialOrder.durationMs.toFixed(1)), duplicateRetries: retryTimes.length, p50Ms: Number(retryPercentile(0.5).toFixed(1)), p95Ms: Number(retryPercentile(0.95).toFixed(1)), errors: 0, advisoryLockHeld: true })}`);
+  results.push('project creation is independent of the legacy advisory lock and concurrent retries create one request');
   const publicTrackPath = `/api/track?token=${encodeURIComponent(officialOrder.data.trackingToken)}&lang=en`;
   const publicTrack = await request('GET', publicTrackPath);
   assert(publicTrack.status === 200 && publicTrack.data.status && publicTrack.data.service === 'web' && !('email' in publicTrack.data) && !('phone' in publicTrack.data), 'Lock-free tracking read did not return the customer-safe project status fields.');
