@@ -408,7 +408,8 @@ function renderTemplatePreview(item){
   document.title=item.title[state.lang]+' · ZEZO Forge';
 }
 function templateNotice(message,error=false){
-  const el=$('#mobileDemoNotice')||$('#templatePreviewNotice');if(el){el.textContent=message;el.classList.toggle('error',Boolean(error));el.classList.add('show');setTimeout(()=>el.classList.remove('show'),2600)}
+  const isTemplatePreview=Boolean($('#zezo-legacy-root')?.classList.contains('template-preview-mode'));
+  const el=(isTemplatePreview?$('#templatePreviewNotice'):null)||$('#mobileDemoNotice')||$('#templatePreviewNotice');if(el){el.textContent=message;el.classList.toggle('error',Boolean(error));el.classList.add('show');setTimeout(()=>el.classList.remove('show'),2600)}
 }
 function exportPlanner(){
   const item=state.currentTemplate,form=$('#demoPlanner');if(!item||!form)return;
