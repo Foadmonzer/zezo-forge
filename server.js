@@ -13,6 +13,7 @@ import { deleteReferralTrackingForVisitor, loadNormalizedStore, persistNormalize
 import { loadPublicRuntimeSnapshot, loadPublicTrackRecord } from './src/server/public-read-repository.js';
 import { claimGuestConversations, findLoginAccount, loadClientDashboardData, loadConversationAssignees, loadConversationViews, loadCrmRecordsForViewer, loadCrmRelatedRows, loadEmployeeDashboardData, loadOrderManagerOrders, loadReferralEventsForUsers, loadSessionAccount, storeLoginSessionAndAudit } from './src/server/core-read-repository.js';
 import { changePostgresPassword, enablePostgresMfa, logoutPostgresSession, setupPostgresMfa } from './src/server/postgres-auth-repository.js';
+import { getRequestPublicSiteOrigin } from './src/public-site-origin.js';
 import { acceptPostgresQuote, createPostgresConversation, createPostgresConversationMessage, createPostgresQuote } from './src/server/postgres-conversation-repository.js';
 import { claimNextOutboxMessage, completeOutboxMessage } from './src/server/outbox-repository.js';
 import { createPostgresWithdrawalRequest } from './src/server/postgres-withdrawal-repository.js';
@@ -772,10 +773,11 @@ function requestIsSecure(req) {
   return trustedProxy && String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() === 'https';
 }
 function siteBase(req) {
-  const configured = STAGING_MODE ? '' : String(process.env.ZEZO_PUBLIC_URL || '').trim().replace(/\/$/, '');
-  if (configured && /^https?:\/\/[a-z0-9.-]+(?::\d+)?$/i.test(configured)) return configured;
   const host = String(req.headers.host || 'localhost').toLowerCase();
-  return `${requestIsSecure(req) ? 'https' : 'http'}://${/^[a-z0-9.-]+(?::\d+)?$/.test(host) ? host : 'localhost'}`;
+  const requestOrigin = `${requestIsSecure(req) ? 'https' : 'http'}://${/^[a-z0-9.-]+(?::\d+)?$/.test(host) ? host : 'localhost'}`;
+  const origin = getRequestPublicSiteOrigin(process.env, { isStaging: STAGING_MODE, requestOrigin });
+  if (!origin) throw new Error('Staging public URL is not configured.');
+  return origin;
 }
 async function processMailQueue() {
   if (STAGING_MODE || !emailReady()) return 0;

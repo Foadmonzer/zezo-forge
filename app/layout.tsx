@@ -1,8 +1,9 @@
 import type { Metadata, Viewport } from 'next';
 import type { ReactNode } from 'react';
+import { getPublicSiteOrigin } from '../src/public-site-origin.js';
 
 const staging = process.env.ZEZO_STAGING === 'true';
-const publicSiteUrl = 'https://zezo-forge-fouad.netlify.app';
+const publicSiteUrl = getPublicSiteOrigin();
 const title = 'ZEZO — من الفكرة إلى الواقع الرقمي';
 const description = 'من الفكرة إلى الواقع الرقمي. مواقع وتطبيقات وحلول ذكاء اصطناعي من ZEZO Digital Solutions & AI.';
 
