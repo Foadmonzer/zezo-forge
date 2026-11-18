@@ -292,11 +292,61 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   expect(crossAccountRead.status()).toBe(404);
   await marketerApi.dispose();
 
-  // Create and sign in as a customer through the actual browser form, carrying the synthetic referral.
+  // A team session left in the browser must not expose its notifications while
+  // a visitor is composing a client request; switching accounts must sign it out.
+  const staffSwitchPage = await browser.newPage({ viewport: { width: 1366, height: 900 } });
+  const staffSessionApi = await playwrightRequest.newContext({ baseURL });
+  const staffLoginResponse = await staffSessionApi.post('/api/auth/login', {
+    data: { username: marketer.username, password: marketer.password, accountType: 'employee' }
+  });
+  expect(staffLoginResponse.status()).toBe(200);
+  const staffSessionCookie = staffLoginResponse.headers()['set-cookie']?.match(/(?:^|[,;]\s*)zezo_session=([^;,\s]+)/)?.[1];
+  expect(staffSessionCookie).toBeTruthy();
+  const browserOrigin = new URL(baseURL);
+  await staffSwitchPage.context().addCookies([{
+    name: 'zezo_session', value: staffSessionCookie, domain: browserOrigin.hostname, path: '/',
+    httpOnly: true, secure: browserOrigin.protocol === 'https:', sameSite: 'Lax'
+  }]);
+  await staffSwitchPage.goto('/');
+  await waitForZezoApp(staffSwitchPage);
+  await expect(staffSwitchPage.locator('#notificationBell')).toBeHidden();
+  const staffConversationPosts = [];
+  const observeStaffConversationPost = request => {
+    if (new URL(request.url()).pathname === '/api/conversations' && request.method() === 'POST') staffConversationPosts.push(request);
+  };
+  staffSwitchPage.on('request', observeStaffConversationPost);
+  await staffSwitchPage.locator('#templateGrid').scrollIntoViewIfNeeded();
+  await staffSwitchPage.locator('[data-template-id="web-copper-table"] [data-template-request][data-template-action="order"]').click();
+  await staffSwitchPage.locator('#templateOrderModal [data-order-channel="chat"]').click();
+  await staffSwitchPage.locator('#conversationStartForm [name="message"]').fill('Synthetic request composed while a marketer session is active.');
+  await staffSwitchPage.locator('#conversationStartForm button[type="submit"]').click();
+  await expect(staffSwitchPage.locator('#authModal.open')).toBeVisible();
+  await expect(staffSwitchPage.locator('#clientSessionNotice')).toBeVisible();
+  await expect(staffSwitchPage.locator('#clientIntentNotice')).toBeVisible();
+  await expect(staffSwitchPage.locator('#notificationBell')).toBeHidden();
+  expect(staffConversationPosts).toHaveLength(0);
+  await staffSwitchPage.locator('#switchToClientAccount').click();
+  await expect(staffSwitchPage.locator('#dashboardBackdrop.open')).toHaveCount(0);
+  const afterStaffLogout = await staffSwitchPage.evaluate(async () => {
+    const response = await fetch('/api/notifications?limit=8', { credentials: 'same-origin', cache: 'no-store' });
+    return { status: response.status, body: await response.json() };
+  });
+  expect(afterStaffLogout.status).toBe(401);
+  await expect(staffSwitchPage.locator('#notificationBell')).toBeHidden();
+  await Promise.all([staffSwitchPage.close(), staffSessionApi.dispose()]);
+
+  // Reproduce the visitor journey from a clean page: keep the referral, template,
+  // and message until the visitor creates a client account, then create one chat.
   await page.setViewportSize({ width: 1366, height: 900 });
   await page.goto(`/?ref=${encodeURIComponent(referralCode)}`);
   await waitForZezoApp(page);
-  await expect(page.locator('#authModal')).toHaveCount(1);
+  await expect(page.locator('#notificationBell')).toBeHidden();
+  const anonymousNotifications = await page.evaluate(async () => {
+    const response = await fetch('/api/notifications?limit=8', { credentials: 'same-origin', cache: 'no-store' });
+    return { status: response.status, body: await response.json() };
+  });
+  expect(anonymousNotifications.status).toBe(401);
+  expect(anonymousNotifications.body.authenticated).not.toBe(true);
   const attributionResponse = await page.evaluate(async () => {
     const response = await fetch('/api/referral-attribution', { credentials: 'same-origin', cache: 'no-store' });
     return { status: response.status, body: await response.json() };
@@ -307,9 +357,29 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   expect(attributionCookie?.httpOnly).toBe(true);
   expect(attributionCookie?.sameSite).toBe('Lax');
   if (baseURL.startsWith('https://')) expect(attributionCookie?.secure).toBe(true);
-  await page.locator('.login-open').click();
+
+  const referralDb = new pg.Client({ connectionString: process.env.DATABASE_URL, application_name: 'zezo-playwright-referral-verification' });
+  await referralDb.connect();
+  const conversationCountBefore = Number((await referralDb.query('SELECT count(*)::int AS count FROM conversations')).rows[0]?.count || 0);
+  const anonymousConversationPosts = [];
+  const observeConversationPost = request => {
+    if (new URL(request.url()).pathname === '/api/conversations' && request.method() === 'POST') anonymousConversationPosts.push(request);
+  };
+  page.on('request', observeConversationPost);
+  await page.locator('#templateGrid').scrollIntoViewIfNeeded();
+  await page.locator('[data-template-id="web-copper-table"] [data-template-request][data-template-action="order"]').click();
+  await page.locator('#templateOrderModal [data-order-channel="chat"]').click();
+  const initialQuestion = 'Synthetic anonymous browser question about the restaurant template.';
+  await page.locator('#conversationStartForm [name="message"]').fill(initialQuestion);
+  await page.locator('#conversationStartForm button[type="submit"]').click();
   await expect(page.locator('#authModal.open')).toBeVisible();
+  await expect(page.locator('#customerChoicePanel [data-customer-view="login"]')).toBeVisible();
   await expect(page.locator('#customerChoicePanel [data-customer-view="register"]')).toBeVisible();
+  await expect(page.locator('#clientIntentNotice')).toContainText('لم تُرسل بعد');
+  await page.screenshot({ path: testInfo.outputPath('guest-referral-auth-choice.png'), fullPage: true });
+  expect(anonymousConversationPosts).toHaveLength(0);
+  expect(Number((await referralDb.query('SELECT count(*)::int AS count FROM conversations')).rows[0]?.count || 0)).toBe(conversationCountBefore);
+  page.off('request', observeConversationPost);
   await page.locator('#customerChoicePanel [data-customer-view="register"]').click();
   await expect(page.locator('#referralAttributionNotice')).toBeVisible();
   await expect(page.locator('#referralAttributionNotice')).toContainText(referralCode);
@@ -319,7 +389,10 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await page.locator('#clientRegisterForm [name="password"]').fill(customerPassword);
   await page.locator('#clientRegisterForm [name="confirmPassword"]').fill(customerPassword);
   await page.locator('#clientRegisterForm button[type="submit"]').click();
-  await expect(page.locator('#dashboardBackdrop.open')).toBeVisible();
+  await expect(page.locator('#conversationModal.open')).toBeVisible();
+  await expect(page.locator('#conversationMessages')).toContainText(initialQuestion);
+  await expect(page.locator('#clientIntentNotice')).toBeHidden();
+  await page.screenshot({ path: testInfo.outputPath('guest-referral-conversation-created.png'), fullPage: true });
   expect((await page.context().cookies(baseURL)).some(item => item.name === 'zezo_referral_attribution')).toBe(false);
   const customerDashboard = await page.evaluate(async () => {
     const response = await fetch('/api/dashboard', { cache: 'no-store' });
@@ -327,8 +400,6 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   });
   const customerId = customerDashboard?.user?.id;
   expect(customerId).toBeTruthy();
-  const referralDb = new pg.Client({ connectionString: process.env.DATABASE_URL, application_name: 'zezo-playwright-referral-verification' });
-  await referralDb.connect();
   const savedAttribution = await referralDb.query(
     'SELECT data ->> $2 AS value FROM user_accounts WHERE id = $1', [customerId, 'referralUserId']
   );
@@ -338,6 +409,19 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   );
   expect(savedAttribution.rows[0]?.value).toBe(marketer.id);
   expect(signupEvent.rows[0]?.count).toBe(1);
+  const persistedConversation = await referralDb.query(`
+    SELECT c."customerId", c.data ->> 'referralUserId' AS referral_user,
+      c.data ->> 'referralCode' AS referral_code, m.body
+    FROM conversations c JOIN conversation_messages m ON m."conversationId" = c.id
+    WHERE c."customerId" = $1 AND m.body = $2
+  `, [customerId, initialQuestion]);
+  expect(persistedConversation.rows).toHaveLength(1);
+  expect(persistedConversation.rows[0]).toMatchObject({
+    customerId,
+    referral_user: marketer.id,
+    referral_code: referralCode,
+    body: initialQuestion
+  });
   const marketerJourneyApi = await playwrightRequest.newContext({ baseURL });
   await json(await marketerJourneyApi.post('/api/auth/login', { data: { username: marketer.username, password: marketer.password, accountType: 'employee' } }));
   const signupDashboard = await json(await marketerJourneyApi.get('/api/dashboard'));
@@ -347,15 +431,8 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   ]));
   expect(JSON.stringify(signupDashboard.referredClients)).not.toContain(`e2e_customer_${suffix}@example.test`);
   expect(JSON.stringify(signupDashboard.referredClients)).not.toContain('501234567');
-  await page.locator('#dashboardClose').click();
 
-  // Start a template conversation and send a customer message in the browser.
-  await page.locator('#templateGrid').scrollIntoViewIfNeeded();
-  await page.locator('[data-template-id="web-copper-table"] [data-template-request][data-template-action="order"]').click();
-  await page.locator('#templateOrderModal [data-order-channel="chat"]').click();
-  await page.locator('#conversationStartForm [name="message"]').fill('Synthetic browser question about the restaurant template.');
-  await page.locator('#conversationStartForm button[type="submit"]').click();
-  await expect(page.locator('#conversationModal.open')).toBeVisible();
+  // Continue the authenticated chat, then verify it survives logout and login.
   await page.locator('#conversationReplyForm [name="message"]').fill('Synthetic customer follow-up message.');
   await page.locator('#conversationReplyForm button[type="submit"]').click();
   await expect(page.locator('#conversationMessages')).toContainText('Synthetic customer follow-up message');
@@ -584,6 +661,17 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   // Developer accepts, submits synthetic delivery; Owner reviews and completes it.
   const devPage = await browser.newPage({ viewport: { width: 1366, height: 900 } });
   await loginThroughUI(devPage, { username: developer.username, password: developer.password });
+  const dualRoleDeveloper = await devPage.evaluate(async () => {
+    const response = await fetch('/api/dashboard', { cache: 'no-store' });
+    return response.json();
+  });
+  expect(dualRoleDeveloper.user.referralCode).toBeTruthy();
+  expect(dualRoleDeveloper.referralLink).toBeTruthy();
+  expect(dualRoleDeveloper.projects.some(project => project.id === leadId)).toBe(true);
+  await expect(devPage.locator('#dashboardTabs [data-dash-tab="referral"]')).toBeVisible();
+  await devPage.locator('[data-dash-tab="referral"]').click();
+  await expect(devPage.locator('#dashboardContent')).toContainText(dualRoleDeveloper.user.referralCode);
+  await expect(devPage.locator('#dashboardContent')).toContainText(/عمولة تنفيذ المشروع منفصلة|Project execution is separate/);
   await devPage.locator('[data-dash-tab="development"]').click();
   const project = devPage.locator(`[data-project-card="${leadId}"]`);
   await expect(project).toBeVisible();

@@ -404,11 +404,14 @@ try {
   const orderManagerInvite=await invite('Smoke Order Manager','smokeorders','order_manager'),orderManagerPassword=temporaryPassword(),orderManager=await activate(orderManagerInvite,orderManagerPassword),orderManagerMfa=await enableManagementMfa(app.handle,orderManager.cookie);
   assertStatus(await call(app.handle,'GET','/api/dashboard',{cookie:orderManager.cookie}),200,'Order Manager sees the embedded conversation workspace');
   assert.equal(asJson(await call(app.handle,'GET','/api/dashboard',{cookie:orderManager.cookie})).role,'order_manager');
-  const conversationClient=await ensureTestClient(app.handle,{name:'Conversation Client',email:'conversation-client@example.test'});
-  const conversationStart=await call(app.handle,'POST','/api/conversations',{cookie:conversationClient.cookie,body:{templateId:'web-copper-table',source:'template_catalog',referralCode:marketerInvite.user.referralCode,message:'I want to order and customize the restaurant website template.'}});
+  const conversationClient=await ensureTestClient(app.handle,{name:'Conversation Client',email:'conversation-client@example.test',referralCode:marketerInvite.user.referralCode});
+  const anonymousConversation=await call(app.handle,'POST','/api/conversations',{body:{templateId:'web-copper-table',source:'template_catalog',message:'Anonymous request must not be saved.'}});
+  assertStatus(anonymousConversation,401,'anonymous visitors must authenticate before a conversation is created');
+  assertStatus(await call(app.handle,'GET','/api/notifications'),401,'anonymous visitors cannot read team notifications');
+  const conversationStart=await call(app.handle,'POST','/api/conversations',{cookie:conversationClient.cookie,body:{templateId:'web-copper-table',source:'template_catalog',referralCode:marketer.user.referralCode,message:'I want to order and customize the restaurant website template.'}});
   assertStatus(conversationStart,201,'customer starts a real template conversation');
   const conversation=asJson(conversationStart).conversation;
-  assert.equal(conversation.referralCode,marketerInvite.user.referralCode,'template chat keeps referral attribution');
+  assert.equal(conversation.referralCode,marketerInvite.user.referralCode,'template chat uses the referral bound to the client account and ignores a forged override');
   assert.equal(conversation.source,'template_catalog','template chat stores its source');
   assert.equal(conversation.status,'new','new conversation starts in the new state');
   assertStatus(await call(app.handle,'GET',`/api/conversations/${conversation.id}`,{cookie:marketer.cookie}),404,'marketer cannot read customer conversations');

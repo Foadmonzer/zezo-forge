@@ -222,6 +222,7 @@ body.reduced-motion .program-card,body.reduced-motion .support-fab{transition:no
 
 /* Customer sign-in choices and the private staff portal. */
 .auth-choice-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.auth-choice-grid>#clientIntentNotice,.auth-choice-grid>#clientSessionNotice,.auth-choice-grid>#switchToClientAccount{grid-column:1/-1}
 .auth-choice-grid .auth-access-card{display:flex;flex-direction:column;min-height:150px}
 .auth-choice-grid .auth-access-card .button{margin-top:auto}
 .button-secondary{border-color:rgba(163,255,18,.45);background:rgba(163,255,18,.07);color:#dfffb1}

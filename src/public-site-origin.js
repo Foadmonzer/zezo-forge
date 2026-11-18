@@ -1,4 +1,4 @@
-export const DEFAULT_PUBLIC_SITE_ORIGIN = 'https://zezo-forge-fouad.netlify.app';
+export const DEFAULT_PUBLIC_SITE_ORIGIN = 'https://zezoforge.com';
 
 /**
  * Parse a configured public URL as an origin only. This prevents path, query,
@@ -29,6 +29,7 @@ export function getPublicSiteOrigin(env = process.env) {
     const preview = normalizePublicSiteOrigin(env.DEPLOY_PRIME_URL || env.URL, { allowHttp: env.NODE_ENV !== 'production' });
     return preview || DEFAULT_PUBLIC_SITE_ORIGIN;
   }
+  if (env.NODE_ENV === 'production') return DEFAULT_PUBLIC_SITE_ORIGIN;
   const configured = normalizePublicSiteOrigin(env.ZEZO_PUBLIC_URL, { allowHttp: env.NODE_ENV !== 'production' });
   return configured || DEFAULT_PUBLIC_SITE_ORIGIN;
 }
@@ -53,8 +54,8 @@ export function getRequestPublicSiteOrigin(env = process.env, { isStaging = fals
     return normalizePublicSiteOrigin(requestOrigin, { allowHttp: true }) || '';
   }
 
+  if (env.NODE_ENV === 'production') return DEFAULT_PUBLIC_SITE_ORIGIN;
   const configured = normalizePublicSiteOrigin(env.ZEZO_PUBLIC_URL, { allowHttp });
   if (configured) return configured;
-  if (env.NODE_ENV === 'production') return DEFAULT_PUBLIC_SITE_ORIGIN;
   return normalizePublicSiteOrigin(requestOrigin, { allowHttp: true }) || DEFAULT_PUBLIC_SITE_ORIGIN;
 }

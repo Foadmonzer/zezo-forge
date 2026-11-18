@@ -734,30 +734,31 @@ function referralForRequest(req, body={}){
   const resolved=code?referralLinkForCode(code):null;
   return resolved?{...resolved,code,link:resolved.link}:null;
 }
-async function resolvePostgresReferralForConversation(req, body={}){
-  const visitorId=clean(body.referralVisitorId,80);
-  if(/^[\-_a-zA-Z0-9]{12,80}$/.test(visitorId)){
-    const attributed=await queryPostgres(`
-      SELECT a."userId", a.code, a.data, u.role, u.active
-      FROM referral_attributions a JOIN user_accounts u ON u.id=a."userId"
-      WHERE a."visitorHash"=$1 AND a."expiresAt">NOW()
-      LIMIT 1
-    `,[hash(visitorId)]);
-    const row=attributed.rows[0];
-    if(row)return row.active&&['marketer','developer'].includes(row.role)?{userId:row.userId,code:row.code||'',linkId:row.data?.linkId||null}:null;
-  }
-  const code=clean(cookieValue(req,'zezo_ref')||body.referralCode,40);
-  if(!code)return null;
+async function resolvePostgresReferralForConversation(clientUser){
+  const userId=clean(clientUser?.referralUserId,80),code=clean(clientUser?.referralCode||clientUser?.currentReferralCode,40),linkId=clean(clientUser?.referralLinkId,80);
+  if(!userId||!code)return null;
   const found=await queryPostgres(`
-    SELECT u.id AS "userId", $1::text AS code, l.id AS "linkId", u.role
+    SELECT u.id AS "userId", $2::text AS code,
+      (SELECT l.id FROM referral_links l WHERE l."userId"=u.id AND l.code=$2
+       ORDER BY (l.id=$3) DESC, l.active DESC, l."createdAt" DESC LIMIT 1) AS "linkId"
     FROM user_accounts u
-    LEFT JOIN referral_links l ON l."userId"=u.id AND l.code=$1 AND l.active=TRUE
-    WHERE u.active=TRUE AND u.role=ANY($2::text[])
-      AND (l.id IS NOT NULL OR u.data->>'referralCode'=$1 OR u.data->>'currentReferralCode'=$1)
-    ORDER BY (l.id IS NOT NULL) DESC
+    WHERE u.id=$1 AND u.active=TRUE AND u.role=ANY($4::text[])
+      AND (EXISTS (SELECT 1 FROM referral_links l WHERE l."userId"=u.id AND l.code=$2)
+        OR u.data->>'referralCode'=$2 OR u.data->>'currentReferralCode'=$2)
     LIMIT 1
-  `,[code,['marketer','developer']]);
-  return found.rows[0]?{userId:found.rows[0].userId,code:found.rows[0].code,linkId:found.rows[0].linkId||null}:null;
+  `,[userId,code,linkId,['marketer','developer']]);
+  const row=found.rows[0];
+  return row?{userId:row.userId,code:row.code,linkId:row.linkId||null}:null;
+}
+function referralForAuthenticatedClient(clientUser){
+  const userId=clean(clientUser?.referralUserId,80),code=clean(clientUser?.referralCode||clientUser?.currentReferralCode,40);
+  if(!userId||!code)return null;
+  const referrer=store.users.find(user=>user.id===userId&&user.active&&['marketer','developer'].includes(user.role));
+  if(!referrer)return null;
+  const resolved=referralLinkForCode(code);
+  if(resolved&&resolved.user.id!==userId)return null;
+  if(!resolved&&referrer.referralCode!==code&&referrer.currentReferralCode!==code)return null;
+  return {userId,code,linkId:clientUser.referralLinkId||resolved?.link?.id||null};
 }
 function bindClientReferral(user, attribution){
   if(user.referralUserId||!attribution?.user?.id)return false;
@@ -2553,6 +2554,8 @@ async function handlePostgresCoreWrite(req, res, path) {
   const respond = (status, body, headers = security) => { json(res, status, body, headers); return true; };
 
   if (req.method === 'POST' && path === '/api/conversations') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, ['client'])) return true;
     const ip = req.socket?.remoteAddress || 'unknown';
     if (!await consumeRateLimitBucket('conversation-start', ip, 15, 60 * 60_000)) {
       return respond(429, { error: 'وصلنا الحد المؤقت للمحادثات. حاول لاحقاً / Conversation limit reached. Try again later.' });
@@ -2563,8 +2566,6 @@ async function handlePostgresCoreWrite(req, res, path) {
       body = parsed.fields; file = parsed.file;
     } else body = await jsonBody(req);
 
-    const auth = await directPostgresSessionUser(req);
-    if (auth && !directRequireAuth(req, res, auth.user, ['client'])) return true;
     const templateId = clean(body.templateId, 80);
     const template = templateById.get(templateId);
     const message = clean(body.message, 2000);
@@ -2594,28 +2595,24 @@ async function handlePostgresCoreWrite(req, res, path) {
     const suppliedKey = clean(req.headers['idempotency-key'] || body.idempotencyKey, 120);
     const idempotencyKey = /^[A-Za-z0-9_-]{32,120}$/.test(suppliedKey) ? suppliedKey : token(24);
     const idempotencyHash = hash(idempotencyKey);
-    const guest = guestSessionValue(req) || (!auth ? token(32) : '');
-    const headers = !auth && !guestSessionValue(req)
-      ? { ...security, 'Set-Cookie': cookie('zezo_guest', guest, 30 * 24 * 60 * 60, req) }
-      : security;
-    const referral = await resolvePostgresReferralForConversation(req, body);
+    const referral = await resolvePostgresReferralForConversation(auth.user);
     const createdAt = now();
     const conversation = {
       id: `chat_${idempotencyHash.slice(0, 40)}`, createdAt, updatedAt: createdAt,
       templateId: template.id, templateName: template.title.ar, templateService: template.service,
       templateCategory: template.category, source: clean(body.source, 40) || 'template_catalog',
-      department: 'orders', status: 'new', clientId: auth?.user.role === 'client' ? auth.user.id : null,
-      guestSessionHash: auth ? null : hash(guest), assignedUserId: null,
+      department: 'orders', status: 'new', clientId: auth.user.id,
+      guestSessionHash: null, assignedUserId: null,
       referralCode: referral?.code || '', referralLinkId: referral?.linkId || null,
       referralUserId: referral?.userId || null, leadId: null, messages: []
     };
     const result = await createPostgresConversation({
-      conversation, message, attachmentFile, actor: auth?.user || null, guestHash: auth ? '' : hash(guest),
+      conversation, message, attachmentFile, actor: auth.user, guestHash: '',
       idempotencyHash, auditId: id('evt'), messageId: id('msg'), referral, at: createdAt,
       authorizeRecipient: canReceiveConversationNotification
     });
     if (result.kind === 'conflict') return respond(409, { error: 'تعذر إكمال المحادثة بهذا الطلب. حدّث الصفحة وحاول مجدداً / This conversation request could not be completed. Refresh and try again.' });
-    return respond(result.kind === 'duplicate' ? 200 : 201, { ok: true, conversation: result.conversation, messageId: result.messageId || result.conversation?.messages?.at(-1)?.id }, headers);
+    return respond(result.kind === 'duplicate' ? 200 : 201, { ok: true, conversation: result.conversation, messageId: result.messageId || result.conversation?.messages?.at(-1)?.id });
   }
 
   const conversationMessageMatch = req.method === 'POST' && /^\/api\/conversations\/([^/]+)\/messages$/.exec(path);
@@ -2945,16 +2942,15 @@ async function handleRequest(req, res) {
       return json(res, 200, { prices: store.settings.prices.filter(price=>price.active!==false), templatePrices: store.settings.templatePrices || {}, templateInclusions:store.settings.templateInclusions||{}, templateActive:store.settings.templateActive||{}, commissionConfigured: store.settings.commissionPercent != null, customerSupportWhatsappNumber:customerSupportPhone, ordersWhatsappNumber:ordersPhone, customerSupportWhatsappUrl:buildWhatsAppUrl(customerSupportPhone), ordersWhatsappUrl:ordersUrl, whatsappUrl:ordersUrl, emailReady: emailReady() && adminEmailReady(), aiQuoteReady:!STAGING_MODE&&Boolean(process.env.OPENAI_API_KEY&&process.env.OPENAI_MODEL), stagingMode:STAGING_MODE }, security);
     }
     if(req.method==='POST'&&path==='/api/conversations'){
+      const auth=requireAuth(req,res,['client']);if(!auth)return;
       if(!await rateAllowedFor(conversationAttempts,`create:${req.socket.remoteAddress||'unknown'}`,15,60*60_000))return json(res,429,{error:'وصلنا الحد المؤقت للمحادثات. حاول لاحقاً / Conversation limit reached. Try again later.'},security);
-      let b={},file=null;if((req.headers['content-type']||'').toLowerCase().startsWith('multipart/form-data')){const parsed=parseMultipart(await bodyBuffer(req),req.headers['content-type']);b=parsed.fields;file=parsed.file;}else b=await jsonBody(req);const templateId=clean(b.templateId,80),template=templateById.get(templateId),message=clean(b.message,2000),auth=sessionUser(req);
-      if(auth&&auth.user.role!=='client')return json(res,403,{error:'إنشاء محادثة قالب متاح للعميل فقط / Template conversations are for customers'},security);
+      let b={},file=null;if((req.headers['content-type']||'').toLowerCase().startsWith('multipart/form-data')){const parsed=parseMultipart(await bodyBuffer(req),req.headers['content-type']);b=parsed.fields;file=parsed.file;}else b=await jsonBody(req);const templateId=clean(b.templateId,80),template=templateById.get(templateId),message=clean(b.message,2000);
       if(!template||store.settings.templateActive?.[templateId]===false||message.length<5)return json(res,400,{error:'اختر قالباً متاحاً واكتب استفسارك / Choose an available template and enter your question'},security);
-      let guest=guestSessionValue(req),headers={};if(!auth&&!guest){guest=token(32);headers['Set-Cookie']=cookie('zezo_guest',guest,30*24*60*60,req);}
-      const referralCode=clean(b.referralCode||url.searchParams.get('ref'),40),resolved=referralForRequest(req,{...b,referralCode}),conv={id:id('chat'),createdAt:now(),updatedAt:now(),templateId:template.id,templateName:template.title.ar,templateService:template.service,templateCategory:template.category,source:clean(b.source,40)||'template_catalog',department:'orders',status:'new',clientId:auth?.user.role==='client'?auth.user.id:null,guestSessionHash:auth?null:hash(guest),assignedUserId:null,referralCode:resolved?.code||'',referralLinkId:resolved?.link?.id||null,referralUserId:resolved?.user?.id||null,leadId:null,messages:[],quote:null,agreedPriceSnapshot:null};
-      const attachment=await saveUpload(file,conv.clientId),first=appendConversationMessage(conv,{senderType:conv.clientId?'client':'guest',senderId:conv.clientId||'',text:message,attachment});store.conversations.unshift(conv);
+      const resolved=referralForAuthenticatedClient(auth.user),conv={id:id('chat'),createdAt:now(),updatedAt:now(),templateId:template.id,templateName:template.title.ar,templateService:template.service,templateCategory:template.category,source:clean(b.source,40)||'template_catalog',department:'orders',status:'new',clientId:auth.user.id,guestSessionHash:null,assignedUserId:null,referralCode:resolved?.code||'',referralLinkId:resolved?.linkId||null,referralUserId:resolved?.userId||null,leadId:null,messages:[],quote:null,agreedPriceSnapshot:null};
+      const attachment=await saveUpload(file,conv.clientId),first=appendConversationMessage(conv,{senderType:'client',senderId:conv.clientId,text:message,attachment});store.conversations.unshift(conv);
       if(conv.referralUserId)recordReferralEvent({userId:conv.referralUserId,code:conv.referralCode,linkId:conv.referralLinkId,type:'inquiry_confirmed',resourceId:conv.id,idempotencyKey:`conversation_inquiry:${conv.id}`});
-      audit(auth?.user||null,'template_conversation_created',conv.id,`${conv.templateId}; referral=${conv.referralCode||'none'}`);notifyConversation(conv,'created',auth?.user||null);await persist();
-      return json(res,201,{ok:true,conversation:safeConversation(conv,false),messageId:first.id}, {...security,...headers});
+      audit(auth.user,'template_conversation_created',conv.id,`${conv.templateId}; referral=${conv.referralCode||'none'}`);notifyConversation(conv,'created',auth.user);await persist();
+      return json(res,201,{ok:true,conversation:safeConversation(conv,false),messageId:first.id},security);
     }
     if(req.method==='GET'&&path==='/api/conversations'){
       const auth=requireAuth(req,res);if(!auth)return;let changed=false;

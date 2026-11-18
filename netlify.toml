@@ -1,2 +1,14 @@
 [build]
 command = "pnpm build"
+
+[[redirects]]
+from = "http://zezo-forge-fouad.netlify.app/*"
+to = "https://zezoforge.com/:splat"
+status = 301
+force = true
+
+[[redirects]]
+from = "https://zezo-forge-fouad.netlify.app/*"
+to = "https://zezoforge.com/:splat"
+status = 301
+force = true
