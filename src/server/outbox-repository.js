@@ -1,13 +1,23 @@
 import { randomBytes } from 'node:crypto';
-import { withPostgresTransaction } from './postgres-runtime.js';
+import { withPostgresScopedTransaction } from './postgres-runtime.js';
 
 const leaseSeconds = 120;
 const providerIdempotencyWindowHours = 24;
 
+// The legacy snapshot writer upserts this table while holding SHARE ROW EXCLUSIVE.
+// Keep a conflicting lock on this one table, but avoid its global advisory queue
+// and unrelated company-wide table locks for worker state transitions.
+function withOutboxTransaction(work) {
+  return withPostgresScopedTransaction(async client => {
+    await client.query('LOCK TABLE outbox_messages IN ROW EXCLUSIVE MODE');
+    return work(client);
+  });
+}
+
 /** Atomically lease one message, with a stable provider idempotency key (the row id). */
 export async function claimNextOutboxMessage({ allowAdmin = false, messageIds = null } = {}) {
   const leaseToken = randomBytes(24).toString('hex');
-  return withPostgresTransaction(async client => {
+  return withOutboxTransaction(async client => {
     // A request that died while waiting for its provider is ambiguous. Retry it only
     // inside the provider's documented idempotency window; older rows need review.
     await client.query(`
@@ -76,7 +86,7 @@ export async function claimNextOutboxMessage({ allowAdmin = false, messageIds = 
 /** Complete only the worker that owns the current lease. */
 export async function completeOutboxMessage(id, leaseToken, { state, providerId = '', lastError = '' } = {}) {
   if (!['sent', 'retry', 'failed'].includes(state)) throw new Error('Invalid outbox completion state.');
-  return withPostgresTransaction(async client => {
+  return withOutboxTransaction(async client => {
     const result = await client.query(`
       UPDATE outbox_messages
       SET state = $3,
