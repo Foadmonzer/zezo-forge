@@ -1,52 +1,42 @@
+import { createHash } from 'node:crypto';
 import { withPostgresScopedTransaction } from './postgres-runtime.js';
 
 const asObject = value => value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 
-async function resolveReferral(client, visitorHash, requestedCode) {
-  let code = requestedCode || '';
-  let attributedUserId = null;
-  let attributedLinkId = '';
-  if (visitorHash) {
-    const attribution = await client.query(`
-      SELECT "userId", code, data
-      FROM referral_attributions
-      WHERE "visitorHash" = $1 AND "expiresAt" > NOW()
-      LIMIT 1
-    `, [visitorHash]);
-    const row = attribution.rows[0];
-    if (row) {
-      code = String(row.code || '');
-      attributedUserId = row.userId;
-      attributedLinkId = String(asObject(row.data).linkId || '');
-    }
-  }
-  if (!code) return null;
-
-  const result = await client.query(`
-    SELECT u.id, u.email, u.data, link.id AS link_id
+async function resolveReferral(client, visitorHash) {
+  // Only a server-issued opaque first-party cookie can prove a referral.
+  // Ignore referral codes and visitor IDs sent in request bodies or URLs.
+  if (!visitorHash) return null;
+  const attribution = await client.query(`
+    SELECT a."userId", a.code, a.data, u.email
+    FROM referral_attributions a
+    JOIN user_accounts u ON u.id = a."userId"
+    LEFT JOIN referral_links l ON l."userId" = u.id AND l.code = a.code AND l.active = TRUE
+    WHERE a."visitorHash" = $1 AND a."expiresAt" > NOW()
+      AND u.active = TRUE AND u.role = ANY($2::text[])
+      AND (l.id IS NOT NULL OR u.data->>'referralCode' = a.code OR u.data->>'currentReferralCode' = a.code)
+    LIMIT 1 FOR UPDATE OF a
+  `, [visitorHash, ['marketer', 'developer']]);
+  const row = attribution.rows[0];
+  if (!row) return null;
+  const code = String(row.code || '');
+  const referrer = await client.query(`
+    SELECT u.id, u.email, l.id AS link_id
     FROM user_accounts u
-    LEFT JOIN referral_links link ON link."userId" = u.id AND link.code = $1
-    WHERE u.active = TRUE
-      AND u.role = ANY($2::text[])
-      AND (
-        ($3::text IS NOT NULL AND u.id = $3)
-        OR ($3::text IS NULL AND (link.id IS NOT NULL OR u.data ->> 'referralCode' = $1))
-      )
-    ORDER BY CASE WHEN link.id IS NULL THEN 1 ELSE 0 END
+    LEFT JOIN referral_links l ON l."userId" = u.id AND l.code = $2 AND l.active = TRUE
+    WHERE u.id = $1 AND u.active = TRUE AND u.role = ANY($3::text[])
+      AND (l.id IS NOT NULL OR u.data->>'referralCode' = $2 OR u.data->>'currentReferralCode' = $2)
     LIMIT 1
-  `, [code, ['marketer', 'developer'], attributedUserId]);
-  const referrer = result.rows[0];
-  if (!referrer) return null;
-  return {
-    userId: referrer.id,
-    code,
-    linkId: referrer.link_id || attributedLinkId || `legacy_${referrer.id}`
-  };
+  `, [row.userId, code, ['marketer', 'developer']]);
+  const active = referrer.rows[0];
+  if (!active) return null;
+  return { userId: active.id, email: String(active.email || '').trim().toLowerCase(), code,
+    linkId: active.link_id || String(asObject(row.data).linkId || `legacy_${active.id}`) };
 }
 
 /** Create a customer account, session, audit record, and optional verification outbox entry atomically. */
 export async function createPostgresClientRegistration({
-  user, referralVisitorHash = '', referralCode = '', auditId, at,
+  user, referralVisitorHash = '', auditId, at,
   verificationRequired = false, sessionHash = '', sessionExpiresAt = null, outboxMessage = null
 }) {
   try {
@@ -60,9 +50,9 @@ export async function createPostgresClientRegistration({
       );
       if (duplicate.rowCount) return { kind: 'duplicate' };
 
-      const referral = await resolveReferral(client, referralVisitorHash, referralCode);
+      const referral = await resolveReferral(client, referralVisitorHash);
       const persistedUser = { ...user };
-      if (referral && referral.userId !== persistedUser.id) {
+      if (referral && referral.userId !== persistedUser.id && referral.email !== String(persistedUser.email || '').trim().toLowerCase()) {
         persistedUser.referralUserId = referral.userId;
         persistedUser.referralCode = referral.code;
         persistedUser.referralLinkId = referral.linkId;
@@ -75,6 +65,22 @@ export async function createPostgresClientRegistration({
         VALUES ($1, $2, $3, 'client', $4, $5, $6, $7::jsonb, $8, $8)
       `, [persistedUser.id, persistedUser.email, persistedUser.username, persistedUser.active,
         persistedUser.name, persistedUser.passwordHash, JSON.stringify(persistedUser), at]);
+
+      if (persistedUser.referralUserId && referralVisitorHash) {
+        const signupEventId = `rfe_signup_${createHash('sha256').update(`${persistedUser.referralUserId}:${persistedUser.id}`).digest('hex').slice(0, 32)}`;
+        await client.query(`
+          INSERT INTO referral_events (id, "userId", code, "eventType", "resourceId", "idempotencyKey", data, "createdAt")
+          VALUES ($1, $2, $3, 'client_signup', $4, $5, $6::jsonb, $7)
+          ON CONFLICT ("idempotencyKey") DO NOTHING
+        `, [signupEventId, persistedUser.referralUserId, persistedUser.referralCode, persistedUser.id,
+          `client_signup:${persistedUser.id}`, JSON.stringify({ linkId: persistedUser.referralLinkId, clientId: persistedUser.id, attributedAt: at }), at]);
+        await client.query(`
+          UPDATE referral_attributions
+          SET "expiresAt" = $2,
+              data = data || jsonb_build_object('boundClientId', $3::text, 'boundAt', $2::text)
+          WHERE "visitorHash" = $1 AND "expiresAt" > $2
+        `, [referralVisitorHash, at, persistedUser.id]);
+      }
 
       await client.query(`
         INSERT INTO audit_entries (id, "actorId", action, "targetId", data, "createdAt")

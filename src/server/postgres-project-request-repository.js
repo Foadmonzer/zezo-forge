@@ -18,9 +18,9 @@ async function activeReferrer(client, { userId = '', code = '' } = {}) {
     LEFT JOIN referral_links l
       ON l."userId" = u.id AND l.active = TRUE
       AND (($2::text <> '' AND l.code = $2) OR ($2::text = '' AND l.id = u.data ->> 'currentReferralLinkId'))
-    WHERE u.active = TRUE AND u.role = ANY($3::text[])
+    WHERE u.role = ANY($3::text[])
       AND (($1::text <> '' AND u.id = $1)
-        OR ($1::text = '' AND (l.id IS NOT NULL OR u.data ->> 'referralCode' = $2 OR u.data ->> 'currentReferralCode' = $2)))
+        OR ($1::text = '' AND u.active = TRUE AND (l.id IS NOT NULL OR u.data ->> 'referralCode' = $2 OR u.data ->> 'currentReferralCode' = $2)))
     ORDER BY (l.id IS NOT NULL) DESC
     LIMIT 1
   `, [String(userId || ''), normalizedCode, ['marketer', 'developer']]);
@@ -34,29 +34,15 @@ async function activeReferrer(client, { userId = '', code = '' } = {}) {
   };
 }
 
-async function resolveReferral(client, { customer, conversation, visitorHash, requestedCode }) {
+async function resolveReferral(client, customer) {
   if (customer.referralUserId) {
     const existing = await activeReferrer(client, { userId: customer.referralUserId, code: customer.referralCode || '' });
     if (existing) return { ...existing, linkId: customer.referralLinkId || existing.linkId };
   }
-  if (conversation?.referralCode) {
-    const fromConversation = await activeReferrer(client, { code: conversation.referralCode });
-    if (fromConversation) return { ...fromConversation, linkId: conversation.referralLinkId || fromConversation.linkId };
-  }
-  if (visitorHash) {
-    const attribution = await client.query(`
-      SELECT "userId", code, data
-      FROM referral_attributions
-      WHERE "visitorHash" = $1 AND "expiresAt" > NOW()
-      ORDER BY "createdAt" DESC LIMIT 1
-    `, [visitorHash]);
-    const row = attribution.rows[0];
-    if (row) {
-      const resolved = await activeReferrer(client, { userId: row.userId, code: row.code });
-      if (resolved) return { ...resolved, linkId: object(row.data).linkId || resolved.linkId };
-    }
-  }
-  return activeReferrer(client, { code: requestedCode || '' });
+  // Once registered, only the durable sponsor on the client account may
+  // attribute a project. Conversations, URL parameters, and submitted fields
+  // cannot assign or replace a marketer.
+  return null;
 }
 
 async function crmDuplicateCandidates(client, { phone, email, leadId }) {
@@ -133,7 +119,6 @@ export async function createPostgresProjectRequest({
     phone: payload.phone, service: payload.service, category: payload.category,
     details: payload.details, budget: payload.budget, templateId: payload.templateId,
     templateAction: payload.templateAction, conversationId: payload.conversationId,
-    referralVisitorHash: payload.referralVisitorHash, referralCode: payload.requestedCode,
     fileName: file?.filename || '', fileSize: file?.content?.length || 0,
     fileHash: file?.content ? digest(file.content) : ''
   }));
@@ -202,10 +187,7 @@ export async function createPostgresProjectRequest({
     const templateActive = priceRow ? priceRow.active !== false : settings.templateActive?.[payload.templateId] !== false;
     if (payload.templateId && !templateActive) return { kind: 'template_unavailable' };
 
-    let referral = await resolveReferral(client, {
-      customer, conversation, visitorHash: payload.referralVisitorHash,
-      requestedCode: payload.requestedCode
-    });
+    let referral = await resolveReferral(client, customer);
     const normalizedEmail = normalizeEmail(customer.email);
     const normalizedPhone = normalizePhone(payload.phone);
     if (referral && (
@@ -310,12 +292,6 @@ export async function createPostgresProjectRequest({
     `, [crmId, crmStatus, lead.source, JSON.stringify(crm), at]);
 
     const nextCustomerData = { ...object(userRow.data), phone: payload.phone };
-    if (!nextCustomerData.referralUserId && referral) {
-      nextCustomerData.referralUserId = referral.id;
-      nextCustomerData.referralCode = referralCode;
-      nextCustomerData.referralLinkId = referral.linkId;
-      nextCustomerData.referralBoundAt = createdAt;
-    }
     await client.query('UPDATE user_accounts SET data = $2::jsonb, "updatedAt" = $3 WHERE id = $1', [customer.id, JSON.stringify(nextCustomerData), at]);
 
     if (conversation) {

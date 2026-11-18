@@ -334,7 +334,7 @@ try {
   assert.equal(referralReport.summary.serviceViews,1);
   assert.equal(referralReport.summary.templateViews,1);
   assert.equal(referralReport.summary.whatsappClicks,1);
-  assert.doesNotMatch(JSON.stringify(referralReport),/temporary@example\.test|Temporary Client|smoke test request/i,'referral analytics never includes client contact or brief text');
+  assert.doesNotMatch(JSON.stringify(referralReport),/temporary@example\.test|\+971500000099|smoke test request|distinct returning visitor request/i,'referral analytics never includes client contact or brief text');
   assertStatus(await call(app.handle,'GET','/api/referral-intelligence'),401,'referral report requires authentication');
   const returningReferralLead=asJson(await call(app.handle,'POST','/api/leads',{remoteAddress:'127.0.0.40',body:{name:'Returning Referral Client',email:'returning-referral@example.test',phone:'',service:'web',category:'site',details:'A distinct returning visitor request for a landing page.',budget:'300 ILS',consent:'true',referralVisitorId:visitorId}}));
   assert.equal(returningReferralLead.attributed,true,'server-side consented visitor attribution survives client navigation without resubmitting the referral code');
@@ -343,7 +343,7 @@ try {
   assert.equal(attributedRequest.referralCode,currentReferralLink.code,'first-touch original monthly link receives the later request');
   assert.equal(attributedRequest.referralLinkId,currentReferralLink.id,'request is pinned to its original monthly-link record');
   assert.equal(marketerDash.rank.qualifiedSales,0,'unpaid enquiries do not qualify for rank sales');
-  assert.doesNotMatch(JSON.stringify(marketerDash), /temporary@example\.test|Temporary Client|smoke test request/i, 'marketer view must not expose client contact or description');
+  assert.doesNotMatch(JSON.stringify(marketerDash), /temporary@example\.test|\+971500000099|smoke test request|distinct returning visitor request/i, 'marketer view must not expose client contact or description');
   assert.doesNotMatch(JSON.stringify(marketerDash), /\+971500000099|wa\.me\/971500000099/i, 'marketers cannot see a client WhatsApp number');
 
   const marketingInvite = await invite('Smoke Marketing Lead', 'smokemarketing', 'marketing_manager');

@@ -296,10 +296,23 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await page.setViewportSize({ width: 1366, height: 900 });
   await page.goto(`/?ref=${encodeURIComponent(referralCode)}`);
   await waitForZezoApp(page);
+  await expect(page.locator('#authModal')).toHaveCount(1);
+  const attributionResponse = await page.evaluate(async () => {
+    const response = await fetch('/api/referral-attribution', { credentials: 'same-origin', cache: 'no-store' });
+    return { status: response.status, body: await response.json() };
+  });
+  expect(attributionResponse.status).toBe(200);
+  expect(attributionResponse.body).toMatchObject({ attributed: true, code: referralCode });
+  const attributionCookie = (await page.context().cookies(baseURL)).find(item => item.name === 'zezo_referral_attribution');
+  expect(attributionCookie?.httpOnly).toBe(true);
+  expect(attributionCookie?.sameSite).toBe('Lax');
+  if (baseURL.startsWith('https://')) expect(attributionCookie?.secure).toBe(true);
   await page.locator('.login-open').click();
   await expect(page.locator('#authModal.open')).toBeVisible();
   await expect(page.locator('#customerChoicePanel [data-customer-view="register"]')).toBeVisible();
   await page.locator('#customerChoicePanel [data-customer-view="register"]').click();
+  await expect(page.locator('#referralAttributionNotice')).toBeVisible();
+  await expect(page.locator('#referralAttributionNotice')).toContainText(referralCode);
   await page.locator('#clientRegisterForm [name="name"]').fill('Synthetic Browser Customer');
   await page.locator('#clientRegisterForm [name="email"]').fill(`e2e_customer_${suffix}@example.test`);
   const customerPassword = `Customer!${suffix}Password2026`;
@@ -307,6 +320,33 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await page.locator('#clientRegisterForm [name="confirmPassword"]').fill(customerPassword);
   await page.locator('#clientRegisterForm button[type="submit"]').click();
   await expect(page.locator('#dashboardBackdrop.open')).toBeVisible();
+  expect((await page.context().cookies(baseURL)).some(item => item.name === 'zezo_referral_attribution')).toBe(false);
+  const customerDashboard = await page.evaluate(async () => {
+    const response = await fetch('/api/dashboard', { cache: 'no-store' });
+    return response.ok ? response.json() : null;
+  });
+  const customerId = customerDashboard?.user?.id;
+  expect(customerId).toBeTruthy();
+  const referralDb = new pg.Client({ connectionString: process.env.DATABASE_URL, application_name: 'zezo-playwright-referral-verification' });
+  await referralDb.connect();
+  const savedAttribution = await referralDb.query(
+    'SELECT data ->> $2 AS value FROM user_accounts WHERE id = $1', [customerId, 'referralUserId']
+  );
+  const signupEvent = await referralDb.query(
+    'SELECT COUNT(*)::int AS count FROM referral_events WHERE "userId" = $1 AND "eventType" = $2 AND "resourceId" = $3',
+    [marketer.id, 'client_signup', customerId]
+  );
+  expect(savedAttribution.rows[0]?.value).toBe(marketer.id);
+  expect(signupEvent.rows[0]?.count).toBe(1);
+  const marketerJourneyApi = await playwrightRequest.newContext({ baseURL });
+  await json(await marketerJourneyApi.post('/api/auth/login', { data: { username: marketer.username, password: marketer.password, accountType: 'employee' } }));
+  const signupDashboard = await json(await marketerJourneyApi.get('/api/dashboard'));
+  expect(signupDashboard.referralMetrics.signups).toBe(1);
+  expect(signupDashboard.referredClients).toEqual(expect.arrayContaining([
+    expect.objectContaining({ id: customerId, name: 'Synthetic Browser Customer', requestCount: 0 })
+  ]));
+  expect(JSON.stringify(signupDashboard.referredClients)).not.toContain(`e2e_customer_${suffix}@example.test`);
+  expect(JSON.stringify(signupDashboard.referredClients)).not.toContain('501234567');
   await page.locator('#dashboardClose').click();
 
   // Start a template conversation and send a customer message in the browser.
@@ -387,6 +427,16 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   });
   expect(orderResult?.id).toBeTruthy();
   const leadId = orderResult.id;
+  const savedRequestAttribution = await referralDb.query(
+    'SELECT "referrerId", data ->> $2 AS referral_user_id, data ->> $3 AS referral_code FROM project_requests WHERE id = $1',
+    [leadId, 'referralUserId', 'referralCode']
+  );
+  expect(savedRequestAttribution.rows[0]?.referrerId).toBe(marketer.id);
+  expect(savedRequestAttribution.rows[0]?.referral_user_id).toBe(marketer.id);
+  expect(savedRequestAttribution.rows[0]?.referral_code).toBe(referralCode);
+  const marketerAfterRequest = await json(await marketerJourneyApi.get('/api/dashboard'));
+  expect(marketerAfterRequest.leads.some(lead => lead.id === leadId)).toBe(true);
+  expect(marketerAfterRequest.referredClients[0]?.requestCount).toBe(1);
 
   // Owner: assign developer and record a synthetic, verified manual payment in the UI.
   const ownerPage = await browser.newPage({ viewport: { width: 1366, height: 900 } });
@@ -590,12 +640,14 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await marketerPage.locator('[data-dash-tab="referral"]').click();
   await expect(marketerPage.locator('#dashboardContent')).toContainText(/Rookie|مبتدئ/);
   await expect(marketerPage.locator('#dashboardContent')).toContainText('15%');
-  await expect(marketerPage.locator('#dashboardContent')).not.toContainText('Synthetic Browser Customer');
+  await expect(marketerPage.locator('#dashboardContent')).toContainText('Synthetic Browser Customer');
+  await expect(marketerPage.locator('#dashboardContent')).not.toContainText(`e2e_customer_${suffix}@example.test`);
+  await expect(marketerPage.locator('#dashboardContent')).not.toContainText('501234567');
   await expect(marketerPage.locator('#dashboardContent')).not.toContainText('Synthetic E2E Owner');
   await workspaceViewportMatrix(marketerPage, 'referral', 'marketer', testInfo);
   await expect(page.locator('#dashboardContent')).not.toContainText('Synthetic E2E Owner');
 
-  await Promise.all([ownerApi.dispose(), ownerPage.close(), marketerPage.close()]);
+  await Promise.all([ownerApi.dispose(), marketerJourneyApi.dispose(), ownerPage.close(), marketerPage.close(), referralDb.end()]);
 });
 
 test('interactive demos perform their core local actions without external services', async ({ page, browserName }) => {

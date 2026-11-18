@@ -40,6 +40,8 @@ jobs:
       - run: pnpm exec prisma validate
       - name: Verify safe API error responses
         run: node --test scripts/api-error-response.test.mjs
+      - name: Verify public site URL and production Host-header safety
+        run: pnpm test:public-site-origin
       - name: Migrate, test, and benchmark isolated PostgreSQL
         env:
           PGHOST: 127.0.0.1
