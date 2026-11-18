@@ -48,8 +48,8 @@ test('staging gate protects pages, API, and static assets until a secure session
   expect(gateCookie.domain.replace(/^\\./, ''), `session cookie domain ${gateCookie.domain} should match page host ${pageUrl.hostname}`).toBe(pageUrl.hostname);
   expect(gateCookie.sameSite).toBe('Strict');
   expect(gateCookie.secure, 'local HTTP browser tests must not receive a Secure-only cookie').toBe(false);
-  const browserApiResponse = await page.goto('/api/public');
-  expect(browserApiResponse?.status(), 'the browser should send the issued staging cookie on same-origin requests').toBe(200);
+  const browserApiResponse = await page.request.get('/api/public');
+  expect(browserApiResponse.status(), 'the browser context should send the issued staging cookie on same-origin requests').toBe(200);
   const authorizedApi = await request.get('/api/public', { headers: { cookie: `zezo_staging_access=${gateCookie.value}` } });
   expect(authorizedApi.status(), 'the server should accept the session cookie minted by the staging login').toBe(200);
   expect(await page.evaluate(() => document.cookie)).not.toContain('zezo_staging_access');
@@ -58,8 +58,8 @@ test('staging gate protects pages, API, and static assets until a secure session
 
   await page.goto('/__staging/logout');
   await expect(page.getByRole('heading', { name: 'دخول بيئة الاختبار' })).toBeVisible();
-  const anonymousApiResponse = await page.goto('/api/public');
-  expect(anonymousApiResponse?.status(), 'logging out should remove the staging cookie from subsequent browser requests').toBe(401);
+  const anonymousApiResponse = await page.request.get('/api/public');
+  expect(anonymousApiResponse.status(), 'logging out should remove the staging cookie from subsequent browser requests').toBe(401);
 
   const robots = await request.get('/robots.txt');
   expect(robots.status()).toBe(200);

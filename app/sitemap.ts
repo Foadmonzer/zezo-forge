@@ -1,11 +1,10 @@
 import type { MetadataRoute } from 'next';
-
-const siteUrl = 'https://zezo-forge-fouad.netlify.app';
+import { getPublicSiteOrigin } from '../src/public-site-origin.js';
 
 export default function sitemap(): MetadataRoute.Sitemap {
   if (process.env.ZEZO_STAGING === 'true') return [];
   return [{
-    url: siteUrl,
+    url: getPublicSiteOrigin(),
     changeFrequency: 'weekly',
     priority: 1
   }];

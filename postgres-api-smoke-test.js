@@ -32,6 +32,7 @@ const testRateBuckets = [
   rateBucket('client-registration:127.0.0.1'), rateBucket(`login:127.0.0.1:${customerEmail}`),
   rateBucket('conversation:create:127.0.0.1'), rateBucket('public-enquiry:127.0.0.1'),
   rateBucket('quote:127.0.0.1'), rateBucket('quote:referral:127.0.0.1'), rateBucket('referral:127.0.0.1'),
+  rateBucket('referral-attribution:127.0.0.1'), rateBucket('referral-events:127.0.0.1'), rateBucket('referral-consent-revoke:127.0.0.1'),
   rateBucket('employee-activation:127.0.0.1')
 ];
 
@@ -87,8 +88,16 @@ function multipartForm(fields, file, boundary) {
 }
 
 function cookieFrom(response) {
-  const value = response.headers['Set-Cookie'];
-  assert(typeof value === 'string' && value.startsWith('zezo_session='), 'Authentication response did not issue a session cookie.');
+  const values = Array.isArray(response.headers['Set-Cookie']) ? response.headers['Set-Cookie'] : [response.headers['Set-Cookie']];
+  const value = values.find(item => typeof item === 'string' && item.startsWith('zezo_session='));
+  assert(typeof value === 'string', 'Authentication response did not issue a session cookie.');
+  return value.split(';', 1)[0];
+}
+
+function referralCookieFrom(response) {
+  const values = Array.isArray(response.headers['Set-Cookie']) ? response.headers['Set-Cookie'] : [response.headers['Set-Cookie']];
+  const value = values.find(item => typeof item === 'string' && item.startsWith('zezo_referral_attribution='));
+  assert(typeof value === 'string' && /HttpOnly/.test(value) && /SameSite=Lax/.test(value), 'Referral capture did not issue an HttpOnly first-party cookie.');
   return value.split(';', 1)[0];
 }
 
@@ -247,7 +256,11 @@ try {
   `, [referralLinkId, referralUserId, referralCode, JSON.stringify({ id: referralLinkId, userId: referralUserId, code: referralCode, month: '2026-11', kind: 'monthly' })]);
   syntheticIds.push(referralUserId);
 
-  const customerRegistrationBody = { name: 'Synthetic Test Customer', email: customerEmail, password: customerPassword, confirmPassword: customerPassword, student: false, role: 'admin' };
+  const customerRegistrationBody = { name: 'Synthetic Test Customer', email: customerEmail, password: customerPassword, confirmPassword: customerPassword, student: false, role: 'admin', referralCode: 'FORGED-BODY-CODE', referralVisitorId: `forgedvisitor${testSuffix}` };
+  const capturedReferral = await request('GET', `/api/referral-attribution?ref=${encodeURIComponent(referralCode)}`);
+  assert(capturedReferral.status === 200 && capturedReferral.data.attributed === true && capturedReferral.data.code === referralCode,
+    'Server did not capture a valid first-touch referral in PostgreSQL.');
+  const capturedReferralCookie = referralCookieFrom(capturedReferral);
   const registrationLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
   await registrationLockHolder.connect();
   let customerRegistration;
@@ -257,7 +270,7 @@ try {
   try {
     await registrationLockHolder.query('BEGIN');
     await registrationLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
-    registrationPromise = request('POST', '/api/client/register', { body: customerRegistrationBody });
+    registrationPromise = request('POST', '/api/client/register', { body: customerRegistrationBody, cookie: capturedReferralCookie });
     customerRegistration = await Promise.race([
       registrationPromise,
       new Promise((_, reject) => {
@@ -277,22 +290,25 @@ try {
   }
   assert(customerRegistration.status === 201, `Synthetic customer registration failed with ${customerRegistration.status}.`);
   assert(customerRegistration.data.user?.role === 'client', 'Client registration request could not escalate its role to Owner.');
-  const customerId = customerRegistration.data.user.id;
+  let customerId = customerRegistration.data.user.id;
   syntheticIds.push(customerId);
   const duplicateCustomerRegistration = await request('POST', '/api/client/register', { body: customerRegistrationBody });
   assert(duplicateCustomerRegistration.status === 409, 'Customer registration allowed a duplicate email.');
   const referralCustomerEmail = `pg_referral_customer_${testSuffix}@example.test`;
   const referralCustomerRegistration = await request('POST', '/api/client/register', {
-    body: { ...customerRegistrationBody, name: 'Synthetic Referral Customer', email: referralCustomerEmail },
-    cookie: `zezo_ref=${referralCode}`
+    body: { ...customerRegistrationBody, name: 'Synthetic Unattributed Customer', email: referralCustomerEmail }
   });
   assert(referralCustomerRegistration.status === 201 && referralCustomerRegistration.data.user?.role === 'client',
-    `Synthetic referral customer registration failed with ${referralCustomerRegistration.status}.`);
+    `Synthetic unattributed customer registration failed with ${referralCustomerRegistration.status}.`);
   const referralCustomerId = referralCustomerRegistration.data.user.id;
   syntheticIds.push(referralCustomerId);
-  const customerReferral = await client.query(`SELECT data ->> 'referralUserId' AS referrer_id, data ->> 'referralCode' AS referral_code FROM user_accounts WHERE id = $1`, [referralCustomerId]);
-  assert(customerReferral.rows[0]?.referrer_id === referralUserId && customerReferral.rows[0]?.referral_code === referralCode,
-    'Customer registration did not preserve the marketing referral attribution.');
+  const customerReferral = await client.query(`SELECT data ->> 'referralUserId' AS referrer_id FROM user_accounts WHERE id = $1`, [referralCustomerId]);
+  assert(!customerReferral.rows[0]?.referrer_id, 'Client registration accepted an untrusted referral code from the request body.');
+  const savedReferral = await client.query(`SELECT data ->> 'referralUserId' AS referrer_id, data ->> 'referralCode' AS referral_code FROM user_accounts WHERE id = $1`, [customerId]);
+  assert(savedReferral.rows[0]?.referrer_id === referralUserId && savedReferral.rows[0]?.referral_code === referralCode,
+    'Server-issued first-touch attribution was not saved on the customer account.');
+  const signupEvent = await client.query('SELECT count(*)::int AS count FROM referral_events WHERE "userId" = $1 AND "eventType" = $2 AND "resourceId" = $3', [referralUserId, 'client_signup', customerId]);
+  assert(signupEvent.rows[0]?.count === 1, 'A referred signup was not recorded exactly once.');
   const persistedRegistration = await client.query(`
     SELECT
       (SELECT count(*)::int FROM user_accounts WHERE email = $1) AS account_count,
@@ -562,6 +578,27 @@ try {
   }
   const marketerHome = await request('GET', '/api/dashboard', { cookie: employees.marketer.cookie });
   assert(Boolean(marketerHome.data.referralLink) && marketerHome.data.users === undefined, 'Marketer dashboard exposed team data or omitted its own referral link.');
+  const marketerReferralCapture = await request('GET', `/api/referral-attribution?ref=${encodeURIComponent(marketerHome.data.user.referralCode)}`);
+  assert(marketerReferralCapture.status === 200 && marketerReferralCapture.data.attributed, 'A valid active marketer link was not captured.');
+  const marketerReferralCookie = referralCookieFrom(marketerReferralCapture);
+  const referredClientEmail = `pg_attributed_client_${testSuffix}@example.test`;
+  const referredClient = await request('POST', '/api/client/register', {
+    body: { name: 'Synthetic Attributed Customer', email: referredClientEmail, password: customerPassword, confirmPassword: customerPassword, role: 'admin', referralCode: 'FORGED-OVERRIDE' },
+    cookie: marketerReferralCookie
+  });
+  assert(referredClient.status === 201 && referredClient.data.user?.role === 'client', `Referred client registration failed with ${referredClient.status}.`);
+  customerId = referredClient.data.user.id;
+  customerCookie = cookieFrom(referredClient);
+  syntheticIds.push(customerId);
+  const savedMarketerAttribution = await client.query(`SELECT data ->> 'referralUserId' AS referrer_id, data ->> 'referralCode' AS referral_code FROM user_accounts WHERE id = $1`, [customerId]);
+  assert(savedMarketerAttribution.rows[0]?.referrer_id === employees.marketer.id && savedMarketerAttribution.rows[0]?.referral_code === marketerHome.data.user.referralCode,
+    'The registered client was not bound to the active marketer selected by the server cookie.');
+  const marketerSignupView = await request('GET', '/api/dashboard', { cookie: employees.marketer.cookie });
+  assert(marketerSignupView.status === 200 && marketerSignupView.data.referralMetrics?.signups >= 1 &&
+    marketerSignupView.data.referredClients?.some(row => row.id === customerId && row.name === 'Synthetic Attributed Customer' && row.requestCount === 0) &&
+    !JSON.stringify(marketerSignupView.data.referredClients).includes(referredClientEmail),
+  'The marketer dashboard did not show its referred client safely after registration.');
+  results.push('client signup bound to the active employee marketer; marketer sees signup without customer contact details');
   const hrPaymentDenied = await request('POST', '/api/admin/payment', {
     body: { leadId: 'synthetic-not-found', amount: 1, kind: 'payment', verified: true, idempotencyKey: `denied_${testSuffix}` }, cookie: employees.hr_manager.cookie
   });
@@ -629,18 +666,24 @@ try {
   results.push('Owner permission changes use row-scoped transactions, remain unblocked by the legacy global lock, apply immediately, revoke sessions, audit once, and reject Owner escalation');
 
   const visitorId = `phase3visitor${testSuffix}`;
+  const trackingAttribution = await request('GET', `/api/referral-attribution?ref=${encodeURIComponent(marketerHome.data.user.referralCode)}`);
+  assert(trackingAttribution.status === 200 && trackingAttribution.data.attributed, 'Optional referral analytics test could not capture first-party attribution.');
+  const trackingCookie = referralCookieFrom(trackingAttribution);
+  const rawAttributionToken = decodeURIComponent(trackingCookie.split('=', 2)[1]);
+  const attributionHash = createHash('sha256').update(rawAttributionToken).digest('hex');
   const trackedVisit = await request('POST', '/api/referral-events', {
-    body: { code: marketerHome.data.user.referralCode, type: 'visit', visitorId, eventId: `phase3event${testSuffix}` }
+    body: { type: 'visit', visitorId, eventId: `phase3event${testSuffix}` }, cookie: trackingCookie
   });
   assert(trackedVisit.status === 202, `Synthetic referral event was rejected with ${trackedVisit.status}.`);
   const visitorHash = createHash('sha256').update(visitorId).digest('hex');
-  const trackedRows = await client.query('SELECT (SELECT count(*) FROM referral_events WHERE "visitorHash" = $1) + (SELECT count(*) FROM referral_attributions WHERE "visitorHash" = $1) AS count', [visitorHash]);
+  const trackedRows = await client.query('SELECT (SELECT count(*) FROM referral_events WHERE "visitorHash" = $1 AND data ->> \'analyticsVisitorHash\' = $2) + (SELECT count(*) FROM referral_attributions WHERE "visitorHash" = $1) AS count', [attributionHash, visitorHash]);
   assert(Number(trackedRows.rows[0].count) === 2, 'Synthetic visit and attribution were not saved to PostgreSQL.');
   const revokedConsent = await request('POST', '/api/referral-consent/revoke', { body: { visitorId } });
   assert(revokedConsent.status === 202, `Visitor consent revocation failed with ${revokedConsent.status}.`);
-  const revokedRows = await client.query('SELECT (SELECT count(*) FROM referral_events WHERE "visitorHash" = $1) + (SELECT count(*) FROM referral_attributions WHERE "visitorHash" = $1) AS count', [visitorHash]);
-  assert(Number(revokedRows.rows[0].count) === 0, 'Consent revocation did not delete the visitor tracking rows from PostgreSQL.');
-  results.push('referral visit and attribution storage, followed by consent revocation deletion');
+  const revokedRows = await client.query('SELECT (SELECT count(*) FROM referral_events WHERE "visitorHash" = $1 AND data ->> \'analyticsVisitorHash\' = $2) AS event_count, (SELECT count(*) FROM referral_attributions WHERE "visitorHash" = $1) AS attribution_count', [attributionHash, visitorHash]);
+  assert(Number(revokedRows.rows[0].event_count) === 0 && Number(revokedRows.rows[0].attribution_count) === 1,
+    'Consent revocation must delete optional analytics while retaining the functional first-party referral attribution.');
+  results.push('server-owned referral cookie, optional analytics storage and revocation without losing functional attribution');
 
   const createdConversation = await request('POST', '/api/conversations', {
     body: { templateId: 'web-copper-table', message: 'Synthetic question about customizing the restaurant template.', source: 'postgres_api_test' },

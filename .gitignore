@@ -21,6 +21,7 @@ data-staging-recovery/
 node_modules/
 .next/
 .next-*/
+.netlify/
 src/generated/prisma/
 *.tsbuildinfo
 coverage/

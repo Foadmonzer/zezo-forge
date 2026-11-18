@@ -9,6 +9,7 @@ const dataDir = await mkdtemp(join(tmpdir(), 'zezo-staging-test-'));
 const accessPassword = `Staging-${randomBytes(30).toString('base64url')}`;
 process.env.ZEZO_STAGING = 'true';
 process.env.ZEZO_STAGING_ACCESS_PASSWORD = accessPassword;
+process.env.ZEZO_TRUST_PROXY = 'true';
 process.env.ZEZO_DATA_DIR = dataDir;
 process.env.NODE_ENV = 'test';
 process.env.ZEZO_WHATSAPP_NUMBER = '+971500000000';
