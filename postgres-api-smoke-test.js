@@ -18,6 +18,8 @@ const stagingAccessCookie = process.env.ZEZO_STAGING === 'true'
   : '';
 const syntheticIds = [];
 const testSuffix = randomUUID().replaceAll('-', '').slice(0, 12);
+const invalidResetToken = `synthetic-invalid-reset-${testSuffix}`;
+const loginFloodIp = `198.51.100.${Math.floor(Math.random() * 200) + 20}`;
 const password = `Synthetic!${testSuffix}2026`;
 const ownerUsername = `pg_owner_${testSuffix}`;
 const customerEmail = `pg_customer_${testSuffix}@example.test`;
@@ -29,6 +31,9 @@ let preexistingOutboxIds = [];
 const rateBucket = value => createHash('sha256').update(`zezo-rate:${value}`).digest('hex');
 const testRateBuckets = [
   rateBucket('login:first-admin:127.0.0.1'), rateBucket(`login:127.0.0.1:${ownerUsername}`),
+  rateBucket('login-ip:127.0.0.1'), rateBucket(`login-ip:${loginFloodIp}`),
+  ...Array.from({ length: 101 }, (_, index) => rateBucket(`login:${loginFloodIp}:unknown_${testSuffix}_${index === 100 ? 'blocked' : index}`)),
+  rateBucket('password-reset-submit-ip:127.0.0.1'), rateBucket(`password-reset-submit-token:${createHash('sha256').update(invalidResetToken).digest('hex')}`),
   rateBucket('client-registration:127.0.0.1'), rateBucket(`login:127.0.0.1:${customerEmail}`),
   rateBucket('conversation:create:127.0.0.1'), rateBucket('public-enquiry:127.0.0.1'),
   rateBucket('quote:127.0.0.1'), rateBucket('quote:referral:127.0.0.1'), rateBucket('referral:127.0.0.1'),
@@ -40,7 +45,7 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-async function request(method, path, { body, rawBody, contentType = 'application/json', cookie = '' } = {}) {
+async function request(method, path, { body, rawBody, contentType = 'application/json', cookie = '', remoteAddress = '127.0.0.1' } = {}) {
   const startedAt = performance.now();
   const requestBytes = rawBody !== undefined ? Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody) : body === undefined ? null : Buffer.from(JSON.stringify(body));
   const req = Readable.from(requestBytes?.length ? [requestBytes] : []);
@@ -48,7 +53,7 @@ async function request(method, path, { body, rawBody, contentType = 'application
   req.url = path;
   const requestCookie = [stagingAccessCookie, cookie].filter(Boolean).join('; ');
   req.headers = { 'content-type': contentType, ...(requestCookie ? { cookie: requestCookie } : {}) };
-  req.socket = { remoteAddress: '127.0.0.1', encrypted: false };
+  req.socket = { remoteAddress, encrypted: false };
   const res = {
     headersSent: false,
     writableEnded: false,
@@ -239,6 +244,28 @@ try {
   });
   assert(secondSetup.status === 410, 'Public Owner creation must remain permanently closed after bootstrap.');
   results.push('public Owner setup remains closed before and after bootstrap');
+
+  const invalidResetAttempts = await Promise.all(Array.from({ length: 6 }, () => request('POST', '/api/auth/reset-password', {
+    body: { token: invalidResetToken, password: `Safe!Reset${testSuffix}Password` }
+  })));
+  assert(invalidResetAttempts.filter(result => result.status === 400).length === 5 && invalidResetAttempts.filter(result => result.status === 429).length === 1,
+    `Password reset submissions must be rate-limited by token before repeated password hashing (statuses: ${invalidResetAttempts.map(result => result.status).join(',')}).`);
+  results.push('password reset rejects invalid links generically and applies a shared per-token submission limit');
+
+  const loginFloodAttempts = [];
+  for (let index = 0; index < 100; index += 1) {
+    loginFloodAttempts.push(await request('POST', '/api/auth/login', {
+      body: { username: `unknown_${testSuffix}_${index}`, password: 'irrelevant', accountType: 'management' },
+      remoteAddress: loginFloodIp
+    }));
+  }
+  const loginFloodBlocked = await request('POST', '/api/auth/login', {
+    body: { username: `unknown_${testSuffix}_blocked`, password: 'irrelevant', accountType: 'management' },
+    remoteAddress: loginFloodIp
+  });
+  assert(loginFloodAttempts.every(result => result.status === 401) && loginFloodBlocked.status === 429,
+    'Login attempts across different usernames must share a PostgreSQL-backed per-IP limit.');
+  results.push('login password guessing is limited across usernames on one source IP without account-wide lockout');
 
   const customerPassword = `Customer!${testSuffix}Longer`;
   const referralUserId = `usr_ref_${testSuffix}`;
@@ -834,6 +861,39 @@ try {
   const officialOrder = await request('POST', '/api/leads', { body: projectRequestBody, cookie: customerCookie });
   assert(officialOrder.status === 201 && officialOrder.data.id, `Customer official order creation failed with ${officialOrder.status}.`);
   syntheticLeadId = officialOrder.data.id;
+  const leadAttachmentId = `att_synthetic_lead_${testSuffix}`;
+  const leadAttachmentBytes = Buffer.from('%PDF-1.4 synthetic lead attachment');
+  await client.query(
+    'INSERT INTO stored_attachments (id, "ownerId", "fileName", "contentType", "sizeBytes", content) VALUES ($1, $2, $3, $4, $5, $6)',
+    [leadAttachmentId, customerId, 'synthetic-lead.pdf', 'application/pdf', leadAttachmentBytes.length, leadAttachmentBytes]
+  );
+  await client.query(
+    `UPDATE project_requests SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{attachments}', $2::jsonb, true) WHERE id = $1`,
+    [syntheticLeadId, JSON.stringify([{ attachmentId: leadAttachmentId, storedName: leadAttachmentId, storage: 'postgres', originalName: 'synthetic-lead.pdf', type: 'application/pdf', size: leadAttachmentBytes.length }])]
+  );
+  await client.query(
+    `UPDATE user_accounts SET data = jsonb_set(COALESCE(data, '{}'::jsonb), '{permissionOverrides}', $2::jsonb, true) WHERE id = $1`,
+    [employees.marketing_manager.id, JSON.stringify({ 'orders.manage': 'assigned' })]
+  );
+  const managerOutOfScopeLeadAttachment = await request('GET', `/api/admin/attachment/${syntheticLeadId}/0`, { cookie: employees.marketing_manager.cookie });
+  assert(managerOutOfScopeLeadAttachment.status === 404, 'Marketing manager downloaded a lead attachment outside the assigned CRM scope.');
+  await client.query(
+    `UPDATE project_requests SET data = jsonb_set(data, '{orderManagerUserId}', to_jsonb($2::text), true) WHERE id = $1`,
+    [syntheticLeadId, employees.marketing_manager.id]
+  );
+  const managerAssignedLeadAttachment = await request('GET', `/api/admin/attachment/${syntheticLeadId}/0`, { cookie: employees.marketing_manager.cookie });
+  assert(managerAssignedLeadAttachment.status === 200 && managerAssignedLeadAttachment.bytes.equals(leadAttachmentBytes), 'Marketing manager with matching CRM assignment could not access the lead attachment.');
+  await client.query(
+    `UPDATE project_requests SET data = jsonb_set(data, '{orderManagerUserId}', to_jsonb($2::text), true) WHERE id = $1`,
+    [syntheticLeadId, employees.order_manager.id]
+  );
+  const ownerLeadAttachment = await request('GET', `/api/admin/attachment/${syntheticLeadId}/0`, { cookie: ownerCookie });
+  assert(ownerLeadAttachment.status === 200 && ownerLeadAttachment.bytes.equals(leadAttachmentBytes), 'Owner could not access a synthetic customer lead attachment.');
+  const hrLeadAttachment = await request('GET', `/api/admin/attachment/${syntheticLeadId}/0`, { cookie: employees.hr_manager.cookie });
+  assert(hrLeadAttachment.status === 404, 'HR manager accessed a customer lead attachment outside CRM permissions.');
+  const unassignedDeveloperLeadAttachment = await request('GET', `/api/admin/attachment/${syntheticLeadId}/0`, { cookie: employees.developer.cookie });
+  assert(unassignedDeveloperLeadAttachment.status === 404, 'Developer accessed a customer lead attachment without the assigned project status.');
+  results.push('lead attachment downloads enforce assigned CRM scope; out-of-scope manager, HR, and unassigned developer access is denied');
   const orderLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
   await orderLockHolder.connect();
   let orderRetriesWhileLocked;

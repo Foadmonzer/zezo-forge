@@ -1117,6 +1117,15 @@ async function handlePostgresCoreRead(req, res, path) {
   if (req.method === 'POST' && path === '/api/auth/reset-password') {
     const body = await jsonBody(req);
     const rawToken = String(body.token || '').slice(0, 200);
+    const ip = req.socket?.remoteAddress || 'unknown';
+    // Reset submissions perform a costly scrypt operation. Apply shared,
+    // database-backed limits first so parallel function instances cannot
+    // amplify password-hashing work or brute-force a reset link.
+    if (!await consumeRateLimitBucket('password-reset-submit-ip', ip, 30, 60 * 60_000) ||
+        (rawToken && !await consumeRateLimitBucket('password-reset-submit-token', hash(rawToken), 5, 60 * 60_000))) {
+      json(res, 429, { error: 'محاولات كثيرة. اطلب رابطاً جديداً وحاول لاحقاً / Too many attempts. Request a new link and try again later.' }, security);
+      return true;
+    }
     if (!validPassword(String(body.password || ''))) {
       json(res, 400, { error: 'كلمة المرور يجب أن تكون 12 خانة على الأقل / Password must contain at least 12 characters' }, security);
       return true;
@@ -1291,8 +1300,10 @@ async function handlePostgresCoreRead(req, res, path) {
   if (req.method === 'POST' && path === '/api/auth/login') {
     const body = await jsonBody(req);
     const username = clean(body.username, 150).toLowerCase();
-    const key = `${req.socket.remoteAddress || 'unknown'}:${username}`;
-    if (!await consumeRateLimitBucket('login', key, 8, 15 * 60_000)) {
+    const ip = req.socket.remoteAddress || 'unknown';
+    const key = `${ip}:${username}`;
+    if (!await consumeRateLimitBucket('login-ip', ip, 100, 15 * 60_000) ||
+        !await consumeRateLimitBucket('login', key, 8, 15 * 60_000)) {
       json(res, 429, { error: 'محاولات كثيرة. جرّب بعد 15 دقيقة / Too many attempts; try again in 15 minutes' }, security); return true;
     }
     const user = await findLoginAccount(username);
@@ -3813,7 +3824,11 @@ async function handleRequest(req, res) {
       return json(res,200,{withdrawal:{id:withdrawal.id,status:withdrawal.status,amount:withdrawal.amount,updatedAt:withdrawal.updatedAt}},security);
     }
     if (req.method === 'GET' && path.startsWith('/api/admin/attachment/')) {
-      const auth=requireAuth(req,res,['admin','marketing_manager','hr_manager','developer']); if(!auth)return; const [leadId,indexText]=path.split('/').slice(-2); const lead=store.leads.find(l=>l.id===leadId); if(auth.user.role==='developer'&&(!lead||lead.developerUserId!==auth.user.id||!['accepted','in_progress','review_requested','approved','revision_requested'].includes(lead.developerTaskStatus)))return json(res,404,{error:'الملف غير موجود / File not found'},security); const a=lead?.attachments[Number(indexText)];
+      const auth=requireAuth(req,res,['admin','marketing_manager','hr_manager','developer']); if(!auth)return; const [leadId,indexText]=path.split('/').slice(-2); const lead=store.leads.find(l=>l.id===leadId);
+      if (!lead) return json(res,404,{error:'الملف غير موجود / File not found'},security);
+      if (auth.user.role==='developer' && (lead.developerUserId!==auth.user.id || !['accepted','in_progress','review_requested','approved','revision_requested'].includes(lead.developerTaskStatus))) return json(res,404,{error:'الملف غير موجود / File not found'},security);
+      if (auth.user.role!=='admin' && auth.user.role!=='developer' && !crmAccess(auth.user,{...lead,assignedUserId:lead.orderManagerUserId||lead.assignedUserId||''})) return json(res,404,{error:'الملف غير موجود / File not found'},security);
+      const attachments=Array.isArray(lead.attachments)?lead.attachments:[]; const a=attachments[Number(indexText)];
       if(!a) return json(res,404,{error:'الملف غير موجود'},security);
       return serveUpload(res,a,security);
     }

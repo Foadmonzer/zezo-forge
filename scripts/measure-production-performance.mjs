@@ -1,4 +1,4 @@
-const baseUrl = new URL(process.env.ZEZO_PERF_BASE_URL || 'https://zezo-forge-fouad.netlify.app');
+const baseUrl = new URL(process.env.ZEZO_PERF_BASE_URL || 'https://zezoforge.com');
 const concurrency = Math.max(1, Math.min(32, Number(process.env.ZEZO_PERF_CONCURRENCY) || 10));
 const samplesPerPath = Math.max(5, Math.min(100, Number(process.env.ZEZO_PERF_SAMPLES_PER_PATH) || 20));
 const paths = ['/', '/team', '/api/public', '/api/health', '/api/notifications?limit=8'];

@@ -10,7 +10,7 @@ Keep the Gmail values in the Netlify Production environment only:
 
 - `ZEZO_GMAIL_SMTP_USER=zezo.info.2026@gmail.com`
 - `ZEZO_GMAIL_SMTP_APP_PASSWORD` = the Gmail App Password, stored as a secret
-- `ZEZO_PUBLIC_URL=https://zezo-forge-fouad.netlify.app`
+- `ZEZO_PUBLIC_URL=https://zezoforge.com`
 
 `ZEZO_PUBLIC_URL` is required and must be set to the exact HTTPS origin for each
 deploy context. Production uses the production site URL. A Deploy Preview must
