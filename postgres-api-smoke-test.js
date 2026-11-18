@@ -26,6 +26,14 @@ let syntheticConversationId = '';
 let syntheticLeadId = '';
 const employeeIds = [];
 let preexistingOutboxIds = [];
+let countPaymentSnapshotWrites = false;
+let paymentSnapshotWrites = 0;
+const originalClientQuery = pg.Client.prototype.query;
+pg.Client.prototype.query = function countedPaymentSnapshotQuery(...args) {
+  const sql = typeof args[0] === 'string' ? args[0] : args[0]?.text || '';
+  if (countPaymentSnapshotWrites && /^\s*INSERT INTO app_settings\b/i.test(sql)) paymentSnapshotWrites += 1;
+  return originalClientQuery.apply(this, args);
+};
 const rateBucket = value => createHash('sha256').update(`zezo-rate:${value}`).digest('hex');
 const testRateBuckets = [
   rateBucket('login:first-admin:127.0.0.1'), rateBucket(`login:127.0.0.1:${ownerUsername}`),
@@ -893,10 +901,19 @@ try {
   });
   assert(missingPaymentKey.status === 400, 'Payment endpoint accepted a payment without an idempotency key.');
   const idempotencyKey = `synthetic_${testSuffix}_payment`;
-  const payment = await request('POST', '/api/admin/payment', {
-    body: { leadId: syntheticLeadId, amount: 200, kind: 'payment', verified: true, idempotencyKey }, cookie: ownerCookie
-  });
+  paymentSnapshotWrites = 0;
+  countPaymentSnapshotWrites = true;
+  let payment;
+  try {
+    payment = await request('POST', '/api/admin/payment', {
+      body: { leadId: syntheticLeadId, amount: 200, kind: 'payment', verified: true, idempotencyKey }, cookie: ownerCookie
+    });
+  } finally {
+    countPaymentSnapshotWrites = false;
+  }
   assert(payment.status === 201 && payment.data.lead?.paidTotal === 200, `Verified synthetic payment failed with ${payment.status}.`);
+  assert(paymentSnapshotWrites === 1, `A single payment should persist the compatibility snapshot once, observed ${paymentSnapshotWrites} writes.`);
+  results.push('manual payment and its ledger/commission updates persist through one PostgreSQL snapshot write');
   const duplicatePayment = await request('POST', '/api/admin/payment', {
     body: { leadId: syntheticLeadId, amount: 200, kind: 'payment', verified: true, idempotencyKey }, cookie: ownerCookie
   });
