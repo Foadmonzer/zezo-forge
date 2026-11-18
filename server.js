@@ -23,6 +23,7 @@ import { createPostgresClientRegistration } from './src/server/postgres-client-r
 import { capturePostgresReferralAttribution, deletePostgresReferralAnalyticsByVisitor, getPostgresReferralAttribution, recordPostgresReferralEvent } from './src/server/postgres-referral-repository.js';
 import { createPostgresProjectRequest } from './src/server/postgres-project-request-repository.js';
 import { updatePostgresEmployeePermissions } from './src/server/postgres-permission-repository.js';
+import { recordPostgresManualPayment } from './src/server/postgres-payment-repository.js';
 import { completePostgresPasswordResetEmail, consumePostgresPasswordReset, issuePostgresPasswordReset } from './src/server/postgres-password-recovery-repository.js';
 import { createPasswordResetUrl, passwordRecoveryEmailReady, passwordRecoveryFailureCode, sendPasswordRecoveryEmail, verifyPasswordRecoveryTransport } from './src/server/password-recovery-mailer.js';
 
@@ -2154,7 +2155,9 @@ function updateDeveloperCommission(lead) {
   if(lead.developerTaskStatus==='declined'&&!lead.developerCommissionPaidAmount){lead.developerCommissionStatus='none';return;}
   if(!lead.developerUserId){lead.developerCommissionStatus='none';return;}
   if(!eligible){
-    lead.developerCommissionStatus=lead.developerCommissionDebtRemaining>0?'reversed':(wasEarned&&Number(lead.developerCommissionPaidAmount||0)>0?'reversed':'pending');
+    const reversal = Boolean(lead.refunded || lead.status==='cancelled' || lead.isDuplicate) &&
+      (wasEarned || Number(lead.developerCommissionPaidAmount||0)>0 || Boolean(lead.everFullyPaid || lead.fullyPaidAt));
+    lead.developerCommissionStatus=lead.developerCommissionDebtRemaining>0||reversal||(wasEarned&&Number(lead.developerCommissionPaidAmount||0)>0)?'reversed':'pending';
     return;
   }
   const unpaid=money(Math.max(0,amount-Number(lead.developerCommissionPaidAmount||0)));
@@ -2547,6 +2550,45 @@ async function handlePostgresReferral(req, res, path) {
   return respond(202, { ok: true, duplicate: result.kind === 'duplicate' });
 }
 
+async function handlePostgresManualPayment(req, res, path) {
+  if (!postgresConfigured() || req.method !== 'POST' || path !== '/api/admin/payment' || !stagingAuthorized(req)) return false;
+  const security = { ...responseSecurityHeaders(), 'Cache-Control': 'no-store' };
+  const respond = (status, body) => { json(res, status, body, security); return true; };
+  let body;
+  try { body = await jsonBody(req); }
+  catch { return respond(400, { error: 'تعذر قراءة بيانات الدفعة / Could not read payment details.' }); }
+
+  const amount = Number(body.amount);
+  const idempotencyKey = clean(body.idempotencyKey, 80);
+  if (!body.leadId || !Number.isFinite(amount) || amount <= 0 || amount > 10000000 ||
+      !['payment', 'refund'].includes(body.kind) || body.verified !== true ||
+      !/^[a-zA-Z0-9_-]{12,80}$/.test(idempotencyKey)) {
+    return respond(400, { error: 'سجّل مبلغاً صحيحاً ومفتاح حركة فريد وأكد التحقق اليدوي / Enter a valid amount, unique transaction key, and confirm manual verification.' });
+  }
+  const auth = await directPostgresSessionUser(req);
+  if (!directRequireAuth(req, res, auth?.user, ['admin'])) return true;
+
+  const result = await recordPostgresManualPayment({
+    sessionHash: sessionKey(auth.sid), leadId: clean(body.leadId, 100), amount, kind: body.kind,
+    verified: body.verified, idempotencyKey, note: clean(body.note, 300), at: now(),
+    emailEnabled: emailReady()
+  });
+  if (result.kind === 'unauthenticated') return respond(401, { error: 'انتهت الجلسة. سجّل الدخول مجدداً / Session expired. Please sign in again.' });
+  if (result.kind === 'forbidden') return respond(403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted.' });
+  if (result.kind === 'missing') return respond(404, { error: 'الطلب غير موجود / Request not found.' });
+  if (result.kind === 'invalid') return respond(400, { error: 'بيانات الحركة المالية غير صالحة / Invalid financial transaction details.' });
+  if (result.kind === 'idempotency_conflict') return respond(409, { error: 'مفتاح الحركة مستخدم لعملية مختلفة / This transaction key was already used for a different operation.' });
+  if (result.kind === 'ledger_mismatch') return respond(409, { error: 'سجل الدفعات لا يطابق رصيد الطلب؛ لم تُسجل حركة جديدة. راجع السجل المالي / Payment records do not match the request balance; no transaction was recorded. Review the ledger.' });
+  if (result.kind === 'not_payable') return respond(409, { error: 'لا يمكن تسجيل دفعة لهذا الطلب في حالته الحالية / This request cannot accept a payment in its current state.' });
+  if (result.kind === 'refund_exceeds_paid') return respond(400, { error: 'المبلغ المسترد أكبر من المبلغ المحصل / Refund exceeds the collected amount.' });
+  if (result.kind === 'payment_exceeds_contract') return respond(400, { error: 'الدفعة تتجاوز الرصيد المتبقي للعقد / Payment exceeds the contract balance.' });
+
+  const responseLead = { ...safeLead(result.lead, true), developerName: result.developerName || '' };
+  if (result.kind === 'duplicate') return respond(200, { payment: result.payment, lead: responseLead, duplicate: true });
+  if (result.kind === 'created') return respond(201, { payment: result.payment, lead: responseLead });
+  return respond(500, { error: 'تعذر تسجيل الحركة المالية / Could not record the financial transaction.' });
+}
+
 async function handlePostgresCoreWrite(req, res, path) {
   if (!stagingAuthorized(req)) return false;
   const security = responseSecurityHeaders();
@@ -2844,6 +2886,7 @@ async function handle(req, res) {
     return json(res, 200, { createdAt: lead.createdAt, service: lead.service, status: lead.status, statusText: publicStatusLabels[lead.status]?.[lang] || publicStatusLabels.new[lang], note: lead.publicStatusNote || '' }, responseSecurityHeaders());
   }
   if (await handlePostgresEmployeeActivation(req, res, path)) return;
+  if (await handlePostgresManualPayment(req, res, path)) return;
   const projectRequestHandled = await handlePostgresProjectRequest(req, res, path);
   if (projectRequestHandled) return;
   const normalizedReadHandled = process.env.ZEZO_BENCH_LEGACY_CORE_READS === 'true'

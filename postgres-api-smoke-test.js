@@ -24,13 +24,15 @@ const customerEmail = `pg_customer_${testSuffix}@example.test`;
 const results = [];
 let syntheticConversationId = '';
 let syntheticLeadId = '';
+const syntheticConversationIds = [];
+const syntheticLeadIds = [];
 const employeeIds = [];
 let preexistingOutboxIds = [];
 const rateBucket = value => createHash('sha256').update(`zezo-rate:${value}`).digest('hex');
 const testRateBuckets = [
   rateBucket('login:first-admin:127.0.0.1'), rateBucket(`login:127.0.0.1:${ownerUsername}`),
   rateBucket('client-registration:127.0.0.1'), rateBucket(`login:127.0.0.1:${customerEmail}`),
-  rateBucket('conversation:create:127.0.0.1'), rateBucket('public-enquiry:127.0.0.1'),
+  rateBucket('conversation-start:127.0.0.1'), rateBucket('conversation-message:127.0.0.1'), rateBucket('public-enquiry:127.0.0.1'),
   rateBucket('quote:127.0.0.1'), rateBucket('quote:referral:127.0.0.1'), rateBucket('referral:127.0.0.1'),
   rateBucket('referral-attribution:127.0.0.1'), rateBucket('referral-events:127.0.0.1'), rateBucket('referral-consent-revoke:127.0.0.1'),
   rateBucket('employee-activation:127.0.0.1')
@@ -152,11 +154,11 @@ try {
     await dashboardLockHolder.end();
   }
   assert(anonymousDashboard?.done === true && anonymousDashboard.value.status === 401,
-    'Anonymous dashboard access must be rejected before waiting on the legacy global PostgreSQL lock.');
-  results.push('anonymous dashboard access is rejected before the legacy global PostgreSQL lock');
+    'Anonymous dashboard access must be rejected before waiting on the legacy global advisory lock.');
+  results.push('anonymous dashboard access is rejected before the legacy global advisory lock');
   assert(anonymousInvite?.done === true && anonymousInvite.value.status === 401,
-    'Anonymous team invitation access must be rejected before waiting on the legacy global PostgreSQL lock.');
-  results.push('anonymous team invitation access is rejected before the legacy global PostgreSQL lock');
+    'Anonymous team invitation access must be rejected before waiting on the legacy global advisory lock.');
+  results.push('anonymous team invitation access is rejected before the legacy global advisory lock');
 
   const publicBefore = await request('GET', '/api/public');
   assert(!Object.hasOwn(publicBefore.data, 'adminSetupAvailable'), 'Public PostgreSQL configuration must never disclose Owner setup state.');
@@ -274,7 +276,7 @@ try {
     customerRegistration = await Promise.race([
       registrationPromise,
       new Promise((_, reject) => {
-        registrationTimeoutHandle = setTimeout(() => reject(new Error('Customer registration waited on the legacy global advisory lock.')), 5000);
+        registrationTimeoutHandle = setTimeout(() => reject(new Error('Customer registration waited on the legacy advisory lock.')), 5000);
         registrationTimeoutHandle.unref?.();
       })
     ]).catch(error => { registrationTimedOut = true; throw error; });
@@ -286,7 +288,7 @@ try {
   if (registrationTimedOut) {
     customerRegistration = await registrationPromise;
     if (customerRegistration.data.user?.id) syntheticIds.push(customerRegistration.data.user.id);
-    throw new Error('Customer registration waited on the legacy global advisory lock.');
+    throw new Error('Customer registration waited on the legacy advisory lock.');
   }
   assert(customerRegistration.status === 201, `Synthetic customer registration failed with ${customerRegistration.status}.`);
   assert(customerRegistration.data.user?.role === 'client', 'Client registration request could not escalate its role to Owner.');
@@ -332,7 +334,7 @@ try {
   }
   const customerDashboard = await request('GET', '/api/dashboard', { cookie: customerCookie });
   assert(customerDashboard.status === 200 && customerDashboard.data.user?.role === 'client', 'Customer session did not persist between requests.');
-  results.push('customer registration bypasses legacy global lock, preserves referral, prevents duplicates, and atomically saves account/audit/session/verification state');
+  results.push('customer registration bypasses the legacy advisory lock, preserves referral, prevents duplicates, and atomically saves account/audit/session/verification state');
 
   await request('POST', '/api/auth/logout', { cookie: customerCookie });
   customerCookie = '';
@@ -377,8 +379,8 @@ try {
         await legacyLockHolder.query('ROLLBACK').catch(() => {});
         await legacyLockHolder.end();
       }
-      assert(invite?.status === 201, 'Owner invitation must complete without waiting on the legacy global PostgreSQL lock.');
-      results.push('authorized team invitation completed while the legacy global PostgreSQL lock was held; concurrent duplicate invitations produced one account');
+      assert(invite?.status === 201, 'Owner invitation must complete without waiting on the legacy global advisory lock.');
+      results.push('authorized team invitation completed while the legacy global advisory lock was held; concurrent duplicate invitations produced one account');
     } else invite = await inviteRequest();
     assert(invite.status === 201 && invite.data.activationToken, `Owner invitation for ${role} failed with ${invite.status}.`);
     const invitationRows = await client.query(
@@ -504,7 +506,7 @@ try {
         'Employee activation waited on the legacy company-wide PostgreSQL advisory lock.');
       assert(activation.concurrentReplayStatus === 400,
         'Concurrent activation requests reused the same single-use employee invitation token.');
-      results.push('parallel activation requests consumed the invitation once and completed while the legacy company-wide advisory lock was held');
+      results.push('parallel activation requests consumed the invitation once and completed while the legacy advisory lock was held');
     } else {
       activation = await request('POST', '/api/auth/activate', {
         body: { token: activationToken, password: activationPassword }
@@ -599,6 +601,236 @@ try {
     !JSON.stringify(marketerSignupView.data.referredClients).includes(referredClientEmail),
   'The marketer dashboard did not show its referred client safely after registration.');
   results.push('client signup bound to the active employee marketer; marketer sees signup without customer contact details');
+
+  // A developer must retain both capabilities through the same account: a
+  // referral attribution and a separately accounted developer assignment.
+  const developerHome = await request('GET', '/api/dashboard', { cookie: employees.developer.cookie });
+  assert(developerHome.status === 200 && developerHome.data.role === 'developer' &&
+    Boolean(developerHome.data.user?.referralCode) && Boolean(developerHome.data.referralLink),
+  'The developer account did not expose its active employee referral link.');
+  const developerReferralCapture = await request('GET', `/api/referral-attribution?ref=${encodeURIComponent(developerHome.data.user.referralCode)}`);
+  assert(developerReferralCapture.status === 200 && developerReferralCapture.data.attributed,
+    'The developer referral link did not capture first-party attribution.');
+  const developerReferralCookie = referralCookieFrom(developerReferralCapture);
+  const conflictingReferralCapture = await request('GET', `/api/referral-attribution?ref=${encodeURIComponent(marketerHome.data.user.referralCode)}`, {
+    cookie: developerReferralCookie
+  });
+  assert(conflictingReferralCapture.status === 200 && conflictingReferralCapture.data.attributed &&
+    conflictingReferralCapture.data.code === developerHome.data.user.referralCode,
+  'A later referral link replaced the first-touch developer attribution.');
+  const developerReferredEmail = `pg_dev_referred_${testSuffix}@example.test`;
+  const developerReferredRegistration = await request('POST', '/api/client/register', {
+    body: {
+      name: 'Synthetic Developer Referral Customer', email: developerReferredEmail, password: customerPassword,
+      confirmPassword: customerPassword, role: 'admin', referralCode: marketerHome.data.user.referralCode
+    },
+    cookie: developerReferralCookie
+  });
+  assert(developerReferredRegistration.status === 201 && developerReferredRegistration.data.user?.role === 'client',
+    `Client registration from a developer referral failed with ${developerReferredRegistration.status}.`);
+  const developerReferredCustomerId = developerReferredRegistration.data.user.id;
+  syntheticIds.push(developerReferredCustomerId);
+  let developerReferredCustomerCookie = cookieFrom(developerReferredRegistration);
+  if (developerReferredRegistration.data.verificationRequired) {
+    const verificationMessage = await client.query("SELECT data ->> 'text' AS text FROM outbox_messages WHERE recipient = $1 AND data ->> 'kind' = 'client_email_verification' LIMIT 1", [developerReferredEmail]);
+    const verificationTokenMatch = /verifyEmail=([^\\s]+)/.exec(verificationMessage.rows[0]?.text || '');
+    assert(verificationTokenMatch, 'Developer-referred customer verification did not persist its synthetic one-time link.');
+    const verified = await request('POST', '/api/auth/verify-email', { body: { token: decodeURIComponent(verificationTokenMatch[1]) } });
+    assert(verified.status === 200, `Developer-referred customer verification failed with ${verified.status}.`);
+    developerReferredCustomerCookie = cookieFrom(verified);
+  }
+  const developerCustomerAttribution = await client.query(`
+    SELECT data ->> 'referralUserId' AS referrer_id, data ->> 'referralCode' AS referral_code
+    FROM user_accounts WHERE id = $1
+  `, [developerReferredCustomerId]);
+  assert(developerCustomerAttribution.rows[0]?.referrer_id === employees.developer.id &&
+    developerCustomerAttribution.rows[0]?.referral_code === developerHome.data.user.referralCode,
+  'The customer account did not persist the first-touch developer attribution.');
+  const developerReferralConversation = await request('POST', '/api/conversations', {
+    body: { templateId: 'web-copper-table', message: 'Synthetic question from the developer referral journey.', source: 'postgres_api_test' },
+    cookie: developerReferredCustomerCookie
+  });
+  assert(developerReferralConversation.status === 201, `Developer-referred customer conversation failed with ${developerReferralConversation.status}.`);
+  const developerReferralConversationId = developerReferralConversation.data.conversation.id;
+  syntheticConversationIds.push(developerReferralConversationId);
+  const developerReferralQuote = await request('POST', `/api/conversations/${developerReferralConversationId}/quote`, {
+    body: { amount: 400, scope: 'Synthetic referral lifecycle landing page.', included: 'Responsive website and contact details.' }, cookie: ownerCookie
+  });
+  assert(developerReferralQuote.status === 201, `Owner quote for the developer referral journey failed with ${developerReferralQuote.status}.`);
+  const developerReferralQuoteAcceptance = await request('POST', `/api/conversations/${developerReferralConversationId}/accept-quote`, {
+    cookie: developerReferredCustomerCookie
+  });
+  assert(developerReferralQuoteAcceptance.status === 200, `Customer could not approve the developer referral quote (${developerReferralQuoteAcceptance.status}).`);
+  const developerReferralOrderKey = randomUUID().replaceAll('-', '');
+  const developerReferralOrder = await request('POST', '/api/leads', {
+    body: {
+      service: 'web', category: 'site', details: `Synthetic developer referral lifecycle order ${testSuffix}.`,
+      budget: '300–500 ILS', consent: 'true', phone: '+971501234568', whatsappCountryCode: '+971',
+      whatsappLocalNumber: '501234568', templateId: 'web-copper-table', templateAction: 'customize',
+      conversationId: developerReferralConversationId, referralCode: marketerHome.data.user.referralCode,
+      idempotencyKey: developerReferralOrderKey, lang: 'en'
+    }, cookie: developerReferredCustomerCookie
+  });
+  assert(developerReferralOrder.status === 201 && developerReferralOrder.data.id && developerReferralOrder.data.attributed === true,
+    `Developer-referred customer project request failed with ${developerReferralOrder.status}.`);
+  const developerReferralLeadId = developerReferralOrder.data.id;
+  syntheticLeadIds.push(developerReferralLeadId);
+  const developerReferralOrderRow = await client.query(`
+    SELECT "customerId", "referrerId", "agreedAmount", data ->> 'referralCode' AS referral_code
+    FROM project_requests WHERE id = $1
+  `, [developerReferralLeadId]);
+  assert(developerReferralOrderRow.rows[0]?.customerId === developerReferredCustomerId &&
+    developerReferralOrderRow.rows[0]?.referrerId === employees.developer.id &&
+    developerReferralOrderRow.rows[0]?.referral_code === developerHome.data.user.referralCode &&
+    Number(developerReferralOrderRow.rows[0]?.agreedAmount) === 400,
+  'The project order did not retain the customer, accepted quote, and immutable first-touch developer referral.');
+  const developerReferralDashboard = await request('GET', '/api/dashboard', { cookie: employees.developer.cookie });
+  assert(developerReferralDashboard.status === 200 &&
+    developerReferralDashboard.data.referredClients?.some(row => row.id === developerReferredCustomerId && row.requestCount === 1 && row.requests?.some(order => order.id === developerReferralLeadId)) &&
+    developerReferralDashboard.data.leads?.some(row => row.id === developerReferralLeadId) &&
+    !JSON.stringify(developerReferralDashboard.data.referredClients).includes(developerReferredEmail),
+  'The developer did not see the referred customer and order within their own scoped, privacy-safe dashboard.');
+  const unrelatedMarketerDashboard = await request('GET', '/api/dashboard', { cookie: employees.marketer.cookie });
+  assert(!unrelatedMarketerDashboard.data.referredClients?.some(row => row.id === developerReferredCustomerId) &&
+    !unrelatedMarketerDashboard.data.leads?.some(row => row.id === developerReferralLeadId),
+  'An unrelated marketer could see another employee developer referral.');
+  const unrelatedCustomerDashboard = await request('GET', '/api/dashboard', { cookie: customerCookie });
+  assert(!unrelatedCustomerDashboard.data.orders?.some(order => order.id === developerReferralLeadId),
+    'A different customer could see the developer-referred customer order.');
+
+  const dualRoleAssignment = await request('PATCH', `/api/projects/${developerReferralLeadId}/assignment`, {
+    body: { developerUserId: employees.developer.id, developerDueDate: '2026-12-01' }, cookie: ownerCookie
+  });
+  assert(dualRoleAssignment.status === 200, `Owner could not assign the referred project to the same developer (${dualRoleAssignment.status}).`);
+  const dualRoleAcceptance = await request('POST', `/api/developer/projects/${developerReferralLeadId}/decision`, {
+    body: { decision: 'accept', note: 'Synthetic dual-role project accepted.' }, cookie: employees.developer.cookie
+  });
+  assert(dualRoleAcceptance.status === 200, `Developer could not accept their referred project (${dualRoleAcceptance.status}).`);
+  const dualRolePaymentKey = `dev_ref_${testSuffix}_paid`;
+  const paymentLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await paymentLockHolder.connect();
+  let paymentWhileLegacyLock;
+  let dualRolePaymentPromise;
+  try {
+    await paymentLockHolder.query('BEGIN');
+    await paymentLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+    dualRolePaymentPromise = request('POST', '/api/admin/payment', {
+      body: { leadId: developerReferralLeadId, amount: 400, kind: 'payment', verified: true, idempotencyKey: dualRolePaymentKey }, cookie: ownerCookie
+    }).then(value => ({ done: true, value }));
+    paymentWhileLegacyLock = await Promise.race([
+      dualRolePaymentPromise,
+      new Promise(resolve => setTimeout(() => resolve({ done: false }), 1500))
+    ]);
+  } finally {
+    await paymentLockHolder.query('ROLLBACK').catch(() => {});
+    await paymentLockHolder.end();
+  }
+  if (!paymentWhileLegacyLock?.done) await dualRolePaymentPromise;
+  assert(paymentWhileLegacyLock?.done, 'Manual payment still waited behind the global advisory lock.');
+  const dualRolePayment = paymentWhileLegacyLock.value;
+  console.log(`[SCOPED_API_TIMING] ${JSON.stringify({ route: 'POST /api/admin/payment', advisoryLockHeld: true, durationMs: Number(dualRolePayment.durationMs.toFixed(1)), status: dualRolePayment.status })}`);
+  assert(dualRolePayment.status === 201 && Number(dualRolePayment.data.lead?.paidTotal) === 400,
+    `Owner could not record the actual synthetic collected amount (${dualRolePayment.status}).`);
+  const dualRolePaymentReplay = await request('POST', '/api/admin/payment', {
+    body: { leadId: developerReferralLeadId, amount: 400, kind: 'payment', verified: true, idempotencyKey: dualRolePaymentKey }, cookie: ownerCookie
+  });
+  assert(dualRolePaymentReplay.status === 200 && dualRolePaymentReplay.data.duplicate === true,
+    'A repeated developer referral payment key was not idempotent.');
+  const conflictingPaymentReplay = await request('POST', '/api/admin/payment', {
+    body: { leadId: developerReferralLeadId, amount: 399, kind: 'payment', verified: true, idempotencyKey: dualRolePaymentKey }, cookie: ownerCookie
+  });
+  assert(conflictingPaymentReplay.status === 409, 'Reusing a payment idempotency key with a different amount must be rejected as a conflict.');
+  const duplicatePaymentCount = await client.query('SELECT count(*)::int AS count FROM payments WHERE "requestId" = $1 AND "idempotencyKey" = $2', [developerReferralLeadId, dualRolePaymentKey]);
+  assert(Number(duplicatePaymentCount.rows[0]?.count) === 1, 'Replaying the developer referral payment wrote duplicate PostgreSQL rows.');
+  const snapshotLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+  await snapshotLockHolder.connect();
+  let blockedPaymentReplay;
+  let paymentReplayPromise;
+  try {
+    await snapshotLockHolder.query('BEGIN');
+    await snapshotLockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+    await snapshotLockHolder.query(`LOCK TABLE app_settings, user_accounts, project_requests, projects, commissions, payments,
+      withdrawal_requests, finance_ledger_entries, system_notifications, audit_entries, outbox_messages,
+      referral_events, rank_requests, crm_records IN SHARE ROW EXCLUSIVE MODE`);
+    const replayStartedAt = Date.now();
+    paymentReplayPromise = request('POST', '/api/admin/payment', {
+      body: { leadId: developerReferralLeadId, amount: 400, kind: 'payment', verified: true, idempotencyKey: dualRolePaymentKey }, cookie: ownerCookie
+    }).then(value => ({ done: true, value, elapsedMs: Date.now() - replayStartedAt }));
+    blockedPaymentReplay = await Promise.race([
+      paymentReplayPromise,
+      new Promise(resolve => setTimeout(() => resolve({ done: false }), 120))
+    ]);
+    assert(!blockedPaymentReplay?.done, 'The payment path unexpectedly bypassed the compatibility snapshot table lock.');
+  } finally {
+    await snapshotLockHolder.query('ROLLBACK').catch(() => {});
+    await snapshotLockHolder.end();
+  }
+  const releasedPaymentReplay = await paymentReplayPromise;
+  assert(releasedPaymentReplay?.done && releasedPaymentReplay.value.status === 200 && releasedPaymentReplay.value.data.duplicate === true,
+    'Payment replay did not recover idempotently after the compatibility snapshot lock was released.');
+  console.log(`[SCOPED_API_TIMING] ${JSON.stringify({ route: 'POST /api/admin/payment', compatibilitySnapshotTableLockHeld: true, blockedUntilRelease: true, observedMs: releasedPaymentReplay.elapsedMs, status: releasedPaymentReplay.value.status })}`);
+  const deliveryBytes = Buffer.from('%PDF-1.4 synthetic dual-role project delivery');
+  const dualRoleUpload = await request('POST', `/api/developer/projects/${developerReferralLeadId}/files`, {
+    ...multipartForm({}, { name: 'synthetic-dual-role-delivery.pdf', type: 'application/pdf', content: deliveryBytes }, `zezo_dual_role_${testSuffix}`),
+    cookie: employees.developer.cookie
+  });
+  assert(dualRoleUpload.status === 201, `Developer could not upload the synthetic referred project delivery (${dualRoleUpload.status}).`);
+  const dualRoleSubmit = await request('PATCH', `/api/developer/projects/${developerReferralLeadId}`, {
+    body: { status: 'review_requested', note: 'Synthetic dual-role project submitted for review.' }, cookie: employees.developer.cookie
+  });
+  assert(dualRoleSubmit.status === 200, `Developer could not submit the synthetic referred project (${dualRoleSubmit.status}).`);
+  const dualRoleReview = await request('POST', `/api/admin/projects/${developerReferralLeadId}/review`, {
+    body: { decision: 'approved', note: 'Synthetic dual-role delivery review passed.' }, cookie: ownerCookie
+  });
+  assert(dualRoleReview.status === 200, `Owner could not approve the synthetic referred delivery (${dualRoleReview.status}).`);
+  const dualRoleCompletion = await request('PATCH', `/api/admin/projects/${developerReferralLeadId}/stage`, {
+    body: { stage: 'completed', note: 'Synthetic dual-role project completed.' }, cookie: ownerCookie
+  });
+  assert(dualRoleCompletion.status === 200, `Owner could not complete the synthetic referred project (${dualRoleCompletion.status}).`);
+  let dualRoleCommissions = await client.query(`
+    SELECT kind, "ratePercent"::float8 AS rate, amount::float8 AS amount, status
+    FROM commissions WHERE "requestId" = $1 AND "userId" = $2 ORDER BY kind
+  `, [developerReferralLeadId, employees.developer.id]);
+  assert(dualRoleCommissions.rowCount === 2 &&
+    dualRoleCommissions.rows.some(row => row.kind === 'referral' && row.rate === 15 && row.amount === 60) &&
+    dualRoleCommissions.rows.some(row => row.kind === 'developer' && row.rate === 25 && row.amount === 100),
+  'The same developer account did not receive separate 15% referral and 25% programming commission entries after collection and completion.');
+  const dualRoleWallet = await request('GET', '/api/dashboard', { cookie: employees.developer.cookie });
+  assert(Number(dualRoleWallet.data.wallet?.referral?.pending) === 60 && Number(dualRoleWallet.data.wallet?.developer?.pending) === 100,
+    'Referral earnings and programming earnings were combined or misclassified in the developer wallet.');
+
+  const partialRefundKey = `dev_ref_${testSuffix}_refund1`;
+  const partialRefund = await request('POST', '/api/admin/payment', {
+    body: { leadId: developerReferralLeadId, amount: 100, kind: 'refund', verified: true, idempotencyKey: partialRefundKey }, cookie: ownerCookie
+  });
+  assert(partialRefund.status === 201 && Number(partialRefund.data.lead?.paidTotal) === 300,
+    `A valid partial synthetic refund failed with ${partialRefund.status}.`);
+  const partialRefundReplay = await request('POST', '/api/admin/payment', {
+    body: { leadId: developerReferralLeadId, amount: 100, kind: 'refund', verified: true, idempotencyKey: partialRefundKey }, cookie: ownerCookie
+  });
+  assert(partialRefundReplay.status === 200 && partialRefundReplay.data.duplicate === true && Number(partialRefundReplay.data.lead?.paidTotal) === 300,
+    'Replaying a partial refund changed the collected amount more than once.');
+  dualRoleCommissions = await client.query(`
+    SELECT kind, amount::float8 AS amount FROM commissions WHERE "requestId" = $1 AND "userId" = $2 ORDER BY kind
+  `, [developerReferralLeadId, employees.developer.id]);
+  assert(dualRoleCommissions.rows.some(row => row.kind === 'referral' && row.amount === 45) &&
+    dualRoleCommissions.rows.some(row => row.kind === 'developer' && row.amount === 75),
+  'A partial refund did not recalculate both commission streams against the remaining 300 ILS collected.');
+  const fullRefundKey = `dev_ref_${testSuffix}_refund2`;
+  const fullRefund = await request('POST', '/api/admin/payment', {
+    body: { leadId: developerReferralLeadId, amount: 300, kind: 'refund', verified: true, idempotencyKey: fullRefundKey }, cookie: ownerCookie
+  });
+  assert(fullRefund.status === 201 && Number(fullRefund.data.lead?.paidTotal) === 0,
+    `The remaining synthetic collection could not be fully refunded (${fullRefund.status}).`);
+  dualRoleCommissions = await client.query(`
+    SELECT kind, amount::float8 AS amount, status FROM commissions WHERE "requestId" = $1 AND "userId" = $2 ORDER BY kind
+  `, [developerReferralLeadId, employees.developer.id]);
+  assert(dualRoleCommissions.rows.length === 2 &&
+    dualRoleCommissions.rows.every(row => row.amount === 0 && row.status === 'reversed'),
+  'A full refund did not reverse both separate commission streams.');
+  const refundRows = await client.query('SELECT count(*)::int AS count FROM payments WHERE "requestId" = $1 AND status = \'refund\'', [developerReferralLeadId]);
+  assert(Number(refundRows.rows[0]?.count) === 2, 'Refund replay created a duplicate financial record.');
+  results.push('developer referral first-touch, persisted signup/order, assigned project, separate 15%/25% earnings, payment idempotency, privacy, and partial/full refund reversal');
   const hrPaymentDenied = await request('POST', '/api/admin/payment', {
     body: { leadId: 'synthetic-not-found', amount: 1, kind: 'payment', verified: true, idempotencyKey: `denied_${testSuffix}` }, cookie: employees.hr_manager.cookie
   });
@@ -637,7 +869,7 @@ try {
     await permissionsLockHolder.end();
   }
   assert(permissionChange?.status === 200,
-    `Owner permission changes must not wait behind the legacy global PostgreSQL advisory lock (received ${permissionChange?.status ?? (permissionChange?.timedOut ? 'timeout' : 'no response')}${permissionChange ? `: ${JSON.stringify(permissionChange.data || permissionChange.activity || {})}` : ''}).`);
+    `Owner permission changes must not wait behind the legacy advisory lock (received ${permissionChange?.status ?? (permissionChange?.timedOut ? 'timeout' : 'no response')}${permissionChange ? `: ${JSON.stringify(permissionChange.data || permissionChange.activity || {})}` : ''}).`);
   console.log(`[SCOPED_API_TIMING] ${JSON.stringify({ path: `/api/admin/permissions/${encodeURIComponent(employees.marketer.id)}`, method: 'PATCH', concurrency: 1, apiMs: Date.now() - permissionStartedAt, globalAdvisoryLockHeld: true })}`);
   assert(permissionChange.data.user?.effectivePermissions?.['conversations.read'] === 'assigned', 'Permission changes were not effective in the saved response.');
   const permissionPersisted = await client.query(`
@@ -663,7 +895,7 @@ try {
   });
   assert(refreshedMarketerLogin.status === 200, 'Marketer could not establish a fresh session after permission changes revoked old sessions.');
   employees.marketer.cookie = cookieFrom(refreshedMarketerLogin);
-  results.push('Owner permission changes use row-scoped transactions, remain unblocked by the legacy global lock, apply immediately, revoke sessions, audit once, and reject Owner escalation');
+  results.push('Owner permission changes use row-scoped transactions, remain unblocked by the legacy advisory lock, apply immediately, revoke sessions, audit once, and reject Owner escalation');
 
   const visitorId = `phase3visitor${testSuffix}`;
   const trackingAttribution = await request('GET', `/api/referral-attribution?ref=${encodeURIComponent(marketerHome.data.user.referralCode)}`);
@@ -691,6 +923,7 @@ try {
   });
   assert(createdConversation.status === 201, `Customer conversation creation failed with ${createdConversation.status}.`);
   syntheticConversationId = createdConversation.data.conversation.id;
+  syntheticConversationIds.push(syntheticConversationId);
   results.push('customer template conversation saved and reloaded from PostgreSQL');
 
   const assignedConversation = await request('PATCH', `/api/conversations/${syntheticConversationId}`, {
@@ -821,7 +1054,7 @@ try {
   assert(repeatedQuoteAcceptances.every(row => row.status === 409), 'An already accepted quote was accepted again by a duplicate request.');
   const acceptedMessageCount = await client.query(`SELECT count(*)::int AS count FROM conversation_messages WHERE "conversationId" = $1 AND body LIKE 'تم قبول عرض السعر%'`, [syntheticConversationId]);
   assert(Number(acceptedMessageCount.rows[0].count) === 1, 'Concurrent repeated acceptances wrote more than one acceptance message.');
-  results.push('two-account conversation, protected attachments, quote and acceptance complete under the legacy lock using row-scoped PostgreSQL transactions');
+  results.push('two-account conversation, protected attachments, quote and acceptance complete under the legacy advisory lock using row-scoped PostgreSQL transactions');
 
   const projectRequestIdempotencyKey = randomUUID().replaceAll('-', '');
   const projectRequestBody = {
@@ -834,6 +1067,7 @@ try {
   const officialOrder = await request('POST', '/api/leads', { body: projectRequestBody, cookie: customerCookie });
   assert(officialOrder.status === 201 && officialOrder.data.id, `Customer official order creation failed with ${officialOrder.status}.`);
   syntheticLeadId = officialOrder.data.id;
+  syntheticLeadIds.push(syntheticLeadId);
   const orderLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
   await orderLockHolder.connect();
   let orderRetriesWhileLocked;
@@ -925,7 +1159,7 @@ try {
   }
   assert(developerDashboardWhileLocked?.done && developerDashboardWhileLocked.value.status === 200 && developerDashboardWhileLocked.value.data.projects?.some(project => project.id === syntheticLeadId),
     'Developer dashboard still waited on the global advisory lock or lost the assigned project.');
-  assert(!developerDashboardWhileLocked.value.data.projects?.some(project => project.id !== syntheticLeadId), 'Developer dashboard exposed another employee project.');
+  assert(!developerDashboardWhileLocked.value.data.projects?.some(project => ![syntheticLeadId, developerReferralLeadId].includes(project.id)), 'Developer dashboard exposed a project that was neither referred by nor assigned to that employee.');
   results.push('developer dashboard reads scoped project, commission, wallet, and referral data without the global advisory lock');
   const developerDecision = await request('POST', `/api/developer/projects/${syntheticLeadId}/decision`, {
     body: { decision: 'accept', note: 'Synthetic acceptance for the database test.' }, cookie: employees.developer.cookie
@@ -1150,26 +1384,30 @@ try {
   process.exitCode = 1;
 } finally {
   if (syntheticIds.length) {
+    const cleanupLeadIds = syntheticLeadIds.length ? syntheticLeadIds : (syntheticLeadId ? [syntheticLeadId] : []);
+    const cleanupConversationIds = syntheticConversationIds.length ? syntheticConversationIds : (syntheticConversationId ? [syntheticConversationId] : []);
+    const cleanupProjectIds = cleanupLeadIds.map(leadId => `project_${leadId}`);
+    const cleanupReferencePatterns = [...cleanupLeadIds, ...cleanupConversationIds].map(value => `%${value}%`);
     await client.query('BEGIN').catch(() => {});
     try {
-      await client.query('DELETE FROM project_assignments WHERE "projectId" = $1', [`project_${syntheticLeadId}`]);
-      await client.query('DELETE FROM commissions WHERE "requestId" = $1 OR "userId" = ANY($2::text[])', [syntheticLeadId, syntheticIds]);
-      await client.query('DELETE FROM payments WHERE "requestId" = $1', [syntheticLeadId]);
-      await client.query('DELETE FROM finance_ledger_entries WHERE "requestId" = $1 OR "employeeId" = ANY($2::text[])', [syntheticLeadId, syntheticIds]);
-      await client.query('DELETE FROM referral_events WHERE "requestId" = $1 OR "resourceId" = $2 OR "userId" = ANY($3::text[])', [syntheticLeadId, syntheticConversationId, syntheticIds]);
-      await client.query('DELETE FROM referral_attributions WHERE "requestId" = $1 OR "userId" = ANY($2::text[])', [syntheticLeadId, syntheticIds]);
+      await client.query('DELETE FROM project_assignments WHERE "projectId" = ANY($1::text[])', [cleanupProjectIds]);
+      await client.query('DELETE FROM commissions WHERE "requestId" = ANY($1::text[]) OR "userId" = ANY($2::text[])', [cleanupLeadIds, syntheticIds]);
+      await client.query('DELETE FROM payments WHERE "requestId" = ANY($1::text[])', [cleanupLeadIds]);
+      await client.query('DELETE FROM finance_ledger_entries WHERE "requestId" = ANY($1::text[]) OR "employeeId" = ANY($2::text[])', [cleanupLeadIds, syntheticIds]);
+      await client.query('DELETE FROM referral_events WHERE "requestId" = ANY($1::text[]) OR "resourceId" = ANY($2::text[]) OR "userId" = ANY($3::text[])', [cleanupLeadIds, cleanupConversationIds, syntheticIds]);
+      await client.query('DELETE FROM referral_attributions WHERE "requestId" = ANY($1::text[]) OR "userId" = ANY($2::text[])', [cleanupLeadIds, syntheticIds]);
       await client.query('DELETE FROM referral_links WHERE "userId" = ANY($1::text[])', [syntheticIds]);
       await client.query('DELETE FROM rank_requests WHERE "userId" = ANY($1::text[])', [syntheticIds]);
-      await client.query('DELETE FROM system_notifications WHERE "userId" = ANY($1::text[]) OR data::text LIKE $2 OR data::text LIKE $3', [syntheticIds, `%${syntheticLeadId}%`, `%${syntheticConversationId}%`]);
-      await client.query('DELETE FROM audit_entries WHERE "actorId" = ANY($1::text[]) OR "targetId" = ANY($2::text[])', [syntheticIds, [syntheticLeadId, syntheticConversationId]]);
-      await client.query('DELETE FROM crm_records WHERE data::text LIKE $1', [`%${syntheticLeadId}%`]);
+      await client.query('DELETE FROM system_notifications WHERE "userId" = ANY($1::text[]) OR data::text LIKE ANY($2::text[])', [syntheticIds, cleanupReferencePatterns]);
+      await client.query('DELETE FROM audit_entries WHERE "actorId" = ANY($1::text[]) OR "targetId" = ANY($2::text[])', [syntheticIds, [...cleanupLeadIds, ...cleanupConversationIds]]);
+      await client.query('DELETE FROM crm_records WHERE data::text LIKE ANY($1::text[])', [cleanupReferencePatterns]);
       await client.query(`DELETE FROM employee_invitations WHERE data->>'employeeId' = ANY($1::text[])`, [syntheticIds]);
       await client.query('DELETE FROM outbox_messages WHERE recipient = ANY($1::text[])', [syntheticIds.map(id => `${id}@example.test`)]);
       await client.query('DELETE FROM withdrawal_requests WHERE "userId" = ANY($1::text[])', [syntheticIds]);
-      await client.query('DELETE FROM projects WHERE "requestId" = $1', [syntheticLeadId]);
-      await client.query('DELETE FROM project_requests WHERE id = $1', [syntheticLeadId]);
+      await client.query('DELETE FROM projects WHERE "requestId" = ANY($1::text[])', [cleanupLeadIds]);
+      await client.query('DELETE FROM project_requests WHERE id = ANY($1::text[])', [cleanupLeadIds]);
       await client.query('DELETE FROM stored_attachments WHERE "ownerId" = ANY($1::text[])', [syntheticIds]);
-      await client.query('DELETE FROM conversations WHERE id = $1', [syntheticConversationId]);
+      await client.query('DELETE FROM conversations WHERE id = ANY($1::text[])', [cleanupConversationIds]);
       await client.query('DELETE FROM user_accounts WHERE id = ANY($1::text[])', [syntheticIds]);
       await client.query('DELETE FROM rate_limit_buckets WHERE key = ANY($1::text[])', [testRateBuckets]);
       await client.query('DELETE FROM outbox_messages WHERE NOT (id = ANY($1::text[]))', [preexistingOutboxIds]);
