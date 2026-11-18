@@ -2475,7 +2475,11 @@ async function handlePostgresReferral(req, res, path) {
   if (!originOk) return respond(403, { error: 'الطلب غير مسموح / Request origin is not allowed' });
   const ip = req.socket?.remoteAddress || 'unknown';
   const bucket = isAttribution ? 'referral-attribution' : isEvent ? 'referral-events' : 'referral-consent-revoke';
-  const limit = isAttribution ? 60 : isEvent ? 300 : 20;
+  // Public pages check for an existing first-party attribution cookie during
+  // startup, including when the cleaned URL no longer has ?ref=. Keep the
+  // read/capture budget above a normal multi-page session while preserving a
+  // bounded rate for anonymous traffic behind shared office/mobile IPs.
+  const limit = isAttribution ? 300 : isEvent ? 300 : 20;
   if (!await consumeRateLimitBucket(bucket, ip, limit, 60 * 60_000)) {
     return respond(429, { error: 'حاول لاحقاً / Please try again later' });
   }
