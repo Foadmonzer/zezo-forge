@@ -257,7 +257,7 @@ export async function loadClientDashboardData(clientId) {
 // personal dashboards off the compatibility-store loader while retaining the
 // existing serializer and its privacy rules in server.js.
 export async function loadEmployeeDashboardData(userId) {
-  const [requestResult, crmResult, eventResult, linkResult, withdrawalResult, ledgerResult, rankResult, settingsResult] = await Promise.all([
+  const [requestResult, crmResult, eventResult, linkResult, withdrawalResult, ledgerResult, rankResult, settingsResult, referredClientResult] = await Promise.all([
     queryPostgres(`
       SELECT id, "customerId", "referrerId", "developerId", status, "projectStage", "templateId", "agreedAmount", data, "createdAt", "updatedAt"
       FROM project_requests
@@ -270,7 +270,23 @@ export async function loadEmployeeDashboardData(userId) {
     queryPostgres('SELECT id, "userId", amount, status, data, "createdAt", "updatedAt" FROM withdrawal_requests WHERE "userId" = $1 ORDER BY "createdAt" DESC', [userId]),
     queryPostgres('SELECT id, type, status, "requestId", "employeeId", amount, currency, "idempotencyKey", data, "createdAt" FROM finance_ledger_entries WHERE "employeeId" = $1 ORDER BY "createdAt" DESC LIMIT 250', [userId]),
     queryPostgres('SELECT id, "userId", "fromRank", "requestedRank", "salesCount", "commissionPercent", state, "reviewedBy", data, "createdAt", "reviewedAt" FROM rank_requests WHERE "userId" = $1 ORDER BY "createdAt" DESC', [userId]),
-    queryPostgres('SELECT value FROM app_settings WHERE key = $1', ['zezo-runtime'])
+    queryPostgres('SELECT value FROM app_settings WHERE key = $1', ['zezo-runtime']),
+    queryPostgres(`
+      SELECT u.id, COALESCE(NULLIF(u.data ->> 'name', ''), u."fullName", '') AS name,
+        u."createdAt", u.data ->> 'referralBoundAt' AS "referralBoundAt",
+        COALESCE(r.request_count, 0)::int AS "requestCount",
+        COALESCE(r.requests, '[]'::jsonb) AS requests
+      FROM user_accounts u
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS request_count,
+          jsonb_agg(jsonb_build_object('id', p.id, 'status', p.status, 'createdAt', p."createdAt") ORDER BY p."createdAt" DESC) AS requests
+        FROM project_requests p
+        WHERE p."customerId" = u.id AND p."referrerId" = $1
+      ) r ON TRUE
+      WHERE u.role = 'client' AND u.data ->> 'referralUserId' = $1
+      ORDER BY u."createdAt" DESC
+      LIMIT 500
+    `, [userId])
   ]);
 
   const leads = requestResult.rows.map(row => ({
@@ -334,6 +350,11 @@ export async function loadEmployeeDashboardData(userId) {
   const mapJsonRows = (rows, mapper = row => row) => rows.map(source => mapper({ ...object(source.data), id: source.id }, source));
   return {
     leads,
+    referredClients: referredClientResult.rows.map(row => ({
+      id: row.id, name: row.name || '', createdAt: asIso(row.createdAt),
+      referralBoundAt: row.referralBoundAt || '', requestCount: Number(row.requestCount || 0),
+      requests: Array.isArray(row.requests) ? row.requests : []
+    })),
     crmLeads: crmResult.rows.map(row => ({ ...object(row.data), id: row.id, status: row.status || row.data?.status || '', createdAt: asIso(row.createdAt), updatedAt: asIso(row.updatedAt) })),
     referralEvents: mapJsonRows(eventResult.rows, (row, source) => ({ ...row, userId: source.userId, code: source.code || '', type: source.eventType, visitorHash: source.visitorHash || null, resourceId: source.resourceId || '', leadId: source.requestId || row.leadId || '', idempotencyKey: source.idempotencyKey || null, reversedAt: row.reversedAt || '', createdAt: asIso(source.createdAt) })),
     referralLinks: mapJsonRows(linkResult.rows, (row, source) => ({ ...row, userId: source.userId, code: source.code, month: source.month, active: source.active, createdAt: asIso(source.createdAt) })),

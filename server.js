@@ -19,6 +19,7 @@ import { createPostgresWithdrawalRequest } from './src/server/postgres-withdrawa
 import { createPostgresEmployeeInvitation, revokePostgresEmployeeInvitation, reissuePostgresEmployeeInvitation } from './src/server/postgres-invitation-repository.js';
 import { activatePostgresEmployeeInvitation } from './src/server/postgres-activation-repository.js';
 import { createPostgresClientRegistration } from './src/server/postgres-client-registration-repository.js';
+import { capturePostgresReferralAttribution, deletePostgresReferralAnalyticsByVisitor, getPostgresReferralAttribution, recordPostgresReferralEvent } from './src/server/postgres-referral-repository.js';
 import { createPostgresProjectRequest } from './src/server/postgres-project-request-repository.js';
 import { updatePostgresEmployeePermissions } from './src/server/postgres-permission-repository.js';
 import { completePostgresPasswordResetEmail, consumePostgresPasswordReset, issuePostgresPasswordReset } from './src/server/postgres-password-recovery-repository.js';
@@ -43,6 +44,8 @@ const PUBLIC_DIR = join(ROOT, 'public');
 const PORT = Number(process.env.PORT || 4173);
 const MAX_BODY = 6 * 1024 * 1024;
 const SESSION_TTL = 8 * 60 * 60 * 1000;
+const REFERRAL_ATTRIBUTION_COOKIE = 'zezo_referral_attribution';
+const REFERRAL_ATTRIBUTION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const roles = ['admin', 'marketing_manager', 'hr_manager', 'order_manager', 'developer', 'marketer'];
 const allRoles = [...roles, 'client'];
 const employeeRoles = ['marketer', 'developer'];
@@ -231,19 +234,21 @@ function referralIntelligenceFor(user=null) {
   const events=store.referralEvents.filter(event=>allowedIds.has(event.userId)).map(event=>({id:event.id,userId:event.userId,employeeName:visibleUsers.find(row=>row.id===event.userId)?.name||'',code:event.code,linkId:event.linkId,month:event.month,type:event.type,createdAt:event.createdAt,resourceId:event.resourceId,leadId:event.leadId,followupId:event.followupId,reversed:Boolean(event.reversedAt)}));
   const links=store.referralLinks.filter(link=>allowedIds.has(link.userId)).map(link=>({id:link.id,userId:link.userId,employeeName:visibleUsers.find(row=>row.id===link.userId)?.name||'',code:link.code,month:link.month,kind:link.kind,createdAt:link.createdAt,current:visibleUsers.find(row=>row.id===link.userId)?.currentReferralLinkId===link.id}));
   const orders=store.leads.filter(lead=>lead.referralUserId&&allowedIds.has(lead.referralUserId)).map(lead=>({id:lead.id,userId:lead.referralUserId,code:lead.referralCode||'',linkId:lead.referralLinkId||null,createdAt:lead.createdAt,service:lead.service,category:lead.category,status:lead.status,isDuplicate:Boolean(lead.isDuplicate),qualified:Boolean(lead.status==='completed'&&!lead.isDuplicate&&!lead.refunded&&Number(lead.contractAmount)>0&&Number(lead.paidTotal)>=Number(lead.contractAmount)&&Boolean(lead.everFullyPaid||lead.fullyPaidAt)),paid:isOwner?Number(lead.paidTotal||0):undefined,amount:isOwner?Number(lead.contractAmount||0):undefined}));
-  return {retentionDays:90,events,links,orders,employees:visibleUsers.map(row=>({id:row.id,name:row.name,role:row.role,rank:row.rank||'rookie',commissionRate:currentRankRate(row),currentReferralCode:row.currentReferralCode||row.referralCode||''}))};
+  const clients=store.users.filter(row=>row.role==='client'&&allowedIds.has(row.referralUserId)).map(row=>({id:row.id,userId:row.referralUserId,name:row.name||'',createdAt:row.createdAt||'',referralBoundAt:row.referralBoundAt||'',requests:store.leads.filter(lead=>lead.clientId===row.id&&lead.referralUserId===row.referralUserId).map(lead=>({id:lead.id,status:lead.status,createdAt:lead.createdAt}))}));
+  return {retentionDays:90,events,links,orders,clients,employees:visibleUsers.map(row=>({id:row.id,name:row.name,role:row.role,rank:row.rank||'rookie',commissionRate:currentRankRate(row),currentReferralCode:row.currentReferralCode||row.referralCode||''}))};
 }
 function referralIntelligenceForViewer(user){
   const data=referralIntelligenceFor(user);if(!['hr_manager','marketing_manager'].includes(user?.role))return data;
   const allowedIds=new Set(store.users.filter(row=>referralEnabled(row)&&hasPermission(user,'employees.read',{ownerId:row.id,department:row.department||roleDepartment(row.role)})).map(row=>row.id));
-  return {...data,employees:data.employees.filter(row=>allowedIds.has(row.id)),links:data.links.filter(row=>allowedIds.has(row.userId)),orders:data.orders.filter(row=>allowedIds.has(row.userId)),events:data.events.filter(row=>allowedIds.has(row.userId))};
+  const events=data.events.filter(row=>allowedIds.has(row.userId)).map(row=>user.role==='hr_manager'&&row.type==='client_signup'?{...row,resourceId:''}:row);
+  return {...data,employees:data.employees.filter(row=>allowedIds.has(row.id)),links:data.links.filter(row=>allowedIds.has(row.userId)),orders:data.orders.filter(row=>allowedIds.has(row.userId)),clients:user.role==='hr_manager'?[]:data.clients.filter(row=>allowedIds.has(row.userId)),events};
 }
 function referralMetricsFor(userId) {
   const events=store.referralEvents.filter(event=>event.userId===userId&&!event.reversedAt);
   const orders=store.leads.filter(lead=>lead.referralUserId===userId&&!lead.isDuplicate&&!lead.duplicateOfLeadId);
   const currentCode=store.users.find(row=>row.id===userId)?.currentReferralCode;
   const types=type=>events.filter(event=>event.type===type).length;
-  return {visits:new Set(events.filter(event=>event.type==='visit').map(event=>event.visitorHash).filter(Boolean)).size,serviceViews:types('service_view'),templateViews:types('template_view'),whatsappClicks:types('whatsapp_click'),inquiries:types('inquiry_confirmed'),requests:orders.length,quoteAcceptances:types('quote_accepted'),sales:new Set(events.filter(event=>event.type==='qualified_sale'&&event.leadId).map(event=>event.leadId)).size,currentCode};
+  return {signups:types('client_signup'),visits:new Set(events.filter(event=>event.type==='visit').map(event=>event.visitorHash).filter(Boolean)).size,serviceViews:types('service_view'),templateViews:types('template_view'),whatsappClicks:types('whatsapp_click'),inquiries:types('inquiry_confirmed'),requests:orders.length,quoteAcceptances:types('quote_accepted'),sales:new Set(events.filter(event=>event.type==='qualified_sale'&&event.leadId).map(event=>event.leadId)).size,currentCode};
 }
 
 async function loadPostgresStore(client) {
@@ -763,7 +768,8 @@ const emailReady = () => !STAGING_MODE && process.env.ZEZO_ENABLE_EMAIL_DELIVERY
 const adminEmailReady = () => !STAGING_MODE && Boolean(process.env.ZEZO_NOTIFICATION_EMAIL);
 function requestIsSecure(req) {
   if (req.socket?.encrypted) return true;
-  return STAGING_MODE && String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() === 'https';
+  const trustedProxy = process.env.NETLIFY === 'true' || process.env.ZEZO_TRUST_PROXY === 'true';
+  return trustedProxy && String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() === 'https';
 }
 function siteBase(req) {
   const configured = STAGING_MODE ? '' : String(process.env.ZEZO_PUBLIC_URL || '').trim().replace(/\/$/, '');
@@ -1147,9 +1153,8 @@ async function handlePostgresCoreRead(req, res, path) {
     const verificationToken = deliveryReady ? token(32) : '';
     const verificationRequired = Boolean(verificationToken);
     const credential = passwordRecord(password);
-    const referralVisitorId = clean(body.referralVisitorId, 80);
-    const referralVisitorHash = /^[\-_a-zA-Z0-9]{12,80}$/.test(referralVisitorId) ? hash(referralVisitorId) : '';
-    const referralCode = clean(cookieValue(req, 'zezo_ref') || body.referralCode, 40);
+    const referralCookieValue = cookieValue(req, REFERRAL_ATTRIBUTION_COOKIE);
+    const referralVisitorHash = /^[A-Za-z0-9_-]{40,64}$/.test(referralCookieValue) ? hash(referralCookieValue) : '';
     const isStudent = body.student === 'true' || body.student === true;
     const user = {
       id: id('usr'), name, username: email, email, phone: '', instagram: '', socialLinks: '', telegramUsername: '',
@@ -1176,7 +1181,7 @@ async function handlePostgresCoreRead(req, res, path) {
     } : null;
     const sessionId = verificationRequired ? '' : token();
     const result = await createPostgresClientRegistration({
-      user, referralVisitorHash, referralCode, auditId: id('evt'), at: createdAt,
+      user, referralVisitorHash, auditId: id('evt'), at: createdAt,
       verificationRequired,
       sessionHash: sessionId ? sessionKey(sessionId) : '',
       sessionExpiresAt: sessionId ? new Date(Date.now() + SESSION_TTL) : null,
@@ -1187,11 +1192,16 @@ async function handlePostgresCoreRead(req, res, path) {
       return true;
     }
     if (verificationRequired) {
-      json(res, 201, { verificationRequired: true, emailQueued: true }, security);
+      json(res, 201, { verificationRequired: true, emailQueued: true }, {
+        ...security, 'Set-Cookie': cookie(REFERRAL_ATTRIBUTION_COOKIE, '', 0, req)
+      });
       return true;
     }
     json(res, 201, { user: publicUser(result.user), verificationRequired: false, emailConfigured: false }, {
-      ...security, 'Set-Cookie': cookie('zezo_session', sessionId, SESSION_TTL / 1000, req)
+      ...security, 'Set-Cookie': [
+        cookie('zezo_session', sessionId, SESSION_TTL / 1000, req),
+        cookie(REFERRAL_ATTRIBUTION_COOKIE, '', 0, req)
+      ]
     });
     return true;
   }
@@ -1684,7 +1694,10 @@ async function handlePostgresCoreRead(req, res, path) {
       const previousStore = store;
       try {
         store = { ...defaultStore(), ...data, users: [auth.user] };
-        json(res, 200, dashboardFor(auth.user), security);
+        const dashboard = dashboardFor(auth.user);
+        dashboard.referredClients = data.referredClients || [];
+        dashboard.referralMetrics = { ...(dashboard.referralMetrics || {}), signups: dashboard.referredClients.length };
+        json(res, 200, dashboard, security);
       } finally {
         store = previousStore;
       }
@@ -2402,9 +2415,8 @@ async function handlePostgresProjectRequest(req, res, path) {
   }
 
   const conversationId = clean(body.conversationId, 80);
-  const referralVisitorId = clean(body.referralVisitorId, 80);
-  const referralVisitorHash = /^[\-_a-zA-Z0-9]{12,80}$/.test(referralVisitorId) ? hash(referralVisitorId) : '';
-  const requestedCode = clean(cookieValue(req, 'zezo_ref') || body.referralCode, 40);
+  // A registered customer's stored attribution is the only authority for a
+  // project request. URL/body fields remain untrusted display/legacy values.
   const suppliedKey = clean(req.headers['idempotency-key'] || body.idempotencyKey, 120);
   const idempotencyKey = /^[A-Za-z0-9_-]{32,120}$/.test(suppliedKey)
     ? suppliedKey
@@ -2416,7 +2428,7 @@ async function handlePostgresProjectRequest(req, res, path) {
       customerId: auth.user.id, phone, service, category, details,
       budget: clean(body.budget, 80), templateId, templateAction, conversationId,
       guestHash: guestSessionValue(req) ? hash(guestSessionValue(req)) : '',
-      referralVisitorHash, requestedCode, language: body.lang === 'en' ? 'en' : 'ar'
+      language: body.lang === 'en' ? 'en' : 'ar'
     },
     template: template ? { id: template.id, titleAr: template.title?.ar || '' } : null,
     siteBase: siteBase(req), trackingTtlMs: TRACKING_TTL_MS,
@@ -2437,6 +2449,96 @@ async function handlePostgresProjectRequest(req, res, path) {
     emailQueued: emailReady() && adminEmailReady(),
     mail: { customerConfigured: emailReady(), adminConfigured: emailReady() && adminEmailReady() }
   });
+}
+
+function referralRequestHasSameOrigin(req) {
+  const origin = String(req.headers.origin || '').trim();
+  const fetchSite = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+  if (fetchSite === 'cross-site') return false;
+  if (!origin) return true;
+  try {
+    const parsed = new URL(origin);
+    const host = String(req.headers.host || '').toLowerCase();
+    return parsed.host.toLowerCase() === host && ['http:', 'https:'].includes(parsed.protocol);
+  } catch { return false; }
+}
+
+async function handlePostgresReferral(req, res, path) {
+  const isAttribution = path === '/api/referral-attribution';
+  const isEvent = path === '/api/referral-events';
+  const isRevoke = path === '/api/referral-consent/revoke';
+  if (!isAttribution && !isEvent && !isRevoke) return false;
+  if (!stagingAuthorized(req)) return false;
+  const security = responseSecurityHeaders();
+  const respond = (status, body, headers = security) => { json(res, status, body, headers); return true; };
+  const originOk = req.method === 'GET' || referralRequestHasSameOrigin(req);
+  if (!originOk) return respond(403, { error: 'الطلب غير مسموح / Request origin is not allowed' });
+  const ip = req.socket?.remoteAddress || 'unknown';
+  const bucket = isAttribution ? 'referral-attribution' : isEvent ? 'referral-events' : 'referral-consent-revoke';
+  const limit = isAttribution ? 60 : isEvent ? 300 : 20;
+  if (!await consumeRateLimitBucket(bucket, ip, limit, 60 * 60_000)) {
+    return respond(429, { error: 'حاول لاحقاً / Please try again later' });
+  }
+
+  const rawCookie = cookieValue(req, REFERRAL_ATTRIBUTION_COOKIE);
+  const validCookie = /^[A-Za-z0-9_-]{40,64}$/.test(rawCookie);
+  const cookieHash = validCookie ? hash(rawCookie) : '';
+  if (isAttribution) {
+    if (req.method !== 'GET') return respond(405, { error: 'Method not allowed' }, { ...security, Allow: 'GET' });
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const code = clean(url.searchParams.get('ref'), 40);
+    let result = null;
+    if (code) {
+      const value = validCookie ? rawCookie : randomBytes(32).toString('base64url');
+      const valueHash = validCookie ? cookieHash : hash(value);
+      result = await capturePostgresReferralAttribution({
+        cookieHash: valueHash, code, at: now(),
+        expiresAt: new Date(Date.now() + REFERRAL_ATTRIBUTION_TTL_SECONDS * 1000).toISOString()
+      });
+      if (result.kind === 'captured' || result.kind === 'existing') {
+        const expiresAt = Date.parse(result.attribution.expiresAt);
+        const maxAge = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+        const headers = { ...security, ...(maxAge ? { 'Set-Cookie': cookie(REFERRAL_ATTRIBUTION_COOKIE, value, maxAge, req) } : {}) };
+        return respond(200, { attributed: true, code: result.attribution.code, expiresAt: result.attribution.expiresAt }, headers);
+      }
+      return respond(200, { attributed: false });
+    }
+    if (validCookie) {
+      const attribution = await getPostgresReferralAttribution(cookieHash);
+      if (attribution) return respond(200, { attributed: true, code: attribution.code, expiresAt: attribution.expiresAt });
+    }
+    return respond(200, { attributed: false });
+  }
+
+  if (req.method !== 'POST') return respond(405, { error: 'Method not allowed' }, { ...security, Allow: 'POST' });
+  if (isRevoke) {
+    const body = await jsonBody(req);
+    const visitorId = clean(body.visitorId, 80);
+    if (!/^[\-_a-zA-Z0-9]{12,80}$/.test(visitorId)) return respond(400, { error: 'معرّف القياس غير صالح / Invalid analytics identifier' });
+    // Consent revocation removes only optional analytics. The essential
+    // first-party attribution cookie stays server-owned until signup/expiry.
+    await deletePostgresReferralAnalyticsByVisitor(hash(visitorId));
+    return respond(202, { ok: true });
+  }
+
+  const body = await jsonBody(req);
+  const type = clean(body.type, 32);
+  const eventId = clean(body.eventId, 80);
+  const visitorId = clean(body.visitorId, 80);
+  const allowedTypes = ['visit', 'service_view', 'template_view', 'whatsapp_click'];
+  if (!validCookie || !allowedTypes.includes(type) || !/^[\-_a-zA-Z0-9]{12,80}$/.test(eventId) ||
+      !/^[\-_a-zA-Z0-9]{12,80}$/.test(visitorId)) return respond(400, { error: 'حدث الإحالة غير صالح / Invalid referral event' });
+  const resourceId = clean(body.resourceId, 100);
+  if (type === 'service_view' && !['web', 'apps', 'ai', 'ideas'].includes(resourceId)) return respond(400, { error: 'الخدمة غير صالحة / Invalid service' });
+  if (type === 'template_view' && !templateById.has(resourceId)) return respond(400, { error: 'القالب غير صالح / Invalid template' });
+  const followupId = type === 'whatsapp_click' ? clean(body.followupId, 32).toUpperCase() : '';
+  if (type === 'whatsapp_click' && !/^ZRI-[A-F0-9]{8,24}$/.test(followupId)) return respond(400, { error: 'رقم المتابعة غير صالح / Invalid follow-up ID' });
+  const result = await recordPostgresReferralEvent({
+    cookieHash, type, eventId, resourceId, followupId,
+    analyticsVisitorHash: hash(visitorId), at: now()
+  });
+  if (result.kind === 'missing_attribution') return respond(409, { error: 'لا يوجد إسناد إحالة صالح / No valid referral attribution' });
+  return respond(202, { ok: true, duplicate: result.kind === 'duplicate' });
 }
 
 async function handlePostgresCoreWrite(req, res, path) {
@@ -2716,6 +2818,8 @@ async function handle(req, res) {
   // Health checks disclose no store data or mutable state. Keep them outside the
   // compatibility-store transaction so probes do not queue behind business writes.
   if (req.method === 'GET' && path === '/api/health') return handleRequest(req, res);
+  const referralHandled = await handlePostgresReferral(req, res, path);
+  if (referralHandled) return;
   if (req.method === 'GET' && path === '/api/public') {
     // Preserve the legacy staging response without loading data when the gate is closed.
     if (!stagingAuthorized(req)) return handleRequest(req, res);
@@ -2966,12 +3070,13 @@ async function handleRequest(req, res) {
       events.sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt));
       const active=events.filter(event=>!event.reversed),counts=type=>active.filter(event=>event.type===type).length;
       const visitors=new Set(active.filter(event=>event.type==='visit').map(event=>event.visitorHash).filter(Boolean)).size;
-      const linkStats=intel.links.filter(link=>(!employee||link.userId===employee)).map(link=>{const subset=active.filter(event=>event.linkId===link.id);const count=type=>subset.filter(event=>event.type===type).length;return {...link,visits:new Set(subset.filter(event=>event.type==='visit').map(event=>event.visitorHash).filter(Boolean)).size,serviceViews:count('service_view'),templateViews:count('template_view'),whatsappClicks:count('whatsapp_click'),inquiries:count('inquiry_confirmed'),requests:new Set(orders.filter(order=>order.linkId===link.id).map(order=>order.id)).size,sales:new Set(subset.filter(event=>event.type==='qualified_sale'&&event.leadId).map(event=>event.leadId)).size};});
+      const linkStats=intel.links.filter(link=>(!employee||link.userId===employee)).map(link=>{const subset=active.filter(event=>event.linkId===link.id);const count=type=>subset.filter(event=>event.type===type).length;return {...link,signups:count('client_signup'),visits:new Set(subset.filter(event=>event.type==='visit').map(event=>event.visitorHash).filter(Boolean)).size,serviceViews:count('service_view'),templateViews:count('template_view'),whatsappClicks:count('whatsapp_click'),inquiries:count('inquiry_confirmed'),requests:new Set(orders.filter(order=>order.linkId===link.id).map(order=>order.id)).size,sales:new Set(subset.filter(event=>event.type==='qualified_sale'&&event.leadId).map(event=>event.leadId)).size};});
+      const clients=(intel.clients||[]).filter(client=>(!employee||client.userId===employee)&&Date.parse(client.createdAt)>=start&&Date.parse(client.createdAt)<=end);
       for(const event of events)delete event.visitorHash;
-      const summary={visits:visitors,serviceViews:counts('service_view'),templateViews:counts('template_view'),whatsappClicks:counts('whatsapp_click'),inquiries:counts('inquiry_confirmed'),requests:new Set(orders.map(order=>order.id)).size,quoteAcceptances:counts('quote_accepted'),payments:counts('payment_received'),sales:new Set(active.filter(event=>event.type==='qualified_sale'&&event.leadId).map(event=>event.leadId)).size,orders:orders.length};
+      const summary={signups:events.filter(event=>event.type==='client_signup').length,visits:visitors,serviceViews:counts('service_view'),templateViews:counts('template_view'),whatsappClicks:counts('whatsapp_click'),inquiries:counts('inquiry_confirmed'),requests:new Set(orders.map(order=>order.id)).size,quoteAcceptances:counts('quote_accepted'),payments:counts('payment_received'),sales:new Set(active.filter(event=>event.type==='qualified_sale'&&event.leadId).map(event=>event.leadId)).size,orders:orders.length};
       const rate=(numerator,denominator)=>denominator?Math.round(numerator/denominator*1000)/10:0;
       summary.conversionRates={visitToRequest:rate(summary.requests,summary.visits),requestToSale:rate(summary.sales,summary.requests),whatsappToInquiry:rate(summary.inquiries,summary.whatsappClicks)};
-      return json(res,200,{retentionDays:90,filters:{from,to,employee,status},summary,employees:intel.employees.filter(row=>!employee||row.id===employee),links:linkStats,orders:orders.slice(0,500),events:events.filter(event=>event.type!=='visit').slice(0,500)},security);
+      return json(res,200,{retentionDays:90,filters:{from,to,employee,status},summary,employees:intel.employees.filter(row=>!employee||row.id===employee),links:linkStats,clients:clients.slice(0,500),orders:orders.slice(0,500),events:events.filter(event=>event.type!=='visit').slice(0,500)},security);
     }
     if (req.method === 'POST' && path.startsWith('/api/admin/leads/') && path.endsWith('/quote-accepted')) {
       const auth=requireAuth(req,res,['admin']);if(!auth)return;
