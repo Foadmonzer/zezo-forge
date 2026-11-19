@@ -9,8 +9,9 @@ async function tick() {
   if (stopping || running) return;
   running = true;
   try {
-    const { processed, sent, retry, failed, uncertain } = await processPostgresOutbox();
+    const { processed, sent, retry, failed, uncertain, deferred } = await processPostgresOutbox();
     if (processed) console.log('ZEZO email outbox', { processed, accepted: sent, retry, failed, uncertain });
+    if (deferred) console.info('ZEZO email outbox deferred while database table was busy', { phase: deferred });
   } catch {
     console.error('Outbox worker failed; durable queue state was retained for retry.');
   } finally {

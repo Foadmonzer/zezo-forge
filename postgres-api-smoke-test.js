@@ -30,6 +30,7 @@ const rateBucket = value => createHash('sha256').update(`zezo-rate:${value}`).di
 const testRateBuckets = [
   rateBucket('login:first-admin:127.0.0.1'), rateBucket(`login:127.0.0.1:${ownerUsername}`),
   rateBucket('client-registration:127.0.0.1'), rateBucket(`login:127.0.0.1:${customerEmail}`),
+  rateBucket('client-email-verification:127.0.0.1'),
   rateBucket('conversation:create:127.0.0.1'), rateBucket('public-enquiry:127.0.0.1'),
   rateBucket('quote:127.0.0.1'), rateBucket('quote:referral:127.0.0.1'), rateBucket('referral:127.0.0.1'),
   rateBucket('referral-attribution:127.0.0.1'), rateBucket('referral-events:127.0.0.1'), rateBucket('referral-consent-revoke:127.0.0.1'),
@@ -370,7 +371,7 @@ try {
     const verificationSignup = await request('POST', '/api/client/register', { body: { ...customerRegistrationBody, email: verificationEmail } });
     assert(verificationSignup.status === 201 && verificationSignup.data.verificationRequired && verificationSignup.data.emailQueued,
       'Allowlisted client did not receive the verification flow.');
-    const pendingUser = await client.query('SELECT id, active FROM user_accounts WHERE email = $1', [verificationEmail]);
+    const pendingUser = await client.query("SELECT id, active, data->>'emailVerificationExpires' AS expires FROM user_accounts WHERE email = $1", [verificationEmail]);
     assert(pendingUser.rows[0]?.id && !pendingUser.rows[0].active, 'New customer was active before verifying their mailbox.');
     syntheticIds.push(pendingUser.rows[0].id);
     const pendingMail = await client.query("SELECT data FROM outbox_messages WHERE recipient = $1 AND data->>'kind' = 'client_email_verification'", [verificationEmail]);
@@ -379,14 +380,48 @@ try {
     const verifyMatch = /verifyEmail=([A-Za-z0-9_-]+)/.exec(body.text);
     assert(verifyMatch, 'The queued verification message lacks a token.');
     const verifyPayload = { body: { token: verifyMatch[1] } };
-    assert((await request('POST', '/api/auth/verify-email', verifyPayload)).status === 200, 'Customer could not verify their mailbox.');
-    assert((await request('POST', '/api/auth/verify-email', verifyPayload)).status === 400, 'Mailbox verification link was reusable.');
+    const verificationUserId = pendingUser.rows[0].id;
+    await client.query("UPDATE user_accounts SET data = jsonb_set(data, '{emailVerificationExpires}', to_jsonb($2::bigint)) WHERE id = $1", [verificationUserId, Date.now() - 1]);
+    assert((await request('POST', '/api/auth/verify-email', verifyPayload)).status === 400, 'An expired mailbox verification link was accepted.');
+    await client.query("UPDATE user_accounts SET data = jsonb_set(data, '{emailVerificationExpires}', to_jsonb($2::bigint)) || jsonb_build_object('accountDisabledAt', $3::text) WHERE id = $1", [verificationUserId, pendingUser.rows[0].expires, new Date().toISOString()]);
+    assert((await request('POST', '/api/auth/verify-email', verifyPayload)).status === 400, 'Mailbox verification bypassed account deactivation.');
+    await client.query("UPDATE user_accounts SET data = data - 'accountDisabledAt' WHERE id = $1", [verificationUserId]);
+
+    const lockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+    await lockHolder.connect();
+    let timeout;
+    let verificationAttempts;
+    try {
+      await lockHolder.query('BEGIN');
+      await lockHolder.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
+      verificationAttempts = await Promise.race([
+        Promise.all(Array.from({ length: 4 }, () => request('POST', '/api/auth/verify-email', verifyPayload))),
+        new Promise(resolve => { timeout = setTimeout(() => resolve(null), 3000); })
+      ]);
+    } finally {
+      clearTimeout(timeout);
+      await lockHolder.query('ROLLBACK');
+      await lockHolder.end();
+    }
+    assert(verificationAttempts, 'Email verification waited on the legacy company-wide advisory lock.');
+    const verified = verificationAttempts.find(attempt => attempt.status === 200);
+    assert(verified?.data.user?.role === 'client' && verified.data.user.active && verificationAttempts.filter(attempt => attempt.status === 400).length === 3,
+      'Concurrent verification must activate the client once and reject all other attempts.');
+    const verifiedSession = await request('GET', '/api/auth/session', { cookie: cookieFrom(verified) });
+    assert(verifiedSession.status === 200 && verifiedSession.data.user?.id === verificationUserId, 'The verification session was not saved.');
+    const consumed = await client.query(`
+      SELECT (SELECT count(*)::int FROM auth_sessions WHERE "userId" = $1) AS sessions,
+             (SELECT count(*)::int FROM audit_entries WHERE "actorId" = $1 AND action = 'client_email_verified') AS audit,
+             (SELECT data->>'emailVerificationHash' FROM user_accounts WHERE id = $1) AS token_hash
+    `, [verificationUserId]);
+    assert(consumed.rows[0].sessions === 1 && consumed.rows[0].audit === 1 && !consumed.rows[0].token_hash,
+      'The verification token was not consumed atomically with exactly one session and audit record.');
     const unlistedSignup = await request('POST', '/api/client/register', { body: { ...customerRegistrationBody, email: unlistedEmail } });
     assert(unlistedSignup.status === 201 && !unlistedSignup.data.verificationRequired && unlistedSignup.data.user?.active, 'Mail pilot blocked normal client signup.');
     syntheticIds.push(unlistedSignup.data.user.id);
     const unlistedMail = await client.query("SELECT count(*)::int AS count FROM outbox_messages WHERE recipient = $1 AND data->>'kind' = 'client_email_verification'", [unlistedEmail]);
     assert(unlistedMail.rows[0].count === 0, 'Mail pilot queued a verification for a non-allowlisted client.');
-    results.push('mail pilot limits verification to its approved mailbox and rejects verification-token replay');
+    results.push('mail pilot limits verification to its approved mailbox, rejects expired and disabled accounts, and consumes the token once without the global lock');
   }, `pg_verification_${testSuffix}@example.test`);
 
   await request('POST', '/api/auth/logout', { cookie: customerCookie });

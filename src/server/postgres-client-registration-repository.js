@@ -107,3 +107,42 @@ export async function createPostgresClientRegistration({
     throw error;
   }
 }
+
+/** Consume a pending client's email confirmation and issue their session atomically. */
+export async function verifyPostgresClientEmail({ verificationHash, sessionHash, sessionExpiresAt, auditId, at }) {
+  return withPostgresScopedTransaction(async client => {
+    const { rows: [account] } = await client.query(`
+      SELECT id, email, username, role, "fullName", "passwordHash", data, "createdAt"
+      FROM user_accounts
+      WHERE role = 'client' AND active = FALSE
+        AND data ->> 'emailVerificationHash' = $1
+        AND COALESCE(data ->> 'accountDisabledAt', '') IN ('', 'false', '0')
+      LIMIT 1 FOR UPDATE
+    `, [verificationHash]);
+    if (!account) return null;
+
+    const previous = asObject(account.data);
+    const tokenExpiresAt = Number(previous.emailVerificationExpires);
+    if (previous.emailVerified === true || !Number.isFinite(tokenExpiresAt) || tokenExpiresAt <= Date.now()) return null;
+
+    const data = { ...previous, active: true, emailVerified: true, emailVerifiedAt: at };
+    delete data.emailVerificationHash;
+    delete data.emailVerificationExpires;
+    await client.query(`
+      UPDATE user_accounts SET active = TRUE, data = $2::jsonb, "updatedAt" = $3 WHERE id = $1
+    `, [account.id, JSON.stringify(data), at]);
+    await client.query(`
+      INSERT INTO auth_sessions (id, "userId", "expiresAt", data)
+      VALUES ($1, $2, $3, '{}')
+    `, [sessionHash, account.id, sessionExpiresAt]);
+    await client.query(`
+      INSERT INTO audit_entries (id, "actorId", action, "targetId", data, "createdAt")
+      VALUES ($1, $2, 'client_email_verified', $2, $3::jsonb, $4)
+    `, [auditId, account.id, JSON.stringify({ actor: account.username, role: account.role, detail: '' }), at]);
+
+    return {
+      ...data, id: account.id, email: account.email || '', username: account.username || '', role: account.role,
+      name: account.fullName || data.name || '', passwordHash: account.passwordHash, createdAt: account.createdAt.toISOString()
+    };
+  });
+}

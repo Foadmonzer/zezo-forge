@@ -123,6 +123,19 @@ try {
     return Response.json({ id: 'synthetic-accepted-message' }, { status: 200 });
   };
   const runWorker = () => processPostgresOutbox({ env: scopedEnv, allowedKinds: ['test', 'team_invitation'], fetchImpl: stubFetch });
+
+  // Simulate the whole-store compatibility transaction blocking the scheduler.
+  await client.query('BEGIN');
+  try {
+    await client.query('LOCK TABLE outbox_messages IN SHARE ROW EXCLUSIVE MODE');
+    assert.deepEqual(await runWorker(), { processed: 0, sent: 0, retry: 0, failed: 0, uncertain: 0, deferred: 'claim' });
+    assert.deepEqual(sentKeys, []);
+    const unclaimed = await client.query('SELECT state, attempts FROM outbox_messages WHERE id = $1', [sendId]);
+    assert.deepEqual(unclaimed.rows[0], { state: 'pending', attempts: 0 });
+  } finally {
+    await client.query('ROLLBACK');
+  }
+
   assert.deepEqual(await runWorker(), { processed: 1, sent: 0, retry: 1, failed: 0, uncertain: 0 });
   assert.deepEqual(await runWorker(), { processed: 0, sent: 0, retry: 0, failed: 0, uncertain: 0 });
   const retried = await client.query('SELECT state, data FROM outbox_messages WHERE id = $1', [sendId]);
@@ -142,12 +155,41 @@ try {
     fetchImpl: async () => Response.json({ unrelated: 'value' }, { status: 200 })
   }), error => error.uncertain && error.retryable && error.message === 'Email provider acceptance could not be verified.');
 
+  const completionId = `${pendingId}_completion_lock`;
+  createdRows.push(completionId);
+  await client.query(`
+    INSERT INTO outbox_messages (id, recipient, state, attempts, data, "createdAt", "updatedAt")
+    VALUES ($1, $2, 'pending', 0, $3::jsonb, NOW(), NOW())
+  `, [completionId, testRecipient, JSON.stringify({ ...payload(completionId), to: testRecipient })]);
+  const completionKeys = [];
+  const providerId = 'synthetic-accepted-before-lock';
+  const accept = async (_, options) => {
+    completionKeys.push(options.headers['Idempotency-Key']);
+    if (completionKeys.length === 1) {
+      await client.query('BEGIN');
+      await client.query('LOCK TABLE outbox_messages IN SHARE ROW EXCLUSIVE MODE');
+    }
+    return Response.json({ id: providerId });
+  };
+  const runCompletionTest = () => processPostgresOutbox({ env: scopedEnv, allowedKinds: ['test'], fetchImpl: accept });
+  try {
+    assert.deepEqual(await runCompletionTest(), { processed: 0, sent: 0, retry: 0, failed: 0, uncertain: 0, deferred: 'completion' });
+    const leased = await client.query('SELECT state, attempts FROM outbox_messages WHERE id = $1', [completionId]);
+    assert.deepEqual(leased.rows[0], { state: 'sending', attempts: 1 });
+  } finally {
+    await client.query('ROLLBACK');
+  }
+  await client.query(`UPDATE outbox_messages SET data = data || jsonb_build_object('workerLeaseUntil', (NOW() - INTERVAL '1 minute')::text) WHERE id = $1`, [completionId]);
+  assert.equal((await runCompletionTest()).sent, 1);
+  assert.deepEqual(completionKeys, [completionId, completionId]);
+
   console.log('PASS PostgreSQL Outbox claim is atomic and lease protected');
   console.log('PASS worker restart recovers an expired lease while preserving the provider idempotency key');
   console.log('PASS stale worker completion is rejected and sent messages are not reclaimed');
   console.log('PASS ambiguous sends outside the provider idempotency window fail closed for manual review');
   console.log('PASS an ambiguous fifth attempt also fails closed instead of remaining stuck or being resent');
   console.log('PASS retry backoff, stable idempotency, provider acceptance, and cutoff/recipient restrictions');
+  console.log('PASS a busy table defers claims and completions without losing the lease or changing the provider idempotency key');
   console.log('PASS no external email provider was called; all addresses and responses were synthetic');
 } finally {
   await client.query('DELETE FROM outbox_messages WHERE id = ANY($1::text[])', [createdRows]).catch(() => {});
