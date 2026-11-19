@@ -189,6 +189,18 @@ test('responsive page layouts, navigation, and screenshots at requested widths',
   expect(errors).toEqual([]);
 });
 
+test('the mobile recovery form stays actionable while the privacy choice is pending', async ({ page, browserName }) => {
+  test.skip(browserName !== 'chromium', 'Mobile stacking check runs once in Chromium.');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`/#resetPassword=${'A'.repeat(43)}`);
+  await waitForZezoApp(page);
+  await expect(page.locator('#analyticsConsent')).toBeVisible();
+  await expect(page.locator('#resetPasswordForm')).toBeVisible();
+  await page.locator('#resetPasswordForm button[type="submit"]').click({ trial: true });
+  await page.locator('#authModal [data-close-modal]').click();
+  await expect(page.locator('#analyticsConsent')).toBeVisible();
+});
+
 test('all 40 catalog templates open and both request actions route to the correct template', async ({ page, browserName }, testInfo) => {
   test.setTimeout(240_000);
   test.skip(browserName !== 'chromium', 'The 40-template sweep runs once in Chromium.');
