@@ -4,6 +4,11 @@ command = "pnpm build"
 [context.deploy-preview]
 command = "node scripts/verify-netlify-preview-database.mjs && pnpm build"
 
+[context.deploy-preview.environment]
+ZEZO_PREVIEW_DB_PROJECT = "rwekkpwdvncehpwwzpap"
+ZEZO_PREVIEW_DB_POOLER = "aws-0-ap-northeast-1.pooler.supabase.com"
+ZEZO_PREVIEW_DB_ROLE = "zezo_netlify_preview_20261119"
+
 [[redirects]]
 from = "http://zezo-forge-fouad.netlify.app/*"
 to = "https://zezoforge.com/:splat"
