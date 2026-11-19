@@ -1,6 +1,9 @@
 [build]
 command = "pnpm build"
 
+[context.deploy-preview]
+command = "node scripts/verify-netlify-preview-database.mjs && pnpm build"
+
 [[redirects]]
 from = "http://zezo-forge-fouad.netlify.app/*"
 to = "https://zezoforge.com/:splat"

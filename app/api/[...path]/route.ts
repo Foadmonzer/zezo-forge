@@ -46,27 +46,13 @@ function initLocalRuntime() {
   return globals.__zezoNextInit ??= init();
 }
 
-function stagingPublicOrigin(request: NextRequest) {
-  try {
-    const configured = new URL(String(process.env.ZEZO_PUBLIC_URL || ''));
-    if ((configured.protocol === 'https:' || configured.protocol === 'http:') &&
-        !configured.username && !configured.password &&
-        configured.pathname === '/' && !configured.search && !configured.hash) {
-      return configured.origin;
-    }
-  } catch {
-    // Local development may omit ZEZO_PUBLIC_URL; fall back to the request origin.
-  }
-  return new URL(request.url).origin;
-}
-
-function stagingLoginRedirect(request: NextRequest, code: string) {
-  const target = new URL('/', stagingPublicOrigin(request));
-  target.searchParams.set('stagingError', code);
-  const response = NextResponse.redirect(target, 303);
-  response.headers.set('Cache-Control', 'no-store');
-  response.headers.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
-  return response;
+function stagingLoginRedirect(error?: string) {
+  // The staging session cookie belongs to the host that accepts the login.
+  const location = error ? `/?${new URLSearchParams({ stagingError: error })}` : '/';
+  return new NextResponse(null, {
+    status: 303,
+    headers: { Location: location, 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow, noarchive' }
+  });
 }
 
 function stagingRequestAddress(request: NextRequest) {
@@ -80,24 +66,22 @@ async function handleStagingLogin(request: NextRequest) {
   if (process.env.ZEZO_STAGING !== 'true') return new Response(null, { status: 404 });
   if (request.method !== 'POST') return new Response(null, { status: 405, headers: { Allow: 'POST' } });
   if (!process.env.ZEZO_STAGING_ACCESS_PASSWORD || process.env.ZEZO_STAGING_ACCESS_PASSWORD.length < 16) {
-    return stagingLoginRedirect(request, 'configuration');
+    return stagingLoginRedirect('configuration');
   }
   if (hostedServerless() && !postgresConfigured()) {
-    return stagingLoginRedirect(request, 'database_unavailable');
+    return stagingLoginRedirect('database_unavailable');
   }
 
   try {
     const allowed = await consumeRateLimitBucket('staging-login', stagingRequestAddress(request), 12, 15 * 60_000);
-    if (!allowed) return stagingLoginRedirect(request, 'rate_limited');
+    if (!allowed) return stagingLoginRedirect('rate_limited');
 
     const form = await request.formData();
     const value = form.get('password');
     const password = typeof value === 'string' ? value : '';
-    if (!await stagingPasswordMatches(password)) return stagingLoginRedirect(request, 'invalid_password');
+    if (!await stagingPasswordMatches(password)) return stagingLoginRedirect('invalid_password');
 
-    const response = NextResponse.redirect(new URL('/', stagingPublicOrigin(request)), 303);
-    response.headers.set('Cache-Control', 'no-store');
-    response.headers.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    const response = stagingLoginRedirect();
     response.cookies.set({
       name: STAGING_ACCESS_COOKIE,
       value: await createStagingSession(),
@@ -114,7 +98,7 @@ async function handleStagingLogin(request: NextRequest) {
       : 'unknown';
     const name = error instanceof Error ? error.name : 'unknown';
     console.error('ZEZO staging login limiter failed', { name, code });
-    return stagingLoginRedirect(request, 'limiter_unavailable');
+    return stagingLoginRedirect('limiter_unavailable');
   }
 }
 

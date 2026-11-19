@@ -27,7 +27,7 @@ test('staging gate protects pages, API, and static assets until a secure session
 
   const badLogin = await request.post('/api/staging/login', { form: { password: 'not-the-staging-password' }, maxRedirects: 0 });
   expect(badLogin.status()).toBe(303);
-  expect(badLogin.headers().location).toContain('stagingError=invalid_password');
+  expect(badLogin.headers().location).toBe('/?stagingError=invalid_password');
 
   const loginResponsePromise = page.waitForResponse(response => new URL(response.url()).pathname === '/api/staging/login');
   await page.getByLabel('كلمة مرور المعاينة').fill(stagingPassword);
@@ -38,7 +38,7 @@ test('staging gate protects pages, API, and static assets until a secure session
   ]);
   const loginHeaders = await loginResponse.allHeaders();
   expect(loginResponse.status(), `staging login status=${loginResponse.status()} location=${loginHeaders.location || 'missing'}`).toBe(303);
-  expect(loginHeaders.location || '', 'successful login should redirect to the staging home page').not.toContain('stagingError=');
+  expect(loginHeaders.location, 'successful login should stay on the same staging host').toBe('/');
   const cookies = await page.context().cookies();
   const gateCookie = cookies.find(cookie => cookie.name === 'zezo_staging_access');
   expect(gateCookie).toBeTruthy();
@@ -59,6 +59,7 @@ test('staging gate protects pages, API, and static assets until a secure session
   await expect(page.locator('body')).not.toContainText('دخول بيئة الاختبار');
 
   await page.goto('/__staging/logout');
+  expect(new URL(page.url()).origin).toBe(pageUrl.origin);
   await expect(page.getByRole('heading', { name: 'دخول بيئة الاختبار' })).toBeVisible();
   const anonymousApiResponse = await page.request.get('/api/public');
   expect(anonymousApiResponse.status(), 'logging out should remove the staging cookie from subsequent browser requests').toBe(401);
