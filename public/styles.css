@@ -222,6 +222,7 @@ body.reduced-motion .program-card,body.reduced-motion .support-fab{transition:no
 
 /* Customer sign-in choices and the private staff portal. */
 .auth-choice-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.auth-choice-grid>#clientIntentNotice,.auth-choice-grid>#clientSessionNotice,.auth-choice-grid>#switchToClientAccount{grid-column:1/-1}
 .auth-choice-grid .auth-access-card{display:flex;flex-direction:column;min-height:150px}
 .auth-choice-grid .auth-access-card .button{margin-top:auto}
 .button-secondary{border-color:rgba(163,255,18,.45);background:rgba(163,255,18,.07);color:#dfffb1}
@@ -251,3 +252,21 @@ button[aria-busy="true"]::after{content:"";display:inline-block;width:10px;heigh
 /* Let dashboard grid children shrink and keep long helper text readable on phones. */
 .dashboard-layout,.dashboard-content{min-width:0}
 .subtle-note{max-width:100%;white-space:normal;overflow-wrap:anywhere;line-height:1.75}
+/* Owner workspace: full-screen working area with clear, permission-preserving navigation groups. */
+@media(min-width:761px){
+  .dashboard-backdrop{padding:0;align-items:stretch}
+  .dashboard{width:100%;height:100dvh;max-height:100vh;border:0}
+  .dashboard-layout{grid-template-columns:clamp(260px,18vw,320px) minmax(0,1fr)}
+  .dashboard-rail{overflow:auto;padding:24px 17px 16px}
+  .dashboard-tabs-owner{gap:15px}
+  .dashboard-nav-group>span{display:block;padding:0 10px 5px;color:#657283;font-size:8px;font-weight:600;letter-spacing:.04em}
+  .dashboard-nav-group>div{display:grid;gap:3px}
+  .dashboard-tabs-owner .dash-tab{min-height:39px;border-radius:3px;font-size:11px}
+  .dashboard-content{padding:clamp(24px,3vw,48px)}
+}
+@media(max-width:760px){
+  .dashboard-tabs-owner{display:flex;align-items:stretch;gap:3px}
+  .dashboard-nav-group{display:contents}
+  .dashboard-nav-group>span{display:none}
+  .dashboard-nav-group>div{display:flex;gap:3px}
+}

@@ -165,6 +165,11 @@ try {
   assert(Object.keys(publicBefore.data.templateActive || {}).length === 40, 'Public runtime read did not return template availability.');
   results.push('lock-free public runtime read preserves all 40 template prices and availability');
 
+  const anonymousNotifications = await request('GET', '/api/notifications?limit=8');
+  assert(anonymousNotifications.status === 401 && !anonymousNotifications.data.authenticated,
+    'Anonymous visitors must not read notifications from any account.');
+  results.push('anonymous notification reads are denied');
+
   // Hold the legacy global advisory lock from a second PostgreSQL connection.
   // The targeted public repository must still answer while legacy API writes wait.
   const lockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
@@ -599,6 +604,34 @@ try {
     !JSON.stringify(marketerSignupView.data.referredClients).includes(referredClientEmail),
   'The marketer dashboard did not show its referred client safely after registration.');
   results.push('client signup bound to the active employee marketer; marketer sees signup without customer contact details');
+  const developerHome = await request('GET', '/api/dashboard', { cookie: employees.developer.cookie });
+  assert(developerHome.status === 200 && Boolean(developerHome.data.referralLink) &&
+    Boolean(developerHome.data.user?.referralCode), 'A developer must have one account with both a project workspace and a referral link.');
+  const developerReferralCapture = await request('GET', `/api/referral-attribution?ref=${encodeURIComponent(developerHome.data.user.referralCode)}`);
+  assert(developerReferralCapture.status === 200 && developerReferralCapture.data.attributed,
+    'An active developer referral link was not accepted.');
+  const developerReferralCookie = referralCookieFrom(developerReferralCapture);
+  const developerReferredEmail = `pg_developer_client_${testSuffix}@example.test`;
+  const developerReferredClient = await request('POST', '/api/client/register', {
+    body: { name: 'Synthetic Developer Referred Customer', email: developerReferredEmail, password: customerPassword, confirmPassword: customerPassword },
+    cookie: developerReferralCookie
+  });
+  assert(developerReferredClient.status === 201 && developerReferredClient.data.user?.role === 'client',
+    `A client could not register through a developer referral link (${developerReferredClient.status}).`);
+  syntheticIds.push(developerReferredClient.data.user.id);
+  const savedDeveloperAttribution = await client.query(
+    `SELECT data ->> 'referralUserId' AS referrer_id, data ->> 'referralCode' AS referral_code
+       FROM user_accounts WHERE id = $1`, [developerReferredClient.data.user.id]
+  );
+  assert(savedDeveloperAttribution.rows[0]?.referrer_id === employees.developer.id &&
+    savedDeveloperAttribution.rows[0]?.referral_code === developerHome.data.user.referralCode,
+    'The developer referral did not persist against the developer account.');
+  const developerReferralDashboard = await request('GET', '/api/dashboard', { cookie: employees.developer.cookie });
+  assert(developerReferralDashboard.status === 200 &&
+    developerReferralDashboard.data.referredClients?.some(row => row.id === developerReferredClient.data.user.id && row.requestCount === 0) &&
+    !JSON.stringify(developerReferralDashboard.data.referredClients).includes(developerReferredEmail),
+    'The developer referral dashboard did not show its synthetic signup with contact information protected.');
+  results.push('developer account simultaneously supports assigned projects and a referral link; developer-attributed signup is stored and contact details stay private');
   const hrPaymentDenied = await request('POST', '/api/admin/payment', {
     body: { leadId: 'synthetic-not-found', amount: 1, kind: 'payment', verified: true, idempotencyKey: `denied_${testSuffix}` }, cookie: employees.hr_manager.cookie
   });
@@ -685,13 +718,40 @@ try {
     'Consent revocation must delete optional analytics while retaining the functional first-party referral attribution.');
   results.push('server-owned referral cookie, optional analytics storage and revocation without losing functional attribution');
 
+  const conversationCountBefore = Number((await client.query('SELECT count(*)::int AS count FROM conversations')).rows[0]?.count || 0);
+  const anonymousConversation = await request('POST', '/api/conversations', {
+    body: { templateId: 'web-copper-table', message: 'Anonymous synthetic message must not be stored.', source: 'postgres_api_test' }
+  });
+  assert(anonymousConversation.status === 401, 'Anonymous conversation creation must ask the visitor to authenticate.');
+  const staffConversation = await request('POST', '/api/conversations', {
+    body: { templateId: 'web-copper-table', message: 'Staff must not create a customer conversation.', source: 'postgres_api_test' },
+    cookie: employees.order_manager.cookie
+  });
+  assert(staffConversation.status === 403, 'Staff sessions must not submit as a client.');
+  const deniedConversationCount = Number((await client.query('SELECT count(*)::int AS count FROM conversations')).rows[0]?.count || 0);
+  assert(deniedConversationCount === conversationCountBefore, 'Rejected anonymous or staff attempts must not create conversation records.');
+
+  const conversationIdempotencyKey = `chat_${testSuffix}${randomUUID().replaceAll('-', '')}`;
   const createdConversation = await request('POST', '/api/conversations', {
-    body: { templateId: 'web-copper-table', message: 'Synthetic question about customizing the restaurant template.', source: 'postgres_api_test' },
+    body: { templateId: 'web-copper-table', message: 'Synthetic question about customizing the restaurant template.', source: 'postgres_api_test', referralCode: referralCode, referralUserId, referralLinkId, idempotencyKey: conversationIdempotencyKey },
     cookie: customerCookie
   });
   assert(createdConversation.status === 201, `Customer conversation creation failed with ${createdConversation.status}.`);
   syntheticConversationId = createdConversation.data.conversation.id;
-  results.push('customer template conversation saved and reloaded from PostgreSQL');
+  assert(createdConversation.data.conversation.referralUserId === employees.marketer.id && createdConversation.data.conversation.referralCode === marketerHome.data.user.referralCode,
+    'Conversation referral must come from the authenticated customer account, not request fields.');
+  const repeatedConversation = await request('POST', '/api/conversations', {
+    body: { templateId: 'web-copper-table', message: 'Synthetic question about customizing the restaurant template.', source: 'postgres_api_test', referralCode: 'FORGED-SECOND-MARKETER', idempotencyKey: conversationIdempotencyKey },
+    cookie: customerCookie
+  });
+  assert(repeatedConversation.status === 200 && repeatedConversation.data.conversation.id === syntheticConversationId,
+    'Retrying a conversation submission with the same key must return the original conversation.');
+  const persistedConversation = await client.query('SELECT "customerId", data ->> \'referralUserId\' AS referral_user, data ->> \'referralCode\' AS referral_code FROM conversations WHERE id = $1', [syntheticConversationId]);
+  assert(persistedConversation.rows[0]?.customerId === customerId && persistedConversation.rows[0]?.referral_user === employees.marketer.id && persistedConversation.rows[0]?.referral_code === marketerHome.data.user.referralCode,
+    'Persisted conversation must stay attached to the correct client and first-touch employee referral.');
+  const conversationCountAfter = Number((await client.query('SELECT count(*)::int AS count FROM conversations')).rows[0]?.count || 0);
+  assert(conversationCountAfter === conversationCountBefore + 1, 'Conversation retry created a duplicate row.');
+  results.push('authenticated referred customer conversation persists once; forged referral overrides, anonymous reads, and staff submission are denied');
 
   const assignedConversation = await request('PATCH', `/api/conversations/${syntheticConversationId}`, {
     body: { assignedUserId: employees.order_manager.id }, cookie: ownerCookie
