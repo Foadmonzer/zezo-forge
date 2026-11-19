@@ -845,11 +845,11 @@ async function processMailQueue() {
   }
   return undefined;
 }
-async function queueMail({ to = '', recipientType = 'direct', subject, text, kind }) {
+async function queueMail({ to = '', recipientType = 'direct', subject, text, kind, persistImmediately = true }) {
   const safeText=String(text??'').replace(/\r\n?/g,'\n').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g,'').trim().slice(0,6000);
   const item = { id: id('mail'), createdAt: now(), kind: clean(kind, 50), to: clean(to, 150), recipientType, subject: clean(subject, 180), text: safeText, state: 'pending', attempts: 0, lastError: '' };
   store.mailQueue.unshift(item); store.mailQueue = store.mailQueue.slice(0, 1000);
-  await persist();
+  if (persistImmediately) await persist();
   // PostgreSQL deployments use the separately supervised durable worker; do not
   // send inside the request transaction or rely on a serverless timer.
   if (!postgresConfigured()) void processMailQueue();
@@ -2061,8 +2061,8 @@ function syncAllRankRequests() {
   for (const user of store.users) { const request = syncRankRequest(user); if (request) created.push(request); }
   return created;
 }
-async function queueRankRequestMail(request) {
-  await queueMail({ recipientType:'admin', kind:'rank_promotion_requested', subject:`طلب ترقية مسوّق — ${request.name}`, text:`بلغ المسوّق ${request.name} مستوى ${marketerRankTitles[request.targetRank]}\nالرتبة الحالية: ${marketerRankTitles[request.fromRank]}\nالمبيعات المؤهلة مدى الحياة: ${request.salesAtRequest}\nالحد المطلوب: ${request.threshold}\nراجع الطلب واتخذ قرار الموافقة أو الرفض من لوحة ZEZO.` });
+async function queueRankRequestMail(request, { persistImmediately = true } = {}) {
+  await queueMail({ recipientType:'admin', kind:'rank_promotion_requested', subject:`طلب ترقية مسوّق — ${request.name}`, text:`بلغ المسوّق ${request.name} مستوى ${marketerRankTitles[request.targetRank]}\nالرتبة الحالية: ${marketerRankTitles[request.fromRank]}\nالمبيعات المؤهلة مدى الحياة: ${request.salesAtRequest}\nالحد المطلوب: ${request.threshold}\nراجع الطلب واتخذ قرار الموافقة أو الرفض من لوحة ZEZO.`, persistImmediately });
 }
 function safeLead(lead, revealContact = false) {
   return {
@@ -3727,8 +3727,13 @@ async function handleRequest(req, res) {
         if(!wasFullyPaid&&lead.paidTotal>=lead.contractAmount){lead.fullyPaidAt=now();lead.everFullyPaid=true;lead.commissionHoldUntil=lead.fullyPaidAt;}
         if(lead.paidTotal>=lead.contractAmount)lead.refunded=false;
       }
-      store.payments.unshift(payment); if(lead.referralUserId)recordReferralEvent({userId:lead.referralUserId,code:lead.referralCode,linkId:lead.referralLinkId,type:b.kind==='refund'?'refund':'payment_received',leadId:lead.id,idempotencyKey:`${b.kind==='refund'?'refund':'payment_received'}:${payment.id}`});updateCommission(lead); updateDeveloperCommission(lead);syncLeadFinanceLedger(lead,auth.user);syncLeadReferralMilestones(lead,auth.user);syncCrmCaseForOrder(lead,auth.user); const rankRequestsCreated=syncAllRankRequests(); audit(auth.user,b.kind==='refund'?'refund_recorded':'manual_payment_verified',lead.id,`${amount} ILS`); await persist();
-      for(const request of rankRequestsCreated) await queueRankRequestMail(request);
+      store.payments.unshift(payment); if(lead.referralUserId)recordReferralEvent({userId:lead.referralUserId,code:lead.referralCode,linkId:lead.referralLinkId,type:b.kind==='refund'?'refund':'payment_received',leadId:lead.id,idempotencyKey:`${b.kind==='refund'?'refund':'payment_received'}:${payment.id}`});updateCommission(lead); updateDeveloperCommission(lead);syncLeadFinanceLedger(lead,auth.user);syncLeadReferralMilestones(lead,auth.user);syncCrmCaseForOrder(lead,auth.user); const rankRequestsCreated=syncAllRankRequests(); audit(auth.user,b.kind==='refund'?'refund_recorded':'manual_payment_verified',lead.id,`${amount} ILS`);
+      const transactionOwnsPersistence = Boolean(currentPostgresClient());
+      for(const request of rankRequestsCreated) await queueRankRequestMail(request,{persistImmediately:!transactionOwnsPersistence});
+      // The PostgreSQL API compatibility wrapper persists the complete state once
+      // after this handler returns. Avoid rewriting the entire snapshot here and
+      // again for each rank notification created by this same payment.
+      if(!transactionOwnsPersistence) await persist();
       return json(res,201,{payment,lead:safeLead(lead,true)},security);
     }
     if (req.method === 'POST' && path === '/api/admin/commission/paid') {

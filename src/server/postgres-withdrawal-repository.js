@@ -32,12 +32,12 @@ function reservedFor(row, withdrawals) {
 
 export async function createPostgresWithdrawalRequest({ sessionHash, body = {}, now = new Date() }) {
   return withPostgresScopedTransaction(async client => {
-    // Legacy whole-store writers use SHARE ROW EXCLUSIVE on this same set before
-    // loading their snapshot. Scoped requests use compatible locks and row locks,
-    // so independent employees no longer wait for the global queue while old
-    // writers cannot overwrite a withdrawal committed here.
+    // Legacy whole-store writers use SHARE ROW EXCLUSIVE on mutable business
+    // tables before loading their snapshot. audit_entries is append-only, so do
+    // not include it in this broad lock set: concurrent audit inserts use unique
+    // event ids and legacy persistence never deletes them.
     await client.query(`LOCK TABLE app_settings, user_accounts, project_requests, commissions,
-      withdrawal_requests, finance_ledger_entries, system_notifications, audit_entries, outbox_messages
+      withdrawal_requests, finance_ledger_entries, system_notifications, outbox_messages
       IN ROW EXCLUSIVE MODE`);
 
     const sessionResult = await client.query(`

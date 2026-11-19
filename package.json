@@ -26,7 +26,7 @@
     "test:account-notifications": "node scripts/account-notification-regression.mjs",
     "test:public-site-origin": "node --test scripts/public-site-origin.test.mjs",
     "test:password-recovery-email": "node scripts/password-recovery-email-regression.mjs",
-    "test:postgres": "node postgres-smoke-test.js && node postgres-api-smoke-test.js && node postgres-outbox-smoke-test.js",
+    "test:postgres": "node postgres-smoke-test.js && node postgres-api-smoke-test.js && node postgres-outbox-smoke-test.js && node scripts/postgres-issue7-audit-lock-regression.mjs && node scripts/postgres-issue7-outbox-lock-regression.mjs",
     "perf:production": "node scripts/measure-production-performance.mjs",
     "test": "node smoke-test.js && node staging-smoke-test.js"
   },

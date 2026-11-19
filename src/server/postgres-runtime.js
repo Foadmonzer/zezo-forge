@@ -163,10 +163,11 @@ export async function withPostgresTransaction(work) {
       // Serialize the compatibility-state transaction across local and serverless instances.
       await client.query('SELECT pg_advisory_xact_lock($1, $2)', [741902, 1]);
       // Coordinate whole-store snapshot upserts with row-scoped financial writes.
-      // Scoped requests take compatible ROW EXCLUSIVE locks, allowing different
-      // employees to progress concurrently while preventing stale snapshot writes.
+      // audit_entries is append-only: legacy snapshots only upsert existing event
+      // ids and never delete events, so taking a table-wide lock there would block
+      // operations whose writes do not touch the other compatibility-locked tables.
       await client.query(`LOCK TABLE app_settings, user_accounts, project_requests, commissions,
-        withdrawal_requests, finance_ledger_entries, system_notifications, audit_entries, outbox_messages
+        withdrawal_requests, finance_ledger_entries, system_notifications, outbox_messages
         IN SHARE ROW EXCLUSIVE MODE`);
       return await transactionStorage.run(client, async () => {
         const result = await work(client);
