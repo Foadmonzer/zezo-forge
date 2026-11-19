@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { withPostgresScopedTransaction } from './postgres-runtime.js';
+import { enqueuePostgresTransactionalMail, mailWithFooter } from './transactional-email.js';
 
 const object = value => value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 const digest = value => createHash('sha256').update(String(value)).digest('hex');
@@ -92,15 +93,6 @@ async function insertAudit(client, { auditId, customer, action, targetId, detail
     VALUES ($1, $2, $3, $4, $5::jsonb, $6)
     ON CONFLICT (id) DO NOTHING
   `, [auditId, customer?.id || null, action, targetId, JSON.stringify({ actor: customer?.username || 'system', role: customer?.role || 'system', detail: String(detail || '').slice(0, 180) }), at]);
-}
-
-async function insertMail(client, { id, recipient, recipientType = 'direct', kind, subject, text, at }) {
-  const data = { id, to: recipient || '', recipientType, kind, subject, text: String(text || '').slice(0, 6000), state: 'pending', attempts: 0, lastError: '', createdAt: at, updatedAt: at };
-  await client.query(`
-    INSERT INTO outbox_messages (id, recipient, state, attempts, data, "createdAt", "updatedAt")
-    VALUES ($1, $2, 'pending', 0, $3::jsonb, $4, $4)
-    ON CONFLICT (id) DO NOTHING
-  `, [id, recipient || '', JSON.stringify(data), at]);
 }
 
 /**
@@ -342,17 +334,17 @@ export async function createPostgresProjectRequest({
       tab: 'referral', targetId: requestId, targetKind: 'lead', at });
 
     const trackingUrl = `${siteBase}/?track=${encodeURIComponent(trackingToken)}`;
-    await insertMail(client, {
-      id: stableId('mail', `${requestId}:new_lead`), recipient: '', recipientType: 'admin', kind: 'new_lead',
-      subject: `طلب جديد من ${customer.name}`,
-      text: `طلب مشروع جديد في ZEZO\nالاسم: ${customer.name}\nالبريد: ${customer.email}\nواتساب: ${payload.phone}\nالخدمة: ${lead.service} / ${lead.category}${lead.templateName ? `\nالقالب: ${lead.templateName} (${lead.templateAction})` : ''}\nالميزانية: ${lead.budget || 'غير محددة'}\nالإحالة: ${lead.referralCode || 'بدون إحالة'}\nتفاصيل الطلب:\n${lead.details}\nإدارة الطلب: ${siteBase}/`, at
+    await enqueuePostgresTransactionalMail(client, {
+      eventKey: `${requestId}:new_lead`, recipientType: 'admin', kind: 'new_lead',
+      subject: 'طلب مشروع جديد لدى ZEZO / A new ZEZO project request',
+      text: mailWithFooter(`وصل طلب مشروع جديد. افتح مساحة الفريق لمراجعته.\nA new project request arrived. Sign in to the team workspace to review it.\n${siteBase}/team`, 'both'), at
     });
-    await insertMail(client, {
-      id: stableId('mail', `${requestId}:customer_thanks`), recipient: customer.email, kind: 'customer_thanks',
+    await enqueuePostgresTransactionalMail(client, {
+      eventKey: `${requestId}:customer_thanks`, recipient: customer.email, kind: 'customer_thanks',
       subject: payload.language === 'en' ? 'Thank you for your ZEZO enquiry' : 'شكراً لطلبك من ZEZO',
-      text: payload.language === 'en'
+      text: mailWithFooter(payload.language === 'en'
         ? `Hello ${customer.name},\n\nThank you for reaching out to ZEZO. We received your project enquiry and will review it.\n\nTrack your request securely here: ${trackingUrl}\n\nZEZO Digital Solutions & AI`
-        : `مرحباً ${customer.name}،\n\nشكراً لتواصلك مع ZEZO. وصلنا طلب مشروعك وسنراجعه.\n\nتابع حالة طلبك عبر هذا الرابط الخاص: ${trackingUrl}\n\nZEZO للحلول الرقمية والذكاء الاصطناعي`, at
+        : `مرحباً ${customer.name}،\n\nشكراً لتواصلك مع ZEZO. وصلنا طلب مشروعك وسنراجعه.\n\nتابع حالة طلبك عبر هذا الرابط الخاص: ${trackingUrl}\n\nZEZO للحلول الرقمية والذكاء الاصطناعي`, payload.language), at
     });
 
     return { kind: 'created', id: requestId, trackingToken, attributed: Boolean(referral), duplicate: isDuplicate, email: customer.email };

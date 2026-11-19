@@ -40,6 +40,31 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+async function withSyntheticMailSettings(work, recipient = '') {
+  const database = new URL(process.env.DATABASE_URL);
+  assert(['127.0.0.1', 'localhost', 'postgres'].includes(database.hostname) && /(?:ci|test)/.test(database.pathname),
+    'Mail-specific API checks require an isolated local or CI PostgreSQL database.');
+  const settings = {
+    ZEZO_ENABLE_EMAIL_DELIVERY: 'true', RESEND_API_KEY: 'synthetic-not-a-provider-key',
+    ZEZO_FROM_EMAIL: 'ZEZO <noreply@example.test>', ZEZO_EMAIL_TEST_RECIPIENT: recipient,
+    ZEZO_OUTBOX_WORKER_ENABLED: 'true', ZEZO_EMAIL_QUEUE_ACTIVE_SINCE: new Date().toISOString(),
+    ZEZO_NOTIFICATION_EMAIL: 'zezo-smoke-admin@example.test'
+  };
+  const previousSettings = Object.fromEntries(Object.keys(settings).map(key => [key, process.env[key]]));
+  const previousFetch = globalThis.fetch;
+  Object.assign(process.env, settings);
+  globalThis.fetch = async () => { throw new Error('External provider calls are disabled for this mail queue test.'); };
+  try {
+    return await work();
+  } finally {
+    globalThis.fetch = previousFetch;
+    for (const [key, value] of Object.entries(previousSettings)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 async function request(method, path, { body, rawBody, contentType = 'application/json', cookie = '' } = {}) {
   const startedAt = performance.now();
   const requestBytes = rawBody !== undefined ? Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(rawBody) : body === undefined ? null : Buffer.from(JSON.stringify(body));
@@ -261,7 +286,7 @@ try {
   `, [referralLinkId, referralUserId, referralCode, JSON.stringify({ id: referralLinkId, userId: referralUserId, code: referralCode, month: '2026-11', kind: 'monthly' })]);
   syntheticIds.push(referralUserId);
 
-  const customerRegistrationBody = { name: 'Synthetic Test Customer', email: customerEmail, password: customerPassword, confirmPassword: customerPassword, student: false, role: 'admin', referralCode: 'FORGED-BODY-CODE', referralVisitorId: `forgedvisitor${testSuffix}` };
+  const customerRegistrationBody = { name: 'Synthetic Test Customer', email: customerEmail, password: customerPassword, confirmPassword: customerPassword, student: false, lang: 'en', role: 'admin', referralCode: 'FORGED-BODY-CODE', referralVisitorId: `forgedvisitor${testSuffix}` };
   const capturedReferral = await request('GET', `/api/referral-attribution?ref=${encodeURIComponent(referralCode)}`);
   assert(capturedReferral.status === 200 && capturedReferral.data.attributed === true && capturedReferral.data.code === referralCode,
     'Server did not capture a valid first-touch referral in PostgreSQL.');
@@ -338,6 +363,31 @@ try {
   const customerDashboard = await request('GET', '/api/dashboard', { cookie: customerCookie });
   assert(customerDashboard.status === 200 && customerDashboard.data.user?.role === 'client', 'Customer session did not persist between requests.');
   results.push('customer registration bypasses legacy global lock, preserves referral, prevents duplicates, and atomically saves account/audit/session/verification state');
+
+  if (process.env.ZEZO_STAGING !== 'true') await withSyntheticMailSettings(async () => {
+    const verificationEmail = `pg_verification_${testSuffix}@example.test`;
+    const unlistedEmail = `pg_mail_unlisted_${testSuffix}@example.test`;
+    const verificationSignup = await request('POST', '/api/client/register', { body: { ...customerRegistrationBody, email: verificationEmail } });
+    assert(verificationSignup.status === 201 && verificationSignup.data.verificationRequired && verificationSignup.data.emailQueued,
+      'Allowlisted client did not receive the verification flow.');
+    const pendingUser = await client.query('SELECT id, active FROM user_accounts WHERE email = $1', [verificationEmail]);
+    assert(pendingUser.rows[0]?.id && !pendingUser.rows[0].active, 'New customer was active before verifying their mailbox.');
+    syntheticIds.push(pendingUser.rows[0].id);
+    const pendingMail = await client.query("SELECT data FROM outbox_messages WHERE recipient = $1 AND data->>'kind' = 'client_email_verification'", [verificationEmail]);
+    const body = pendingMail.rows[0]?.data;
+    assert(pendingMail.rowCount === 1 && body.subject === 'Confirm your ZEZO email address' && /automated message/.test(body.text) && Date.parse(body.expiresAt) > Date.now(), 'Localized verification message was not persisted safely.');
+    const verifyMatch = /verifyEmail=([A-Za-z0-9_-]+)/.exec(body.text);
+    assert(verifyMatch, 'The queued verification message lacks a token.');
+    const verifyPayload = { body: { token: verifyMatch[1] } };
+    assert((await request('POST', '/api/auth/verify-email', verifyPayload)).status === 200, 'Customer could not verify their mailbox.');
+    assert((await request('POST', '/api/auth/verify-email', verifyPayload)).status === 400, 'Mailbox verification link was reusable.');
+    const unlistedSignup = await request('POST', '/api/client/register', { body: { ...customerRegistrationBody, email: unlistedEmail } });
+    assert(unlistedSignup.status === 201 && !unlistedSignup.data.verificationRequired && unlistedSignup.data.user?.active, 'Mail pilot blocked normal client signup.');
+    syntheticIds.push(unlistedSignup.data.user.id);
+    const unlistedMail = await client.query("SELECT count(*)::int AS count FROM outbox_messages WHERE recipient = $1 AND data->>'kind' = 'client_email_verification'", [unlistedEmail]);
+    assert(unlistedMail.rows[0].count === 0, 'Mail pilot queued a verification for a non-allowlisted client.');
+    results.push('mail pilot limits verification to its approved mailbox and rejects verification-token replay');
+  }, `pg_verification_${testSuffix}@example.test`);
 
   await request('POST', '/api/auth/logout', { cookie: customerCookie });
   customerCookie = '';
@@ -588,7 +638,7 @@ try {
   const marketerReferralCookie = referralCookieFrom(marketerReferralCapture);
   const referredClientEmail = `pg_attributed_client_${testSuffix}@example.test`;
   const referredClient = await request('POST', '/api/client/register', {
-    body: { name: 'Synthetic Attributed Customer', email: referredClientEmail, password: customerPassword, confirmPassword: customerPassword, role: 'admin', referralCode: 'FORGED-OVERRIDE' },
+    body: { name: 'Synthetic Attributed Customer', email: referredClientEmail, password: customerPassword, confirmPassword: customerPassword, lang: 'en', role: 'admin', referralCode: 'FORGED-OVERRIDE' },
     cookie: marketerReferralCookie
   });
   assert(referredClient.status === 201 && referredClient.data.user?.role === 'client', `Referred client registration failed with ${referredClient.status}.`);
@@ -808,9 +858,20 @@ try {
   assert(managementDashboardsWhileLocked.values[1].data.conversations?.some(row => row.id === syntheticConversationId), 'Order Manager lost the assigned conversation in its scoped dashboard.');
   assert(!managementDashboardsWhileLocked.values[1].data.users && !managementDashboardsWhileLocked.values[1].data.financeSummary, 'Order Manager dashboard exposed owner-only data.');
   results.push('Owner and management dashboards bypass the global advisory lock; Order Manager dashboard remains scoped');
-  const ownerReply = await request('POST', `/api/conversations/${syntheticConversationId}/messages`, {
-    body: { message: 'Synthetic ZEZO reply saved for the database integration test.' }, cookie: ownerCookie
-  });
+  const staffReplyEndpoint = `/api/conversations/${syntheticConversationId}/messages`;
+  const staffReplyBody = { message: 'Synthetic ZEZO reply saved for the database integration test.', idempotencyKey: randomUUID().replaceAll('-', '') };
+  let ownerReply;
+  if (process.env.ZEZO_STAGING !== 'true') await withSyntheticMailSettings(async () => {
+    ownerReply = await request('POST', staffReplyEndpoint, { body: staffReplyBody, cookie: ownerCookie });
+    const staffReplyRetry = await request('POST', staffReplyEndpoint, { body: staffReplyBody, cookie: ownerCookie });
+    assert(staffReplyRetry.status === 200, 'A matching retry did not preserve the original staff reply.');
+    const customerMail = await client.query("SELECT data FROM outbox_messages WHERE recipient = $1 AND data->>'kind' = 'customer_conversation_reply'", [referredClientEmail]);
+    assert(customerMail.rowCount === 1, `Staff reply should enqueue exactly one message after a retry; found ${customerMail.rowCount}.`);
+    assert(customerMail.rows[0].data.subject === 'ZEZO replied to your conversation', 'Staff reply did not honor the customer account language.');
+    assert(!customerMail.rows[0].data.text.includes(staffReplyBody.message), 'Staff reply email included private conversation content.');
+    results.push('staff replies enqueue one localized customer email without including private conversation text');
+  }, referredClientEmail);
+  else ownerReply = await request('POST', staffReplyEndpoint, { body: staffReplyBody, cookie: ownerCookie });
   assert(ownerReply.status === 201, `Owner conversation reply failed with ${ownerReply.status}.`);
   const attachmentBytes = Buffer.from('%PDF-1.4 synthetic test attachment');
   const uploadedAttachment = await request('POST', `/api/conversations/${syntheticConversationId}/messages`, {
@@ -913,6 +974,14 @@ try {
     'Project request retries queued behind the legacy global lock or were not idempotent.');
   const idempotentRequestRows = await client.query('SELECT count(*)::int AS count FROM project_requests WHERE id = $1', [syntheticLeadId]);
   assert(Number(idempotentRequestRows.rows[0].count) === 1, 'Repeated concurrent project-request submissions created duplicate rows.');
+  const projectMailIds = ['new_lead', 'customer_thanks'].map(kind => `mail_${createHash('sha256').update(`${syntheticLeadId}:${kind}`).digest('hex').slice(0, 40)}`);
+  const projectMailRows = await client.query('SELECT recipient, data FROM outbox_messages WHERE id = ANY($1)', [projectMailIds]);
+  const adminMail = projectMailRows.rows.find(row => row.data.kind === 'new_lead');
+  const receiptMail = projectMailRows.rows.find(row => row.data.kind === 'customer_thanks');
+  assert(projectMailRows.rowCount === 2 && adminMail?.data.recipientType === 'admin' && receiptMail?.recipient === referredClientEmail,
+    'Project retries did not preserve one company notification and one customer receipt.');
+  assert(!adminMail.data.text.includes(projectRequestBody.details) && !adminMail.data.text.includes(referredClientEmail), 'Company order email included a private request payload.');
+  assert(receiptMail.data.subject === 'Thank you for your ZEZO enquiry' && receiptMail.data.text.includes('automated message'), 'Project confirmation email was not localized.');
   const retryTimes = orderRetriesWhileLocked.values.map(row => row.durationMs).sort((a, b) => a - b);
   const retryPercentile = percentile => retryTimes[Math.min(retryTimes.length - 1, Math.ceil(retryTimes.length * percentile) - 1)];
   console.log(`[PROJECT_REQUEST_TIMING] ${JSON.stringify({ createMs: Number(officialOrder.durationMs.toFixed(1)), duplicateRetries: retryTimes.length, p50Ms: Number(retryPercentile(0.5).toFixed(1)), p95Ms: Number(retryPercentile(0.95).toFixed(1)), errors: 0, advisoryLockHeld: true })}`);

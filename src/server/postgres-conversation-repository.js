@@ -1,6 +1,7 @@
 import { withPostgresScopedTransaction } from './postgres-runtime.js';
 import { loadConversationViews } from './core-read-repository.js';
 import { createHash, randomUUID } from 'node:crypto';
+import { customerReplyEmail, enqueuePostgresTransactionalMail, mailWithFooter } from './transactional-email.js';
 
 const object = value => value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 
@@ -49,6 +50,21 @@ async function insertNotification(client, { id, userId, eventKey, copy, tab, tar
         SELECT 1 FROM system_notifications n WHERE n."userId" = u.id AND n.data ->> 'eventKey' = $6
       )
   `, [id, userId, copy.type || 'inquiry', JSON.stringify(data), at, eventKey]);
+}
+
+async function enqueueCustomerReply(client, { clientId, eventKey, at, siteBase, quote = false }) {
+  if (!siteBase || !clientId) return;
+  const { rows: [account] } = await client.query(`
+    SELECT email, data->>'language' AS language
+    FROM user_accounts
+    WHERE id = $1 AND role = 'client' AND active = TRUE
+      AND COALESCE(data->>'accountDisabledAt', '') IN ('', 'false', '0')
+  `, [clientId]);
+  if (!account?.email) return;
+  await enqueuePostgresTransactionalMail(client, {
+    eventKey, at, recipient: account.email, kind: quote ? 'customer_quote_ready' : 'customer_conversation_reply',
+    ...customerReplyEmail({ siteBase, language: account.language, quote })
+  });
 }
 
 async function notifyConversationTeam(client, { conversation, actorId = '', eventKey, copy, at, authorizeRecipient }) {
@@ -157,7 +173,7 @@ export async function createPostgresConversation({ conversation, message, attach
   });
 }
 
-export async function createPostgresConversationMessage({ conversationId, actor, guestHash = '', text, attachmentFile, idempotencyHash, messageId, auditId, at, permissionScope = '', authorize, authorizeRecipient }) {
+export async function createPostgresConversationMessage({ conversationId, actor, guestHash = '', text, attachmentFile, idempotencyHash, messageId, auditId, at, permissionScope = '', authorize, authorizeRecipient, emailSiteBase }) {
   return withPostgresScopedTransaction(async client => {
     const conversation = await selectConversationForUpdate(client, conversationId);
     if (!conversation) return { kind: 'missing' };
@@ -190,6 +206,7 @@ export async function createPostgresConversationMessage({ conversationId, actor,
     };
     if (senderType === 'staff' && conversation.clientId) {
       await insertNotification(client, { id: stableId('ntf', `${conversation.clientId}:${eventKey}`), userId: conversation.clientId, eventKey, copy, tab: 'conversations', targetId: conversationId, at });
+      await enqueueCustomerReply(client, { clientId: conversation.clientId, eventKey, at, siteBase: emailSiteBase });
     } else {
       await notifyConversationTeam(client, { conversation, actorId: actor?.id || '', eventKey, copy, at, authorizeRecipient });
     }
@@ -208,7 +225,7 @@ async function loadResponse(client, actor, conversationId, guestHash = '', permi
   return rows[0] || null;
 }
 
-export async function createPostgresQuote({ conversationId, actor, quote, message, auditId, messageId, notificationId, at, permissionScope, authorize }) {
+export async function createPostgresQuote({ conversationId, actor, quote, message, auditId, messageId, notificationId, at, permissionScope, authorize, emailSiteBase }) {
   return withPostgresScopedTransaction(async client => {
     const conversation = await selectConversationForUpdate(client, conversationId);
     if (!conversation) return { kind: 'missing' };
@@ -234,12 +251,13 @@ export async function createPostgresQuote({ conversationId, actor, quote, messag
       id: notificationId, userId: conversation.clientId, eventKey, targetId: conversation.id, at, tab: 'conversations',
       copy: { type: 'inquiry', titleAr: 'رد فريق ZEZO على محادثتك', titleEn: 'ZEZO replied to your conversation', descriptionAr: 'افتح المحادثة لمتابعة عرض السعر.', descriptionEn: 'Open the conversation to review the quote.' }
     });
+    await enqueueCustomerReply(client, { clientId: conversation.clientId, eventKey: `quote:${quote.id}:sent`, at, siteBase: emailSiteBase, quote: true });
     const view = await loadResponse(client, actor, conversation.id, '', permissionScope);
     return { kind: 'ok', conversation: view };
   });
 }
 
-export async function acceptPostgresQuote({ conversationId, actor, guestHash = '', quoteMessage, auditId, messageId, notificationIds = [], at, permissionScope = '', authorize }) {
+export async function acceptPostgresQuote({ conversationId, actor, guestHash = '', quoteMessage, auditId, messageId, notificationIds = [], at, permissionScope = '', authorize, adminEmailSiteBase }) {
   return withPostgresScopedTransaction(async client => {
     const conversation = await selectConversationForUpdate(client, conversationId);
     if (!conversation) return { kind: 'missing' };
@@ -287,6 +305,11 @@ export async function acceptPostgresQuote({ conversationId, actor, guestHash = '
       }
       if (conversation.assignedUserId && conversation.assignedUserId !== actor.id) await insertNotification(client, {
         id: notificationIds[index] || `ntf_${randomUUID()}`, userId: conversation.assignedUserId, eventKey, targetId: conversation.id, at, tab: 'conversations', copy
+      });
+      if (adminEmailSiteBase) await enqueuePostgresTransactionalMail(client, {
+        eventKey: `quote:${quoteRow.id}:accepted`, at, recipientType: 'admin', kind: 'client_quote_accepted',
+        subject: 'تم قبول عرض سعر في ZEZO / A ZEZO quote was accepted',
+        text: mailWithFooter(`قبِل عميل عرض سعر. افتح مساحة الفريق لمراجعة المحادثة.\nA customer accepted a quote. Open the team workspace to review the conversation.\n${adminEmailSiteBase}/team`, 'both')
       });
     } else if (conversation.clientId) {
       await insertNotification(client, {
