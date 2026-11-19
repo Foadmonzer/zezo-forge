@@ -21,7 +21,7 @@ import { ResendMailError, sendWithResend } from './src/server/resend-mail.js';
 import { createPostgresWithdrawalRequest } from './src/server/postgres-withdrawal-repository.js';
 import { createPostgresEmployeeInvitation, revokePostgresEmployeeInvitation, reissuePostgresEmployeeInvitation } from './src/server/postgres-invitation-repository.js';
 import { activatePostgresEmployeeInvitation } from './src/server/postgres-activation-repository.js';
-import { createPostgresClientRegistration } from './src/server/postgres-client-registration-repository.js';
+import { createPostgresClientRegistration, verifyPostgresClientEmail } from './src/server/postgres-client-registration-repository.js';
 import { capturePostgresReferralAttribution, deletePostgresReferralAnalyticsByVisitor, getPostgresReferralAttribution, recordPostgresReferralEvent } from './src/server/postgres-referral-repository.js';
 import { createPostgresProjectRequest } from './src/server/postgres-project-request-repository.js';
 import { updatePostgresEmployeePermissions } from './src/server/postgres-permission-repository.js';
@@ -1039,6 +1039,28 @@ async function handlePostgresCoreRead(req, res, path) {
   if (req.method === 'GET' && path === '/api/auth/session') {
     const auth = await directPostgresSessionUser(req);
     json(res, 200, auth ? { authenticated: true, user: publicUser(auth.user) } : { authenticated: false }, security);
+    return true;
+  }
+
+  if (req.method === 'POST' && path === '/api/auth/verify-email') {
+    const body = await jsonBody(req);
+    const verificationToken = typeof body.token === 'string' ? body.token : '';
+    const ip = req.socket?.remoteAddress || 'unknown';
+    if (!await consumeRateLimitBucket('client-email-verification', ip, 16, 15 * 60_000)) {
+      json(res, 429, { error: 'محاولات تأكيد كثيرة. حاول لاحقاً / Too many verification attempts. Try again later.' }, security);
+      return true;
+    }
+    const at = now();
+    const sessionId = token();
+    const user = /^[a-zA-Z0-9_-]{43}$/.test(verificationToken) ? await verifyPostgresClientEmail({
+      verificationHash: hash(verificationToken), sessionHash: sessionKey(sessionId),
+      sessionExpiresAt: new Date(Date.now() + SESSION_TTL), auditId: id('evt'), at
+    }) : null;
+    if (!user) {
+      json(res, 400, { error: 'رابط تأكيد البريد غير صالح أو منتهي / Verification link is invalid or expired' }, security);
+      return true;
+    }
+    json(res, 200, { user: publicUser(user) }, { ...security, 'Set-Cookie': cookie('zezo_session', sessionId, SESSION_TTL / 1000, req) });
     return true;
   }
 

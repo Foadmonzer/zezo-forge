@@ -36,7 +36,7 @@ export async function claimNextOutboxMessage({ allowAdmin = false, messageIds = 
     await client.query(`SET LOCAL statement_timeout = '4000ms'`);
     // Take the table lock before acquiring any individual rows. This coordinates
     // with the older whole-store writer without serializing independent workers.
-    await client.query(`LOCK TABLE outbox_messages IN ROW EXCLUSIVE MODE`);
+    await client.query(`LOCK TABLE outbox_messages IN ROW EXCLUSIVE MODE NOWAIT`);
     await client.query(`
       UPDATE outbox_messages
       SET state = CASE WHEN state = 'sending' OR data ->> 'deliveryUncertain' = 'true' THEN 'uncertain' ELSE 'failed' END,
@@ -99,6 +99,7 @@ export async function completeOutboxMessage(id, leaseToken, { state, providerId 
   if (!['sent', 'retry', 'failed', 'uncertain'].includes(state)) throw new Error('Invalid outbox completion state.');
   return withPostgresScopedTransaction(async client => {
     await client.query(`SET LOCAL statement_timeout = '4000ms'`);
+    await client.query(`LOCK TABLE outbox_messages IN ROW EXCLUSIVE MODE NOWAIT`);
     const result = await client.query(`
       UPDATE outbox_messages
       SET state = $3,

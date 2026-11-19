@@ -31,7 +31,13 @@ export async function processPostgresOutbox({ env = process.env, maxMessages = 2
   const deadline = performance.now() + budgetMs;
 
   while (counts.processed < maxMessages && performance.now() < deadline) {
-    const claimed = await claimNextOutboxMessage({ ...settings, allowedKinds });
+    let claimed;
+    try {
+      claimed = await claimNextOutboxMessage({ ...settings, allowedKinds });
+    } catch (error) {
+      if (error?.code === '55P03') return { ...counts, deferred: 'claim' };
+      throw error;
+    }
     if (!claimed) break;
     const payload = claimed.data || {};
     const recipient = payload.recipientType === 'admin'
@@ -60,7 +66,14 @@ export async function processPostgresOutbox({ env = process.env, maxMessages = 2
       }
     }
 
-    const completed = await completeOutboxMessage(claimed.id, claimed.leaseToken, result);
+    let completed;
+    try {
+      completed = await completeOutboxMessage(claimed.id, claimed.leaseToken, result);
+    } catch (error) {
+      // The committed lease survives until the next worker retries with the same provider key.
+      if (error?.code === '55P03') return { ...counts, deferred: 'completion' };
+      throw error;
+    }
     counts.processed += 1;
     if (completed) counts[result.state] += 1;
     if (pauseBatch) break;
