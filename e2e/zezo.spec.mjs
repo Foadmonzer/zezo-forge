@@ -518,6 +518,15 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   // Owner: assign developer and record a synthetic, verified manual payment in the UI.
   const ownerPage = await browser.newPage({ viewport: { width: 1366, height: 900 } });
   await loginThroughUI(ownerPage, { username: ownerUsername, password: ownerPassword, accountType: 'management', mfaCode: totp(ownerMfa.secret) });
+  await expect(ownerPage.locator('#dashboardTabs .dashboard-nav-group')).toHaveCount(5);
+  await expect(ownerPage.locator('#dashboardTabs')).toContainText('العملاء والطلبات');
+  await expect(ownerPage.locator('#dashboardTabs')).toContainText('الفريق والإحالات');
+  const ownerDashboardWidth = await ownerPage.locator('.dashboard').evaluate(element => element.getBoundingClientRect().width);
+  expect(ownerDashboardWidth).toBeGreaterThan(1300);
+  await ownerPage.setViewportSize({ width: 390, height: 844 });
+  await expect(ownerPage.locator('[data-dash-tab="overview"]')).toBeVisible();
+  expect(await ownerPage.locator('.dashboard').evaluate(element => element.getBoundingClientRect().width)).toBeLessThanOrEqual(390);
+  await ownerPage.setViewportSize({ width: 1366, height: 900 });
   await ownerPage.locator('[data-dash-tab="ranks"]').click();
   await expect(ownerPage.locator('#dashboardContent')).toContainText('20%');
   await expect(ownerPage.locator('#dashboardContent')).toContainText('35%');
@@ -533,6 +542,10 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await inviteForm.locator('[name="username"]').fill(inviteUsername);
   await inviteForm.locator('[name="email"]').fill(`${inviteUsername}@example.test`);
   await inviteForm.locator('[name="role"]').selectOption('marketer');
+  // The owner workspace fills mobile and desktop viewports, so an outside
+  // backdrop click may not exist. If there is an outside target, verify it does
+  // not discard the unsaved form; otherwise verify the full-screen layout.
+  await ownerPage.setViewportSize({ width: 390, height: 844 });
   let dashboardReadsAfterUnsavedInput = 0;
   ownerPage.on('request', request => {
     if (new URL(request.url()).pathname === '/api/dashboard' && request.method() === 'GET') dashboardReadsAfterUnsavedInput++;
@@ -548,12 +561,23 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
     ];
     return candidates.find(([x, y]) => x >= 0 && y >= 0 && x < innerWidth && y < innerHeight && !(x >= panel.left && x <= panel.right && y >= panel.top && y <= panel.bottom)) || null;
   });
-  expect(outsideDashboardPoint, 'an outside-dashboard click target should exist').not.toBeNull();
-  await ownerPage.mouse.click(outsideDashboardPoint[0], outsideDashboardPoint[1]);
+  if (outsideDashboardPoint) {
+    await ownerPage.mouse.click(outsideDashboardPoint[0], outsideDashboardPoint[1]);
+  } else {
+    const bounds = await ownerPage.locator('.dashboard').evaluate(element => {
+      const rect = element.getBoundingClientRect();
+      return { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom, width: innerWidth, height: innerHeight };
+    });
+    expect(bounds.left).toBe(0);
+    expect(bounds.top).toBe(0);
+    expect(bounds.right).toBe(bounds.width);
+    expect(bounds.bottom).toBe(bounds.height);
+  }
   await expect(ownerPage.locator('#dashboardBackdrop.open')).toBeVisible();
   await expect(inviteForm.locator('[name="name"]')).toHaveValue(inviteName);
   await expect(inviteForm.locator('[name="username"]')).toHaveValue(inviteUsername);
   expect(dashboardReadsAfterUnsavedInput).toBe(0);
+  await ownerPage.setViewportSize({ width: 1366, height: 900 });
   let uiInviteRequests = 0;
   ownerPage.on('request', request => { if (new URL(request.url()).pathname === '/api/admin/invite' && request.method() === 'POST') uiInviteRequests++; });
   await ownerPage.route('**/api/admin/invite', async route => {

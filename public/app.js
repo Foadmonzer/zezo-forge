@@ -642,11 +642,29 @@ function tabDefs(role,permissions={}){
   if(role==='developer')return [['development',tx('مشاريعي','My projects'),'⌘'],notifications,['referral',tx('مساحتي وعمولاتي','My space & commissions'),'↗'],profile];
   return [['referral',tx('رابط الإحالة والطلبات','Referral link & leads'),'↗'],notifications,profile];
 }
+function dashboardNavMarkup(role,permissions,activeTab){
+  const items=tabDefs(role,permissions);
+  const button=([id,label,icon])=>`<button class="dash-tab ${id===activeTab?'active':''}" type="button" data-dash-tab="${id}" ${id===activeTab?'aria-current="page"':''}><span>${icon}</span>${esc(label)}</button>`;
+  if(role!=='admin')return items.map(button).join('');
+  const groups=[
+    [tx('الرئيسية','Home'),['overview','notifications']],
+    [tx('العملاء والطلبات','Clients & orders'),['requests','crm','conversations']],
+    [tx('الفريق والإحالات','Team & referrals'),['team','marketing','referrals','ranks']],
+    [tx('المالية','Finance'),['finance','withdrawals']],
+    [tx('النظام','System'),['permissions','pricing','audit','profile']]
+  ];
+  const available=new Map(items.map(item=>[item[0],item]));
+  return groups.map(([label,ids])=>{
+    const buttons=ids.map(id=>available.get(id)).filter(Boolean).map(button).join('');
+    return buttons?`<div class="dashboard-nav-group"><span>${esc(label)}</span><div>${buttons}</div></div>`:'';
+  }).join('');
+}
 function renderDashboard(data,tab){
   state.dashboard=data;state.dashboardTab=tab;
   state.notificationAuthenticated=true;renderNotificationPreview();refreshNotificationPreview();
   $('#dashboardUser').textContent=data.user.name;$('#dashboardRole').textContent=roleNames[data.role]?.[state.lang]||data.role;
-  $('#dashboardTabs').innerHTML=tabDefs(data.role,data.currentPermissions||{}).map(([id,label,icon])=>`<button class="dash-tab ${id===tab?'active':''}" type="button" data-dash-tab="${id}"><span>${icon}</span>${esc(label)}</button>`).join('');
+  $('#dashboardTabs').classList.toggle('dashboard-tabs-owner',data.role==='admin');
+  $('#dashboardTabs').innerHTML=dashboardNavMarkup(data.role,data.currentPermissions||{},tab);
   const content=$('#dashboardContent');
   if(tab==='notifications'){content.innerHTML=notificationCenterMarkup();loadNotificationCenter();return}
   if(data.role==='admin'&&tab==='profile'){content.innerHTML=profilePage(data);return}
