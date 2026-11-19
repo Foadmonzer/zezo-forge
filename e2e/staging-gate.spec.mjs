@@ -52,7 +52,9 @@ test('staging gate protects pages, API, and static assets until a secure session
   expect(browserApiResponse.status(), 'the browser context should send the issued staging cookie on same-origin requests').toBe(200);
   const authorizedApi = await request.get('/api/public', { headers: { cookie: `zezo_staging_access=${gateCookie.value}` } });
   expect(authorizedApi.status(), 'the server should accept the session cookie minted by the staging login').toBe(200);
-  expect(await page.evaluate(() => document.cookie)).not.toContain('zezo_staging_access');
+  // The cookie jar exposes the browser's HttpOnly flag above. Avoid reading
+  // document.cookie here: Next dev may refresh the document between this API
+  // request and page.evaluate, destroying that execution context.
   await page.goto('/');
   await expect(page.locator('body')).not.toContainText('دخول بيئة الاختبار');
 
