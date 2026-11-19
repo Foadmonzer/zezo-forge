@@ -3,13 +3,21 @@
 This document prepares deployment without creating a cloud service or changing DNS.
 The application has not been approved for production traffic.
 
-## Runtime shape
+## Container runtime shape
 
 - Run the Next.js app as a persistent Node.js web service with `pnpm start`.
 - Run the durable email Outbox poller as a separate worker with `pnpm worker:mail`.
 - Both services must point to the same production PostgreSQL database through a secrets manager. Do not use JSON file storage, a server-memory session store, or local uploads in a multi-instance deployment.
 - Run `pnpm db:migrate:deploy` as a one-off pre-deploy step, then `pnpm typecheck`, `pnpm build`, and the approved smoke checks.
 - Leave `ZEZO_ENABLE_EMAIL_DELIVERY=false` until the sender domain, provider, bounce handling, and delivery test are approved. Do not configure WhatsApp or real payment credentials in Staging.
+
+## Netlify transactional email
+
+- The `email-outbox` Scheduled Function checks for new transactional mail once a minute on the published deploy and is not callable from a public URL. The web application commits Outbox rows first. The scheduled invocation claims at most two rows and waits for Resend acceptance, which the worker records with the provider message ID.
+- Set `RESEND_API_KEY`, `ZEZO_FROM_EMAIL`, `ZEZO_NOTIFICATION_EMAIL`, `ZEZO_ENABLE_EMAIL_DELIVERY=true`, `ZEZO_OUTBOX_WORKER_ENABLED=true`, and `ZEZO_EMAIL_QUEUE_ACTIVE_SINCE` in Production's Functions scope. Set the cutoff to the rollout time in UTC ISO 8601. Changing it to an earlier time can send historical emails. Keep real delivery off in Preview and Staging. Never commit credentials.
+- Use `ZEZO_EMAIL_TEST_RECIPIENT` to restrict a controlled rollout to one exact address, including any admin mail. Use a fresh cutoff when releasing the restriction. The scheduled worker sends only the approved account and project email kinds. Financial and historical Outbox rows are outside its scope. The synchronous reset handler owns password-recovery tokens.
+- Monitor the function's `accepted`, `retry`, `failed`, and `uncertain` counts. Check Resend's delivery activity for actual delivery and bounces. An uncertain result requires verification in Resend before considering a resend. Rows outside the provider's 24-hour idempotency window are never automatically retried.
+- Scheduled executions draw from the hosting plan's Functions compute allowance. Monitor Netlify usage after activation. Disable `ZEZO_OUTBOX_WORKER_ENABLED` and redeploy if queue delivery must be paused.
 
 ## Container deployment files
 

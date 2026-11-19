@@ -1,19 +1,34 @@
 import nodemailer from 'nodemailer';
+import { resendConfigured, sendWithResend } from './resend-mail.js';
 
 export const PASSWORD_RECOVERY_SENDER = 'zezo.info.2026@gmail.com';
+const RESEND_TIMEOUT_MS = 2200;
+
+function passwordRecoveryProvider(env) {
+  return String(env.ZEZO_PASSWORD_RECOVERY_PROVIDER || 'gmail').trim().toLowerCase();
+}
+
+/** Allow the bounded Resend call to settle before either public response goes out. */
+export function passwordRecoveryMinimumResponseMs(env = process.env) {
+  return passwordRecoveryProvider(env) === 'resend' ? RESEND_TIMEOUT_MS + 600 : 0;
+}
 
 const escapeHtml = value => String(value).replace(/[&<>"']/g, char => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
 }[char]));
 
 export function passwordRecoveryEmailReady(env = process.env) {
+  if (!passwordRecoveryOrigin(env)) return false;
+  const provider = passwordRecoveryProvider(env);
+  if (provider === 'resend') {
+    return env.ZEZO_ENABLE_PASSWORD_RECOVERY_EMAIL === 'true' && resendConfigured(env);
+  }
+  if (provider !== 'gmail') return false;
   const username = String(env.ZEZO_GMAIL_SMTP_USER || '').trim().toLowerCase();
   const appPassword = String(env.ZEZO_GMAIL_SMTP_APP_PASSWORD || '').replace(/\s/g, '');
   const enabled = env.ZEZO_ENABLE_PASSWORD_RECOVERY_EMAIL === 'true' ||
     (env.ZEZO_ENABLE_PASSWORD_RECOVERY_EMAIL === undefined && Boolean(username && appPassword));
-  return enabled &&
-    username === PASSWORD_RECOVERY_SENDER && appPassword.length > 0 &&
-    Boolean(passwordRecoveryOrigin(env));
+  return enabled && username === PASSWORD_RECOVERY_SENDER && appPassword.length > 0;
 }
 
 export function passwordRecoveryOrigin(env = process.env) {
@@ -23,8 +38,8 @@ export function passwordRecoveryOrigin(env = process.env) {
   if (!configured) return '';
   try {
     const url = new URL(configured);
-    const testHttpAllowed = env.NODE_ENV === 'test' && ['localhost', '127.0.0.1', '::1'].includes(url.hostname);
-    if ((url.protocol !== 'https:' && !testHttpAllowed) || url.username || url.password || url.search || url.hash) return '';
+    const testHttpAllowed = env.NODE_ENV === 'test' && url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+    if ((url.protocol !== 'https:' && !testHttpAllowed) || url.username || url.password || url.pathname !== '/' || url.search || url.hash) return '';
     return url.origin;
   } catch {
     return '';
@@ -104,7 +119,14 @@ function transportOptions(env) {
   };
 }
 
-export function passwordRecoveryFailureCode(error) {
+export function passwordRecoveryFailureCode(error, env = process.env) {
+  if (passwordRecoveryProvider(env) === 'resend') {
+    if (error?.status === 401 || error?.status === 403) return 'resend_auth';
+    if (error?.status === 429) return 'resend_rate_limited';
+    if (error?.status >= 500) return 'resend_unavailable';
+    if (error?.status >= 400) return 'resend_rejected';
+    return 'resend_uncertain';
+  }
   const code = String(error?.code || '').toUpperCase();
   if (['EAUTH', '535'].includes(code) || Number(error?.responseCode) === 535) return 'smtp_auth';
   if (['ETIMEDOUT', 'ESOCKET', 'ETIMEOUT'].includes(code)) return 'smtp_timeout';
@@ -135,13 +157,25 @@ async function withSmtpDeadline(transport, operation) {
 
 export async function verifyPasswordRecoveryTransport(env = process.env) {
   if (!passwordRecoveryEmailReady(env)) throw new Error('password_recovery_email_not_configured');
+  // A sending-only Resend key has no equivalent to SMTP's connection check.
+  // The caller uses the same response deadline regardless of account existence.
+  if (passwordRecoveryProvider(env) === 'resend') return;
   const transport = nodemailer.createTransport(transportOptions(env));
   return withSmtpDeadline(transport, () => transport.verify());
 }
 
-export async function sendPasswordRecoveryEmail({ to, resetUrl, language = 'ar' }, env = process.env) {
+export async function sendPasswordRecoveryEmail({ to, resetUrl, language = 'ar', idempotencyKey }, env = process.env) {
   if (!passwordRecoveryEmailReady(env)) throw new Error('password_recovery_email_not_configured');
   const message = renderPasswordRecoveryEmail({ resetUrl, language });
+  if (passwordRecoveryProvider(env) === 'resend') {
+    const options = { ...message, to, idempotencyKey, env, timeoutMs: RESEND_TIMEOUT_MS };
+    if (env.NODE_ENV === 'test' && env.ZEZO_TEST_RESEND_PORT) {
+      const port = Number(env.ZEZO_TEST_RESEND_PORT);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('invalid_resend_test_port');
+      options.fetchImpl = (_url, init) => fetch(`http://127.0.0.1:${port}/emails`, init);
+    }
+    return sendWithResend(options);
+  }
   const testTransport = env.NODE_ENV === 'test' && env.ZEZO_TEST_SMTP_HOST && env.ZEZO_TEST_SMTP_PORT;
   const transport = nodemailer.createTransport(transportOptions(env));
   return withSmtpDeadline(transport, () => transport.sendMail({

@@ -15,7 +15,9 @@ import { claimGuestConversations, findLoginAccount, loadClientDashboardData, loa
 import { changePostgresPassword, enablePostgresMfa, logoutPostgresSession, setupPostgresMfa } from './src/server/postgres-auth-repository.js';
 import { getRequestPublicSiteOrigin } from './src/public-site-origin.js';
 import { acceptPostgresQuote, createPostgresConversation, createPostgresConversationMessage, createPostgresQuote } from './src/server/postgres-conversation-repository.js';
-import { claimNextOutboxMessage, completeOutboxMessage } from './src/server/outbox-repository.js';
+import { approvalEmail, mailWithFooter, teamInvitationEmail, verificationEmail } from './src/server/transactional-email.js';
+import { postgresOutboxSettings } from './src/server/outbox-worker.js';
+import { ResendMailError, sendWithResend } from './src/server/resend-mail.js';
 import { createPostgresWithdrawalRequest } from './src/server/postgres-withdrawal-repository.js';
 import { createPostgresEmployeeInvitation, revokePostgresEmployeeInvitation, reissuePostgresEmployeeInvitation } from './src/server/postgres-invitation-repository.js';
 import { activatePostgresEmployeeInvitation } from './src/server/postgres-activation-repository.js';
@@ -24,7 +26,7 @@ import { capturePostgresReferralAttribution, deletePostgresReferralAnalyticsByVi
 import { createPostgresProjectRequest } from './src/server/postgres-project-request-repository.js';
 import { updatePostgresEmployeePermissions } from './src/server/postgres-permission-repository.js';
 import { completePostgresPasswordResetEmail, consumePostgresPasswordReset, issuePostgresPasswordReset } from './src/server/postgres-password-recovery-repository.js';
-import { createPasswordResetUrl, passwordRecoveryEmailReady, passwordRecoveryFailureCode, sendPasswordRecoveryEmail, verifyPasswordRecoveryTransport } from './src/server/password-recovery-mailer.js';
+import { createPasswordResetUrl, passwordRecoveryEmailReady, passwordRecoveryFailureCode, passwordRecoveryMinimumResponseMs, sendPasswordRecoveryEmail, verifyPasswordRecoveryTransport } from './src/server/password-recovery-mailer.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const STAGING_MODE = process.env.ZEZO_STAGING === 'true';
@@ -108,7 +110,6 @@ const quoteAttempts = new Map();
 const clientRegistrationAttempts = new Map();
 const passwordResetAttempts = new Map();
 const conversationAttempts = new Map();
-let mailWorkerRunning = false;
 
 const now = () => new Date().toISOString();
 const hash = value => createHash('sha256').update(String(value)).digest('hex');
@@ -766,8 +767,16 @@ function bindClientReferral(user, attribution){
   user.referralUserId=attribution.user.id;user.referralCode=attribution.code||attribution.user.currentReferralCode||attribution.user.referralCode;
   user.referralLinkId=attribution.link?.id||null;user.referralBoundAt=now();return true;
 }
-const emailReady = () => !STAGING_MODE && process.env.ZEZO_ENABLE_EMAIL_DELIVERY === 'true' && Boolean(process.env.RESEND_API_KEY && process.env.ZEZO_FROM_EMAIL);
+function emailReady() {
+  if (STAGING_MODE) return false;
+  if (postgresConfigured()) return Boolean(postgresOutboxSettings());
+  return process.env.ZEZO_ENABLE_EMAIL_DELIVERY === 'true' && Boolean(process.env.RESEND_API_KEY && process.env.ZEZO_FROM_EMAIL);
+}
 const adminEmailReady = () => !STAGING_MODE && Boolean(process.env.ZEZO_NOTIFICATION_EMAIL);
+function emailReadyForRecipient(email) {
+  const testRecipient = normalizeEmail(process.env.ZEZO_EMAIL_TEST_RECIPIENT);
+  return emailReady() && (!testRecipient || normalizeEmail(email) === testRecipient);
+}
 function requestIsSecure(req) {
   if (req.socket?.encrypted) return true;
   const trustedProxy = process.env.NETLIFY === 'true' || process.env.ZEZO_TRUST_PROXY === 'true';
@@ -781,46 +790,8 @@ function siteBase(req) {
   return origin;
 }
 async function processMailQueue() {
-  if (STAGING_MODE || !emailReady()) return 0;
-  if (postgresConfigured()) {
-    if (mailWorkerRunning) return 0;
-    mailWorkerRunning = true;
-    let processed = 0;
-    try {
-      while (true) {
-        const claimed = await claimNextOutboxMessage({ allowAdmin: adminEmailReady() });
-        if (!claimed) break;
-        const item = { ...(claimed.data || {}), id: claimed.id, recipient: claimed.recipient || '', attempts: claimed.attempts };
-        const recipient = item.recipientType === 'admin' ? process.env.ZEZO_NOTIFICATION_EMAIL : (item.to || item.recipient);
-        let nextState;
-        let providerId = '';
-        let lastError = '';
-        try {
-          const response = await fetch('https://api.resend.com/emails', {
-            method: 'POST', signal: AbortSignal.timeout(12000),
-            headers: { 'Authorization': `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': item.id },
-            body: JSON.stringify({ from: process.env.ZEZO_FROM_EMAIL, to: recipient, subject: item.subject, text: item.text })
-          });
-          const result = await response.json().catch(() => ({}));
-          if (!response.ok) throw new Error(result.message || `Email provider returned ${response.status}`);
-          nextState = 'sent';
-          providerId = clean(result.id, 120);
-        } catch (error) {
-          nextState = item.attempts >= 5 ? 'failed' : 'retry';
-          lastError = clean(error.message, 220);
-        }
-        const completed = await completeOutboxMessage(item.id, claimed.leaseToken, { state: nextState, providerId, lastError });
-        if (completed) {
-          const stored = store.mailQueue.find(row => row.id === item.id);
-          if (stored) Object.assign(stored, completed.data || {}, { id: completed.id, state: completed.state, attempts: completed.attempts, updatedAt: completed.updatedAt });
-        }
-        processed += 1;
-      }
-      return processed;
-    } finally {
-      mailWorkerRunning = false;
-    }
-  }
+  // PostgreSQL is drained by the standalone or scheduled worker after commit.
+  if (STAGING_MODE || postgresConfigured() || !emailReady()) return 0;
   if (store.mailQueue.some(item => item.state === 'sending')) return 0;
   for (const item of [...store.mailQueue].reverse()) {
     if (!['pending','retry'].includes(item.state) || item.attempts >= 5) continue;
@@ -829,31 +800,41 @@ async function processMailQueue() {
     item.state = 'sending'; item.attempts += 1; item.lastAttemptAt = now();
     await persist();
     try {
-      const response = await fetch('https://api.resend.com/emails', {
-        method: 'POST', signal: AbortSignal.timeout(12000),
-        headers: { 'Authorization': `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': item.id },
-        body: JSON.stringify({ from: process.env.ZEZO_FROM_EMAIL, to: recipient, subject: item.subject, text: item.text })
+      const result = await sendWithResend({
+        to: recipient, subject: item.subject, text: item.text, html: item.html, idempotencyKey: item.id
       });
-      const result = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(result.message || `Email provider returned ${response.status}`);
-      item.state = 'sent'; item.sentAt = now(); item.providerId = clean(result.id, 120); item.lastError = '';
+      item.state = 'sent'; item.sentAt = now(); item.providerId = result.id; item.lastError = '';
     } catch (error) {
       item.state = item.attempts >= 5 ? 'failed' : 'retry';
-      item.lastError = clean(error.message, 220);
+      item.lastError = error instanceof ResendMailError ? error.message : 'Email send failed.';
     }
     await persist();
   }
   return undefined;
 }
-async function queueMail({ to = '', recipientType = 'direct', subject, text, kind }) {
+async function queueMail({ to = '', recipientType = 'direct', subject, text, kind, eventKey = '', expiresAt }) {
   const safeText=String(text??'').replace(/\r\n?/g,'\n').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g,'').trim().slice(0,6000);
-  const item = { id: id('mail'), createdAt: now(), kind: clean(kind, 50), to: clean(to, 150), recipientType, subject: clean(subject, 180), text: safeText, state: 'pending', attempts: 0, lastError: '' };
+  const mailId = eventKey ? `mail_${hash(eventKey).slice(0, 40)}` : id('mail');
+  const prior = eventKey ? store.mailQueue.find(row => row.id === mailId) : null;
+  if (prior) return prior;
+  const item = { id: mailId, createdAt: now(), kind: clean(kind, 50), to: clean(to, 150), recipientType, subject: clean(subject, 180), text: safeText, state: 'pending', attempts: 0, lastError: '', ...(expiresAt ? { expiresAt } : {}) };
   store.mailQueue.unshift(item); store.mailQueue = store.mailQueue.slice(0, 1000);
   await persist();
   // PostgreSQL deployments use the separately supervised durable worker; do not
   // send inside the request transaction or rely on a serverless timer.
   if (!postgresConfigured()) void processMailQueue();
   return item;
+}
+async function queueProjectWorkspaceMail(req, lead, { eventKey, kind, approved, staff = false }) {
+  const recipientId = staff ? lead.developerUserId : lead.clientId;
+  const expectedRole = staff ? 'developer' : 'client';
+  const account = store.users.find(user => user.id === recipientId && user.role === expectedRole && user.active && !user.accountDisabledAt);
+  if (!account?.email || !emailReadyForRecipient(account.email)) return;
+  const language = staff ? account.language : lead.language || account.language;
+  await queueMail({
+    to: account.email, kind, eventKey: `${eventKey}:${recipientId}`,
+    ...approvalEmail({ siteBase: siteBase(req), language, approved, staff })
+  });
 }
 function fallbackQuote(brief) {
   const text=String(brief||'').toLowerCase();
@@ -1074,7 +1055,9 @@ async function handlePostgresCoreRead(req, res, path) {
       json(res, 503, { error: 'استعادة كلمة المرور عبر البريد غير مفعّلة حالياً. تواصل مع خدمة العملاء لاستعادة الحساب / Email password recovery is not configured yet. Contact ZEZO support to recover your account.' }, security);
       return true;
     }
-    if (email) {
+    const respondAfter = performance.now() + passwordRecoveryMinimumResponseMs();
+    const testRecipient = String(process.env.ZEZO_EMAIL_TEST_RECIPIENT || '').trim().toLowerCase();
+    if (email && (!testRecipient || email === testRecipient)) {
       const rawToken = token(32);
       const resetUrl = createPasswordResetUrl(rawToken);
       const at = now();
@@ -1087,30 +1070,34 @@ async function handlePostgresCoreRead(req, res, path) {
         }
       });
       if (issued.kind === 'queued') {
-        let delivered = false;
+        let accepted = false;
+        let providerId = '';
         try {
-          // Netlify functions may stop as soon as the request ends. Await SMTP
-          // delivery within this request; never hand reset mail to a background timer.
-          await sendPasswordRecoveryEmail({ to: email, resetUrl, language: body.lang === 'en' ? 'en' : 'ar' });
-          delivered = true;
+          // Await provider acceptance in this request. The raw reset token is
+          // only in memory and must never enter a background job payload.
+          const receipt = await sendPasswordRecoveryEmail({ to: email, resetUrl, language: body.lang === 'en' ? 'en' : 'ar', idempotencyKey: mailId });
+          providerId = receipt?.id || '';
+          accepted = true;
         } catch (error) {
           const failureCode = passwordRecoveryFailureCode(error);
           await completePostgresPasswordResetEmail({ id: mailId, state: 'uncertain', failureCode, at: now() }).catch(() => false);
           // Log only a coarse error category. Never log address, message, URL, or token.
-          console.warn('Password recovery SMTP delivery failed:', failureCode);
+          console.warn('Password recovery provider did not confirm acceptance:', failureCode);
         }
-        if (delivered && !await completePostgresPasswordResetEmail({ id: mailId, state: 'sent', at: now() }).catch(() => false)) {
-          // SMTP may have accepted the message even if the delivery receipt write
-          // fails. Keep the API response generic and never retry an ambiguous send.
-          console.warn('Password recovery delivery receipt could not be stored.');
+        if (accepted && !await completePostgresPasswordResetEmail({ id: mailId, state: 'sent', providerId, at: now() }).catch(() => false)) {
+          // An acceptance without a recorded receipt is still ambiguous. Do
+          // not regenerate or resend a one-time link from a background task.
+          console.warn('Password recovery acceptance receipt could not be stored.');
         }
       } else {
-        // Run the same SMTP connection/authentication path for unknown addresses
-        // to reduce response-time differences without sending a message.
+        // SMTP verifies the connection without sending. Resend waits for the
+        // same response deadline as a known account instead of sending a probe.
         try { await verifyPasswordRecoveryTransport(); }
-        catch (error) { console.warn('Password recovery SMTP verification failed:', passwordRecoveryFailureCode(error)); }
+        catch (error) { console.warn('Password recovery provider verification failed:', passwordRecoveryFailureCode(error)); }
       }
     }
+    const remaining = respondAfter - performance.now();
+    if (remaining > 0) await new Promise(resolve => setTimeout(resolve, remaining));
     json(res, 202, { ok: true, message: 'إذا كان البريد مرتبطاً بحساب نشط وتمكن النظام من إرسال الرسالة، فستصلك تعليمات الاستعادة. لا تؤكد هذه الصفحة وصول الرسالة / If this email belongs to an active account and the system can send the message, recovery instructions will arrive. This page does not confirm delivery.' }, security);
     return true;
   }
@@ -1152,16 +1139,17 @@ async function handlePostgresCoreRead(req, res, path) {
     }
 
     const createdAt = now();
-    const deliveryReady = emailReady();
+    const deliveryReady = emailReadyForRecipient(email);
     const verificationToken = deliveryReady ? token(32) : '';
     const verificationRequired = Boolean(verificationToken);
     const credential = passwordRecord(password);
+    const language = body.lang === 'en' ? 'en' : 'ar';
     const referralCookieValue = cookieValue(req, REFERRAL_ATTRIBUTION_COOKIE);
     const referralVisitorHash = /^[A-Za-z0-9_-]{40,64}$/.test(referralCookieValue) ? hash(referralCookieValue) : '';
     const isStudent = body.student === 'true' || body.student === true;
     const user = {
       id: id('usr'), name, username: email, email, phone: '', instagram: '', socialLinks: '', telegramUsername: '',
-      role: 'client', active: !verificationRequired, student: isStudent,
+      role: 'client', active: !verificationRequired, student: isStudent, language,
       university: isStudent ? clean(body.university, 120) : '',
       emailVerified: false, createdAt, ...credential
     };
@@ -1177,8 +1165,8 @@ async function handlePostgresCoreRead(req, res, path) {
       recipient: email,
       data: {
         id: mailId, to: email, recipientType: 'direct', kind: 'client_email_verification', dedupeKey,
-        subject: 'تأكيد بريد حساب ZEZO',
-        text: `مرحباً ${name}،\n\nأكد بريدك لتفعيل حسابك في ZEZO خلال 24 ساعة:\n${verifyUrl}\n\nإذا لم تنشئ هذا الحساب، تجاهل الرسالة.`,
+        ...verificationEmail({ name, verifyUrl, language }),
+        expiresAt: new Date(user.emailVerificationExpires).toISOString(),
         state: 'pending', attempts: 0, lastError: '', createdAt, updatedAt: createdAt
       }
     } : null;
@@ -1254,15 +1242,14 @@ async function handlePostgresCoreRead(req, res, path) {
       }
       return null;
     };
-    const activationUrl = `${siteBase(req)}/activate?token=${encodeURIComponent(activation)}`;
-    const invitationText = `مرحباً ${name}،\n\nأنشأنا لك حساباً في مساحة فريق ZEZO بدور: ${role}.\nفعّل الحساب وأنشئ كلمة مرورك خلال 24 ساعة عبر الرابط التالي:\n${activationUrl}\n\nبعد التفعيل ادخل إلى مساحة الفريق عبر: ${siteBase(req)}/team\n\nإذا لم تكن تتوقع هذه الدعوة، تجاهل الرسالة.`;
-    const noReplyFooter = '\n\n---\nرسالة تلقائية من ZEZO Forge. يرجى عدم الرد على هذه الرسالة.\nThis is an automated message from ZEZO Forge. Please do not reply.';
+    const origin = siteBase(req);
+    const activationUrl = `${origin}/activate?token=${encodeURIComponent(activation)}`;
     const mailId = id('mail');
     const outboxMessage = {
       id: mailId, recipient: email,
       data: {
         id: mailId, to: email, recipientType: 'direct', kind: 'team_invitation',
-        subject: 'دعوة للانضمام إلى ZEZO', text: `${invitationText}${noReplyFooter}`.slice(0, 6000),
+        ...teamInvitationEmail({ activationUrl, teamUrl: `${origin}/team` }), expiresAt,
         state: 'pending', attempts: 0, lastError: '', createdAt, updatedAt: createdAt
       }
     };
@@ -1636,6 +1623,7 @@ async function handlePostgresCoreRead(req, res, path) {
       const result = await createPostgresQuote({
         conversationId, actor: auth.user, quote, message, auditId: id('evt'), messageId: id('msg'), notificationId: id('ntf'),
         at: now(), permissionScope: effectivePermission(auth.user, 'conversations.read'),
+        emailSiteBase: emailReady() ? siteBase(req) : '',
         authorize: conversation => conversationAccess(auth.user, conversation, 'conversations.read') &&
           requirePermission(auth, res, 'quotes.draft', { assigneeId: conversation.assignedUserId || '', ownerId: conversation.clientId || '', department: conversation.department || 'orders' })
       });
@@ -1655,6 +1643,7 @@ async function handlePostgresCoreRead(req, res, path) {
     const result = await acceptPostgresQuote({
       conversationId, actor, guestHash, quoteMessage: 'تم قبول عرض السعر.', auditId: id('evt'), messageId: id('msg'), at: now(),
       permissionScope: effectivePermission(actor, 'conversations.read'),
+      adminEmailSiteBase: adminEmailReady() && emailReadyForRecipient(process.env.ZEZO_NOTIFICATION_EMAIL) ? siteBase(req) : '',
       authorize: conversation => {
         if (actor.role === 'client') return conversation.clientId === actor.id || Boolean(guestHash && conversation.guestSessionHash === guestHash);
         if (actor.role === 'guest') return Boolean(guestHash && conversation.guestSessionHash === guestHash);
@@ -2658,6 +2647,7 @@ async function handlePostgresCoreWrite(req, res, path) {
       conversationId: decodeURIComponent(conversationMessageMatch[1]), actor, guestHash: guest ? hash(guest) : '',
       text, attachmentFile, idempotencyHash: hash(idempotencyKey), messageId: id('msg'), auditId: id('evt'), at: now(),
       permissionScope: auth ? effectivePermission(actor, 'conversations.read') : '',
+      emailSiteBase: emailReady() ? siteBase(req) : '',
       authorizeRecipient: canReceiveConversationNotification,
       authorize: conversation => {
         if (actor.role === 'client') return conversation.clientId === actor.id || Boolean(guest && conversation.guestSessionHash === hash(guest));
@@ -2766,15 +2756,15 @@ async function handlePostgresInvitationWrite(req, res, path) {
   const activation = token(32);
   const expiresAt = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
   const mailId = id('mail');
-  const activationUrl = `${siteBase(req)}/activate?token=${encodeURIComponent(activation)}`;
-  const message = `مرحباً،\n\nتم إصدار رابط تفعيل جديد لحسابك في مساحة فريق ZEZO. الرابط صالح لمرة واحدة ولمدة 24 ساعة:\n${activationUrl}\n\nبوابة الفريق: ${siteBase(req)}/team\n\n---\nرسالة تلقائية من ZEZO Forge. يرجى عدم الرد على هذه الرسالة.\nThis is an automated message from ZEZO Forge. Please do not reply.`;
+  const origin = siteBase(req);
+  const activationUrl = `${origin}/activate?token=${encodeURIComponent(activation)}`;
   const result = await reissuePostgresEmployeeInvitation({
     sessionHash: sessionKey(auth.sid), actorId: auth.user.id, employeeId,
     activationHash: hash(activation), activationExpires: Date.parse(expiresAt), expiresAt,
     issuedAt: at, auditId: id('evt'),
     outboxMessage: { id: mailId, recipient: null, data: {
       id: mailId, to: null, recipientType: 'direct', kind: 'team_invitation',
-      subject: 'تجديد دعوة ZEZO', text: message, state: 'pending', attempts: 0,
+      ...teamInvitationEmail({ activationUrl, teamUrl: `${origin}/team`, reissued: true }), expiresAt, state: 'pending', attempts: 0,
       lastError: '', createdAt: at, updatedAt: at
     } },
     authorize: (actor, employee) => {
@@ -3221,13 +3211,14 @@ async function handleRequest(req, res) {
       if(!await rateAllowedFor(clientRegistrationAttempts,ip,8,60*60_000))return json(res,429,{error:'محاولات تسجيل كثيرة. حاول لاحقاً / Too many registration attempts. Try again later.'},security);
       if(name.length<2||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||!validPassword(password)||String(b.confirmPassword||'')!==password)return json(res,400,{error:'أكمل الاسم والبريد، وتأكد من تطابق كلمتي المرور (12 خانة على الأقل) / Enter your name and email, and make sure both passwords match (12+ characters).'},security);
       if(store.users.some(user=>normalizeEmail(user.email)===email||user.username===email))return json(res,409,{error:'يوجد حساب بهذا البريد. سجّل الدخول بدلاً من إنشاء حساب جديد / An account already exists for this email. Please sign in.'},security);
-      const attribution=referralForRequest(req,b),createdAt=now(),verificationToken=emailReady()?token(32):'';
+      const attribution=referralForRequest(req,b),createdAt=now(),verificationToken=emailReadyForRecipient(email)?token(32):'';
       const student=b.student==='true'||b.student===true;
-      const user={id:id('usr'),name,username:email,email,phone:'',role:'client',active:!emailReady(),student,university:student?clean(b.university,120):'',emailVerified:false,createdAt,...passwordRecord(password)};
+      const language=b.lang==='en'?'en':'ar';
+      const user={id:id('usr'),name,username:email,email,phone:'',role:'client',active:!verificationToken,student,language,university:student?clean(b.university,120):'',emailVerified:false,createdAt,...passwordRecord(password)};
       bindClientReferral(user,attribution);
       if(verificationToken){user.emailVerificationHash=hash(verificationToken);user.emailVerificationExpires=Date.now()+24*60*60_000;}
       store.users.push(user);audit(user,'client_registered',user.id,user.referralCode?`Referral ${user.referralCode}`:'');await persist();
-      if(verificationToken){const verifyUrl=`${siteBase(req)}/?verifyEmail=${encodeURIComponent(verificationToken)}`;await queueMail({to:email,kind:'client_email_verification',subject:'تأكيد بريد حساب ZEZO',text:`مرحباً ${name}،\n\nأكد بريدك لتفعيل حسابك في ZEZO خلال 24 ساعة:\n${verifyUrl}\n\nإذا لم تنشئ هذا الحساب، تجاهل الرسالة.`});void processMailQueue();return json(res,201,{verificationRequired:true,emailQueued:emailReady()},security);}
+      if(verificationToken){const verifyUrl=`${siteBase(req)}/?verifyEmail=${encodeURIComponent(verificationToken)}`;await queueMail({to:email,kind:'client_email_verification',eventKey:`client-verification:${user.id}`,expiresAt:new Date(user.emailVerificationExpires).toISOString(),...verificationEmail({name,verifyUrl,language})});return json(res,201,{verificationRequired:true,emailQueued:true},security);}
       const sid=token();sessions.set(sessionKey(sid),{userId:user.id,expires:Date.now()+SESSION_TTL});
       return json(res,201,{user:publicUser(user),verificationRequired:false,emailConfigured:false}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
     }
@@ -3599,13 +3590,17 @@ async function handleRequest(req, res) {
       if(b.stage==='waiting_developer_acceptance'&&!lead.developerUserId)return json(res,409,{error:'عيّن مبرمجاً قبل انتظار القبول / Assign a developer before awaiting acceptance'},security);
       if(['waiting_client_review','ready_delivery','delivered'].includes(b.stage)&&lead.developerReviewStatus!=='approved')return json(res,409,{error:'اعتمد المراجعة الفنية قبل تسليم الملفات للعميل / Approve technical review before delivery'},security);
       if(b.stage==='completed'&&lead.developerUserId&&lead.developerReviewStatus!=='approved')return json(res,409,{error:'اعتمد تسليم المبرمج قبل إكمال المشروع / Approve the developer delivery before completing the project'},security);
-      const previous=lead.projectStage;setProjectStage(lead,b.stage,auth.user,clean(b.note,500),clean(b.clientNote,500));if(b.clientNote!==undefined)lead.publicStatusNote=clean(b.clientNote,500);
+      const previous=lead.projectStage, previousPublicNote=lead.publicStatusNote||'';
+      setProjectStage(lead,b.stage,auth.user,clean(b.note,500),clean(b.clientNote,500));if(b.clientNote!==undefined)lead.publicStatusNote=clean(b.clientNote,500);
       if(b.stage==='completed')lead.status='completed';
       if(b.stage==='cancelled'){lead.status='cancelled';lead.refunded=true;lead.developerTaskStatus='cancelled';cancelWithdrawalForLead(lead,auth.user);}
       updateCommission(lead);updateDeveloperCommission(lead);syncLeadFinanceLedger(lead,auth.user);syncLeadReferralMilestones(lead,auth.user);syncCrmCaseForOrder(lead,auth.user);const rankRequestsCreated=syncAllRankRequests();
       audit(auth.user,'project_stage_updated',lead.id,`${previous||'—'} -> ${b.stage}`);await persist();
       if(lead.clientId)notifyUser(lead.clientId,`project-stage:${lead.id}:${lead.projectHistory.at(-1).at}`,{type:'project',importance:['completed','cancelled','waiting_client_review'].includes(b.stage)?'high':'normal',titleAr:'تحدّثت مرحلة مشروعك',titleEn:'Your project stage changed',descriptionAr:clean(b.clientNote,320)||`المرحلة الجديدة: ${b.stage}`,descriptionEn:clean(b.clientNote,320)||`New stage: ${b.stage}`},{tab:'orders',targetId:lead.id,targetKind:'lead'});
       if(lead.developerUserId)notifyUser(lead.developerUserId,`project-stage:${lead.id}:${lead.projectHistory.at(-1).at}`,{type:'project',importance:'normal',titleAr:'تحدّثت مرحلة المشروع',titleEn:'Project stage changed',descriptionAr:`المرحلة الجديدة: ${b.stage}`,descriptionEn:`New stage: ${b.stage}`},{tab:'development',targetId:lead.id,targetKind:'lead'});
+      if (previous !== lead.projectStage || previousPublicNote !== (lead.publicStatusNote || '')) {
+        await queueProjectWorkspaceMail(req, lead, { eventKey: `project-stage:${lead.id}:${lead.projectHistory.at(-1).at}`, kind: 'project_stage_changed' });
+      }
       for(const request of rankRequestsCreated)await queueRankRequestMail(request);
       return json(res,200,{lead:safeLead(lead,true)},security);
     }
@@ -3620,6 +3615,9 @@ async function handleRequest(req, res) {
       updateDeveloperCommission(lead);syncCrmCaseForOrder(lead,auth.user);audit(auth.user,b.decision==='approved'?'project_delivery_approved':'project_delivery_revision_requested',lead.id,note);
       notifyUser(lead.developerUserId,`quality-review:${lead.id}:${at}`,{type:'project',importance:'high',titleAr:b.decision==='approved'?'اعتمد المالك مراجعة التسليم':'طلب المالك تعديلات على التسليم',titleEn:b.decision==='approved'?'Owner approved the technical delivery':'Owner requested delivery revisions',descriptionAr:note||'راجع تحديثات المشروع في مساحتك.',descriptionEn:note||'Review the project update in your workspace.'},{tab:'development',targetId:lead.id,targetKind:'lead'});await persist();
       if(lead.clientId)notifyUser(lead.clientId,`project-review:${lead.id}:${at}`,{type:'project',importance:'high',titleAr:b.decision==='approved'?'تسليم مشروعك جاهز للمراجعة':'هناك تحديث على مراجعة مشروعك',titleEn:b.decision==='approved'?'Your delivery is ready for review':'Your project review was updated',descriptionAr:b.decision==='approved'?'راجع الملفات المعتمدة وأكد الاستلام أو أرسل ملاحظة تعديل.':clean(b.clientNote,320)||'يراجع فريق ZEZO التعديلات المطلوبة.',descriptionEn:b.decision==='approved'?'Review the approved files and confirm receipt or request a change.':clean(b.clientNote,320)||'The ZEZO team is reviewing the requested changes.'},{tab:'orders',targetId:lead.id,targetKind:'lead'});
+      const projectMail = { eventKey: `project-review:${lead.id}:${at}`, kind: 'project_delivery_review', approved: b.decision === 'approved' };
+      await queueProjectWorkspaceMail(req, lead, projectMail);
+      await queueProjectWorkspaceMail(req, lead, { ...projectMail, staff: true });
       return json(res,200,{project:safeDeveloperProject(lead),projectStage:lead.projectStage},security);
     }
     if (req.method === 'PATCH' && path.startsWith('/api/admin/leads/')) {
@@ -3893,7 +3891,7 @@ function handlePublicRuntimeConfig(req, res, snapshot) {
   });
 }
 
-export { init, handle, processMailQueue as runOutboxWorker };
+export { init, handle };
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
   await init();

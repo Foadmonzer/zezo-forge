@@ -1,68 +1,32 @@
 # ZEZO password recovery email
 
-Password recovery uses a separate, synchronous Gmail SMTP transport. It does not
-enable the general Resend mail queue or depend on a worker that can stop when a
-Netlify Function returns.
+Password recovery uses the chosen email provider synchronously. The API waits for acceptance while it holds the reset token in memory. It records the outcome in the existing Outbox table. The background worker does not send password reset messages.
 
-## Production configuration
+## Production configuration for Resend
 
-Keep the Gmail values in the Netlify Production environment only:
+- `ZEZO_PASSWORD_RECOVERY_PROVIDER=resend`
+- `ZEZO_ENABLE_PASSWORD_RECOVERY_EMAIL=true`
+- `ZEZO_FROM_EMAIL=ZEZO <noreply@notify.zezoforge.com>`
+- `RESEND_API_KEY` is a sending key scoped to `notify.zezoforge.com`. Store its value as a secret in the Production Functions environment.
+- `ZEZO_PUBLIC_URL=https://zezoforge.com`
 
-- `ZEZO_GMAIL_SMTP_USER=zezo.info.2026@gmail.com`
-- `ZEZO_GMAIL_SMTP_APP_PASSWORD` = the Gmail App Password, stored as a secret
-- `ZEZO_PUBLIC_URL=https://zezo-forge-fouad.netlify.app`
+Keep click and open tracking disabled for the transactional send domain. Click tracking rewrites the one-time link, which contains a credential in its URL fragment. Check the received link against the official domain during the email delivery test. [Resend transactional email guidance](https://resend.com/guides/email/plan-onboarding-email-program)
 
-`ZEZO_PUBLIC_URL` is required and must be set to the exact HTTPS origin for each
-deploy context. Production uses the production site URL. A Deploy Preview must
-use that preview's URL if it is separately configured for testing. If the value
-is absent or invalid, recovery stays disabled; it will never silently fall back
-to the Production URL. Netlify's `DEPLOY_PRIME_URL` is a build-time value and is
-not one of the read-only values exposed to serverless Functions at runtime, so
-do not rely on it as a runtime fallback.
+For the first Production test, set `ZEZO_EMAIL_TEST_RECIPIENT` to the exact address belonging to the approved test account. Other addresses still receive the normal generic response from the recovery endpoint. The address comparison is case insensitive. For a recovery-only test, `ZEZO_ENABLE_EMAIL_DELIVERY=false` keeps the general queue paused. Remove the test recipient restriction only after confirming receipt and completing the reset test. Netlify Functions need a new deployment to pick up environment changes.
 
-When Gmail credentials are present, they enable only password-recovery mail.
-Optionally set `ZEZO_ENABLE_PASSWORD_RECOVERY_EMAIL=false` to explicitly turn
-this path off; set it to `true` to enable it explicitly. The separate
-`ZEZO_ENABLE_EMAIL_DELIVERY` switch still controls the existing Resend mail
-flows and is not required for password recovery.
+For a separately configured preview, use the exact HTTPS preview origin, an isolated database, a test inbox and test-specific email credentials. Keep recovery disabled in shared previews. The application never falls back to the Production URL when its configured origin is missing or invalid.
 
-The sender is fixed to the same authenticated Gmail inbox. Set
-`ZEZO_ENABLE_PASSWORD_RECOVERY_EMAIL=true` explicitly for Production after
-confirming the environment is correct; leave it `false` in isolated previews
-unless a separate test database, test inbox, and test-only SMTP configuration
-are in place. The site must be redeployed after changing function environment
-variables. Never put the App
-Password in Git, a local committed file, a log, or a chat message. The account
-must have Google's 2-Step Verification enabled before it can issue an App
-Password.
+The existing Gmail SMTP option remains available when `ZEZO_PASSWORD_RECOVERY_PROVIDER=gmail` or the provider setting is missing. That option still requires the approved Gmail address and its App Password, stored securely. An explicit Resend configuration never switches to Gmail after a failure.
 
 ## Request and storage behavior
 
-- A reset link is generated from the configured HTTPS site origin, not the
-  incoming Host header, and carries its token in the URL fragment.
-- PostgreSQL stores only the SHA-256 token hash and the one-hour expiry on the
-  account. The outbox record retains the recipient address and minimal delivery
-  status metadata; it does not store the token, reset URL, or message body. Treat
-  the recipient address as personal data under the database's normal access and
-  retention controls.
-- The SMTP send is awaited within the API request and has a 12-second upper
-  bound. A failure is recorded as `uncertain`, logged only as a coarse error
-  category, and is never retried by the background mail worker.
-- Known, unknown, and delivery-failure addresses get the same generic 202
-  response when sending is configured. If global configuration is absent, the
-  route returns a generic 503 without looking up the address. For an unknown
-  address, ZEZO performs an SMTP connection check but sends no email, reducing
-  timing differences without creating messages to arbitrary addresses.
-- Existing rate limits, hashed one-time tokens, expiry checks, session
-  revocation, and the normal MFA-aware sign-in flow remain in place.
+- A reset link uses the configured origin and carries its token in the URL fragment. PostgreSQL stores the SHA-256 token hash and the one-hour expiry on the account. The Outbox record contains the recipient and minimal attempt metadata, including the Resend acceptance ID if available.
+- Resend receives the Outbox ID as the idempotency key. The request has a timeout. On failure the application records a coarse failure category and the worker cannot resend the original one-time link. An acceptance ID confirms only that Resend accepted the request. Verify delivery separately in Resend and the test inbox.
+- Known accounts, unknown addresses and provider failures produce the same generic HTTP 202 when the feature is configured. The Resend response has a minimum duration to absorb ordinary provider request timing. Missing global configuration produces HTTP 503 before account lookup.
+- The existing IP and address limits, token expiry, one-time consumption and session invalidation still apply. Staff sign back in through the usual MFA flow.
 
-## Limitations
+## Checks on isolated PostgreSQL
 
-This is a temporary, low-volume fallback. A personal Gmail inbox is not a
-transactional mail service: Google can reject SMTP sign-in from a cloud runtime,
-App Passwords are weaker than OAuth and can be revoked, Gmail applies sending
-limits, and delivery can be filtered as spam. Netlify's function runtime does
-not guarantee that Gmail accepts a connection from every deployment region.
-Production delivery must be tested through the deployed function before the
-feature is declared active. A verified business domain and transactional email
-provider are the safer long-term solution.
+- `pnpm test:password-recovery-email` uses a loopback HTTP sink that simulates the Resend API. It tests content, the provider acceptance ID, token hashing, successful reset and rejected reuse, session invalidation and provider error redaction.
+- Set `ZEZO_TEST_RECOVERY_CANARY=true` for the same regression with an exact recipient restriction. It checks that an active account outside the allowed address cannot obtain a reset link.
+- Set `ZEZO_TEST_RECOVERY_TRANSPORT=gmail` to run against the isolated SMTP sink.

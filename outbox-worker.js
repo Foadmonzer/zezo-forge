@@ -1,8 +1,7 @@
 import { closePostgresPool, postgresConfigured } from './src/server/postgres-runtime.js';
+import { processPostgresOutbox } from './src/server/outbox-worker.js';
 
-const { init, runOutboxWorker } = await import('./server.js');
 if (!postgresConfigured()) throw new Error('DATABASE_URL is required for the PostgreSQL Outbox worker.');
-await init();
 
 let stopping = false;
 let running = false;
@@ -10,8 +9,8 @@ async function tick() {
   if (stopping || running) return;
   running = true;
   try {
-    const processed = await runOutboxWorker();
-    if (processed) console.log(`Outbox worker processed ${processed} message(s).`);
+    const { processed, sent, retry, failed, uncertain } = await processPostgresOutbox();
+    if (processed) console.log('ZEZO email outbox', { processed, accepted: sent, retry, failed, uncertain });
   } catch {
     console.error('Outbox worker failed; durable queue state was retained for retry.');
   } finally {

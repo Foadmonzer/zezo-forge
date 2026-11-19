@@ -28,10 +28,9 @@ export async function issuePostgresPasswordReset({ email, resetHash, expiresAt, 
   });
 }
 
-/** Record synchronous password-reset SMTP delivery without putting the token or
- * message body in the general outbox. Reset messages are never retried by the
- * background worker because SMTP's delivery result can be ambiguous. */
-export async function completePostgresPasswordResetEmail({ id, state, failureCode = '', at }) {
+/** Record acceptance of a synchronous reset email without storing its body or
+ * token. The background worker cannot recreate the original one-time link. */
+export async function completePostgresPasswordResetEmail({ id, state, providerId = '', failureCode = '', at }) {
   if (!['sent', 'uncertain'].includes(state)) throw new Error('Invalid password reset mail state.');
   return withPostgresScopedTransaction(async client => {
     const result = await client.query(`
@@ -40,13 +39,14 @@ export async function completePostgresPasswordResetEmail({ id, state, failureCod
           data = data || jsonb_build_object(
             'sentAt', CASE WHEN $2 = 'sent' THEN ($3::timestamptz)::text ELSE data ->> 'sentAt' END,
             'lastError', $4::text,
+            'providerId', $5::text,
             'workerLeaseUntil', NULL,
             'leaseToken', NULL
           ),
           "updatedAt" = $3::timestamptz
       WHERE id = $1 AND state = 'sending' AND data ->> 'kind' = 'account_password_reset'
       RETURNING id
-    `, [id, state, at, failureCode]);
+    `, [id, state, at, failureCode, providerId]);
     return Boolean(result.rows[0]);
   });
 }
