@@ -197,16 +197,17 @@ export async function createPostgresConversationMessage({ conversationId, actor,
 
     const duplicate = await client.query(`
       SELECT id FROM conversation_messages
-      WHERE "conversationId" = $1 AND data ->> 'idempotencyHash' = $2
+      WHERE "conversationId" = $1 AND data ->> 'idempotencyHash' = $2 AND "senderId" IS NOT DISTINCT FROM $3::text
       LIMIT 1
-    `, [conversationId, idempotencyHash]);
+    `, [conversationId, idempotencyHash, actor?.id || null]);
     if (duplicate.rowCount) {
       const view = await loadResponse(client, actor, conversationId, guestHash, permissionScope);
-      return { kind: 'duplicate', conversation: view };
+      return { kind: 'duplicate', conversation: view, messageId: duplicate.rows[0].id };
     }
+    if (conversation.status === 'closed') return { kind: 'closed' };
 
     const attachment = await storeAttachment(client, attachmentFile, actor?.id || null);
-    const senderType = actor?.role === 'guest' ? 'guest' : ['admin', 'hr_manager', 'marketing_manager', 'order_manager'].includes(actor?.role) ? 'staff' : 'client';
+    const senderType = !actor || actor.role === 'guest' ? 'guest' : actor.role === 'client' ? 'client' : 'staff';
     const message = await insertConversationMessage(client, { id: messageId, conversationId, actor, senderType, text, attachment, at, idempotencyHash });
     const nextStatus = conversation.status === 'waiting_customer' ? 'in_progress' : conversation.status;
     await client.query('UPDATE conversations SET status = $2, "updatedAt" = $3 WHERE id = $1', [conversationId, nextStatus, at]);

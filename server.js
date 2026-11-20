@@ -117,6 +117,7 @@ const hash = value => createHash('sha256').update(String(value)).digest('hex');
 const token = (bytes = 32) => randomBytes(bytes).toString('base64url');
 const id = prefix => `${prefix}_${randomBytes(9).toString('hex')}`;
 const clean = (v, max = 300) => String(v ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, max);
+const cleanConversationMessage = value => String(value ?? '').replace(/\r\n?/g, '\n').replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, ' ').trim().slice(0, 2000);
 function invitationStatus(user){
   if(user?.active)return user.inviteStatus==='accepted'?'accepted':'active';
   if(user?.inviteApprovalStatus==='pending_approval')return 'pending_approval';
@@ -1702,14 +1703,21 @@ async function handlePostgresCoreRead(req, res, path) {
     }
     if (['marketer', 'developer'].includes(auth?.user.role)) {
       if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
-      const data = await loadEmployeeDashboardData(auth.user.id);
+      const user = auth.user;
+      const [data, conversations] = await Promise.all([
+        loadEmployeeDashboardData(user.id),
+        user.role === 'developer' && permissionEnabled(user, 'conversations.read')
+          ? loadConversationViews(user, { permissionScope: effectivePermission(user, 'conversations.read'), department: user.department || roleDepartment(user.role), includeMessages: false })
+          : []
+      ]);
       // dashboardFor is a synchronous, read-only serializer for these two roles.
       // Swap in the scoped snapshot only during that synchronous call so another
       // request can never observe or mutate this temporary view.
       const previousStore = store;
       try {
-        store = { ...defaultStore(), ...data, users: [auth.user] };
-        const dashboard = dashboardFor(auth.user);
+        store = { ...defaultStore(), ...data, users: [user] };
+        const dashboard = dashboardFor(user);
+        if (user.role === 'developer') dashboard.conversations = conversations;
         dashboard.referredClients = data.referredClients || [];
         dashboard.referralMetrics = { ...(dashboard.referralMetrics || {}), signups: dashboard.referredClients.length };
         json(res, 200, dashboard, security);
@@ -1760,7 +1768,8 @@ async function handlePostgresCoreRead(req, res, path) {
     const guest = auth.user.role === 'client' ? guestSessionValue(req) : '';
     if (guest) await claimGuestConversations(auth.user.id, hash(guest), now());
     const scope = effectivePermission(auth.user, 'conversations.read');
-    const conversations = await loadConversationViews(auth.user, { permissionScope: scope, department: auth.user.department || roleDepartment(auth.user.role) });
+    const summary = new URL(req.url, 'http://localhost').searchParams.get('summary') === '1';
+    const conversations = await loadConversationViews(auth.user, { permissionScope: scope, department: auth.user.department || roleDepartment(auth.user.role), includeMessages: !summary });
     json(res, 200, { conversations }, security);
     return true;
   }
@@ -1770,6 +1779,7 @@ async function handlePostgresCoreRead(req, res, path) {
     const auth = await directPostgresSessionUser(req);
     const guest = guestSessionValue(req);
     let user = auth?.user;
+    if (user && !directRequireAuth(req, res, user, allRoles)) return true;
     if (user?.role === 'client' && guest) await claimGuestConversations(user.id, hash(guest), now());
     if (!user && guest) user = { id: '', role: 'guest' };
     if (!user) { json(res, 404, { error: 'المحادثة غير موجودة / Conversation not found' }, security); return true; }
@@ -1940,7 +1950,7 @@ function customerCanSeeConversation(req,auth,conversation){
   const guest=guestSessionValue(req);return Boolean(guest&&conversation.guestSessionHash===hash(guest));
 }
 function appendConversationMessage(conversation,{senderType,senderId='',text='',attachment=null}){
-  const message={id:id('msg'),senderType,senderId:senderId||null,text:clean(text,2000),createdAt:now(),attachments:attachment?[attachment]:[]};
+  const message={id:id('msg'),senderType,senderId:senderId||null,text:cleanConversationMessage(text),createdAt:now(),attachments:attachment?[attachment]:[]};
   conversation.messages??=[];conversation.messages.push(message);conversation.updatedAt=message.createdAt;return message;
 }
 function notifyConversation(conversation,kind,actor=null){
@@ -2255,7 +2265,11 @@ function dashboardFor(user) {
   const currentWithdrawalMonth=referralMonth(new Date());
   const common={role:user.role,user:publicUser(user),crmSummary:crmSummaryFor(user),referralLink:`/?ref=${encodeURIComponent(user.currentReferralCode||user.referralCode)}`,rank:marketerRankSummary(user),referralMetrics,referralLinks:store.referralLinks.filter(link=>link.userId===user.id).map(link=>({id:link.id,code:link.code,month:link.month,kind:link.kind,createdAt:link.createdAt,current:link.id===user.currentReferralLinkId})),referralIntelligence:referralIntelligenceFor(user),payoutHandle:user.payoutHandle||'',wallet,summary:{...wallet,visits:referralMetrics.visits,leads:referrals.length,withdrawalAlreadyUsed:store.withdrawals.some(w=>w.userId===user.id&&w.month===currentWithdrawalMonth)},commissionTerms:{baseRate:currentRankRate(user),holdDays:Number(store.settings.commissionHoldDays??14)},withdrawals:store.withdrawals.filter(w=>w.userId===user.id).map(withdrawalForMarketer),
     leads:referrals.map(l=>({id:l.id,createdAt:l.createdAt,service:l.service,status:l.status,commissionAmount:l.commissionAmount,commissionStatus:l.commissionStatus,withdrawalId:l.withdrawalId||null}))};
-  if(user.role==='developer')common.projects=allLeads.filter(l=>l.developerUserId===user.id).map(safeDeveloperProject);
+  if (user.role === 'developer') {
+    common.projects=allLeads.filter(l=>l.developerUserId===user.id).map(safeDeveloperProject);
+    common.currentPermissions=Object.fromEntries(Object.keys(permissionDefinitions).map(key=>[key,effectivePermission(user,key)]));
+    common.conversations=store.conversations.filter(conversation=>conversationAccess(user,conversation)).map(conversation=>safeConversation(conversation,false));
+  }
   return common;
 }
 function withdrawalForMarketer(w) { return { id:w.id, createdAt:w.createdAt, amount:w.amount, referralAmount:w.referralAmount||0, developerAmount:w.developerAmount||0, method:w.method, status:w.status, updatedAt:w.updatedAt || null, transferReference:w.status === 'paid' ? w.transferReference : undefined }; }
@@ -2587,7 +2601,7 @@ async function handlePostgresCoreWrite(req, res, path) {
 
     const templateId = clean(body.templateId, 80);
     const template = templateById.get(templateId);
-    const message = clean(body.message, 2000);
+    const message = cleanConversationMessage(body.message);
     if (!template || message.length < 5) return respond(400, { error: 'اختر قالباً متاحاً واكتب استفسارك / Choose an available template and enter your question' });
     const settings = await queryPostgres('SELECT value FROM app_settings WHERE key=$1', ['zezo-runtime']);
     if (settings.rows[0]?.value?.templateActive?.[templateId] === false) {
@@ -2650,10 +2664,10 @@ async function handlePostgresCoreWrite(req, res, path) {
     if (auth && !directRequireAuth(req, res, auth.user, allRoles)) return true;
     if (!auth && !guest) return respond(401, { error: 'انتهت جلسة المحادثة. أعد فتح المحادثة من حسابك / Conversation session expired. Reopen this conversation from your account.' });
     const actor = auth?.user || { id: '', role: 'guest' };
-    if (auth && !['client', 'admin', 'hr_manager', 'marketing_manager', 'order_manager'].includes(actor.role)) {
+    if (auth && !['client', 'admin', 'hr_manager', 'marketing_manager', 'order_manager', 'developer'].includes(actor.role)) {
       return respond(403, { error: 'ليس لديك صلاحية الرد على هذه المحادثة / You cannot reply to this conversation' });
     }
-    const text = clean(body.message, 2000);
+    const text = cleanConversationMessage(body.message);
     if (!text && !file) return respond(400, { error: 'اكتب رسالة أو أرفق ملفاً / Enter a message or attach a file' });
     let attachmentFile = null;
     if (file) {
@@ -2687,6 +2701,7 @@ async function handlePostgresCoreWrite(req, res, path) {
       }
     });
     if (result.kind === 'missing' || result.kind === 'forbidden') return respond(404, { error: 'المحادثة غير موجودة أو لا تملك صلاحية الوصول إليها / Conversation not found or unavailable' });
+    if (result.kind === 'closed') return respond(409, { error: 'المحادثة مغلقة ولا تستقبل رسائل جديدة / This conversation is closed to new messages' });
     return respond(result.kind === 'duplicate' ? 200 : 201, { ok: true, conversation: result.conversation, messageId: result.messageId });
   }
 
@@ -3080,7 +3095,7 @@ async function handleRequest(req, res) {
     if(req.method==='POST'&&path==='/api/conversations'){
       const auth=requireAuth(req,res,['client']);if(!auth)return;
       if(!await rateAllowedFor(conversationAttempts,`create:${req.socket.remoteAddress||'unknown'}`,15,60*60_000))return json(res,429,{error:'وصلنا الحد المؤقت للمحادثات. حاول لاحقاً / Conversation limit reached. Try again later.'},security);
-      let b={},file=null;if((req.headers['content-type']||'').toLowerCase().startsWith('multipart/form-data')){const parsed=parseMultipart(await bodyBuffer(req),req.headers['content-type']);b=parsed.fields;file=parsed.file;}else b=await jsonBody(req);const templateId=clean(b.templateId,80),template=templateById.get(templateId),message=clean(b.message,2000);
+      let b={},file=null;if((req.headers['content-type']||'').toLowerCase().startsWith('multipart/form-data')){const parsed=parseMultipart(await bodyBuffer(req),req.headers['content-type']);b=parsed.fields;file=parsed.file;}else b=await jsonBody(req);const templateId=clean(b.templateId,80),template=templateById.get(templateId),message=cleanConversationMessage(b.message);
       if(!template||store.settings.templateActive?.[templateId]===false||message.length<5)return json(res,400,{error:'اختر قالباً متاحاً واكتب استفسارك / Choose an available template and enter your question'},security);
       const resolved=referralForAuthenticatedClient(auth.user),conv={id:id('chat'),createdAt:now(),updatedAt:now(),templateId:template.id,templateName:template.title.ar,templateService:template.service,templateCategory:template.category,source:clean(b.source,40)||'template_catalog',department:'orders',status:'new',clientId:auth.user.id,guestSessionHash:null,assignedUserId:null,referralCode:resolved?.code||'',referralLinkId:resolved?.linkId||null,referralUserId:resolved?.userId||null,leadId:null,messages:[],quote:null,agreedPriceSnapshot:null};
       const attachment=await saveUpload(file,conv.clientId),first=appendConversationMessage(conv,{senderType:'client',senderId:conv.clientId,text:message,attachment});store.conversations.unshift(conv);
@@ -3099,6 +3114,7 @@ async function handleRequest(req, res) {
       const conversationId=conversationRoute[1],action=conversationRoute[2]||'',conversation=store.conversations.find(item=>item.id===conversationId);
       if(!conversation)return json(res,404,{error:'المحادثة غير موجودة / Conversation not found'},security);
       const auth=sessionUser(req),staff=Boolean(auth&&auth.user.role!=='client');
+      if(auth&&!requireAuth(req,res,allRoles))return;
       if(req.method==='GET'&&action===''){
         if(!customerCanSeeConversation(req,auth,conversation))return json(res,404,{error:'المحادثة غير موجودة / Conversation not found'},security);
         return json(res,200,{conversation:safeConversation(conversation,auth?.user.role==='admin')},security);
@@ -3110,9 +3126,10 @@ async function handleRequest(req, res) {
       }
       if(req.method==='POST'&&action==='messages'){
         let b={},file=null;if((req.headers['content-type']||'').toLowerCase().startsWith('multipart/form-data')){const parsed=parseMultipart(await bodyBuffer(req),req.headers['content-type']);b=parsed.fields;file=parsed.file;}else b=await jsonBody(req);
-        const text=clean(b.message,2000);if(text.length<1&&!file)return json(res,400,{error:'اكتب رسالة أو أرفق ملفاً صالحاً / Enter a message or attach a valid file'},security);
+        const text=cleanConversationMessage(b.message);if(text.length<1&&!file)return json(res,400,{error:'اكتب رسالة أو أرفق ملفاً صالحاً / Enter a message or attach a valid file'},security);
         if(staff){if(!conversationAccess(auth.user,conversation,'conversations.read')||!requirePermission(auth,res,'conversations.reply',{assigneeId:conversation.assignedUserId||'',ownerId:conversation.clientId||'',department:conversation.department||'orders'}))return;}
         else if(!customerCanSeeConversation(req,auth,conversation))return json(res,404,{error:'المحادثة غير موجودة / Conversation not found'},security);
+        if(conversation.status==='closed')return json(res,409,{error:'المحادثة مغلقة ولا تستقبل رسائل جديدة / This conversation is closed to new messages'},security);
         const attachment=await saveUpload(file,auth?.user.id||null),senderType=staff?'staff':auth?'client':'guest',message=appendConversationMessage(conversation,{senderType,senderId:auth?.user.id||'',text,attachment});
         if(staff&&conversation.status==='waiting_customer')conversation.status='in_progress';else if(!staff&&conversation.status==='waiting_customer')conversation.status='in_progress';
         audit(auth?.user||null,'conversation_message_sent',conversation.id,`${senderType}; ${message.id}; attachment=${Boolean(attachment)}`);notifyConversation(conversation,'message',auth?.user||null);await persist();return json(res,201,{ok:true,conversation:safeConversation(conversation,auth?.user.role==='admin')},security);
@@ -3953,9 +3970,17 @@ async function handleRequest(req, res) {
       return json(res,200,{withdrawal:{id:withdrawal.id,status:withdrawal.status,amount:withdrawal.amount,updatedAt:withdrawal.updatedAt}},security);
     }
     if (req.method === 'GET' && path.startsWith('/api/admin/attachment/')) {
-      const auth=requireAuth(req,res,['admin','marketing_manager','hr_manager','developer']); if(!auth)return; const [leadId,indexText]=path.split('/').slice(-2); const lead=store.leads.find(l=>l.id===leadId); if(auth.user.role==='developer'&&(!lead||lead.developerUserId!==auth.user.id||!['accepted','in_progress','review_requested','approved','revision_requested'].includes(lead.developerTaskStatus)))return json(res,404,{error:'الملف غير موجود / File not found'},security); const a=lead?.attachments[Number(indexText)];
-      if(!a) return json(res,404,{error:'الملف غير موجود'},security);
-      return serveUpload(res,a,security);
+      const auth = requireAuth(req, res, ['admin', 'marketing_manager', 'hr_manager', 'developer']);
+      if (!auth) return;
+      const [leadId, indexText] = path.split('/').slice(-2);
+      const lead = store.leads.find(row => row.id === leadId);
+      const unavailable = () => json(res, 404, { error: 'الملف غير موجود / File not found' }, security);
+      if (!lead) return unavailable();
+      if (auth.user.role === 'developer') {
+        if (lead.developerUserId !== auth.user.id || !['accepted', 'in_progress', 'review_requested', 'approved', 'revision_requested'].includes(lead.developerTaskStatus)) return unavailable();
+      } else if (auth.user.role !== 'admin' && !crmAccess(auth.user, { ...lead, assignedUserId: lead.orderManagerUserId || lead.assignedUserId || '' })) return unavailable();
+      const attachment = /^\d+$/.test(indexText) ? lead.attachments?.[Number(indexText)] : null;
+      return attachment ? serveUpload(res, attachment, security) : unavailable();
     }
     return json(res,404,{error:'Not found'},security);
   }

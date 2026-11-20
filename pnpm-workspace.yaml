@@ -2,3 +2,6 @@ allowBuilds:
   '@prisma/engines': true
   core-js: false
   prisma: true
+
+overrides:
+  '@prisma/config>effect': 3.22.1

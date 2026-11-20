@@ -86,7 +86,7 @@ export async function loadNormalizedStore(client, defaultStore) {
   next.leads = requestRows.map(row => ({
     ...withId(row), clientId: row.customerId || row.data?.clientId || null,
     referralUserId: row.referrerId || row.data?.referralUserId || null,
-    developerUserId: row.developerId || row.data?.developerUserId || null,
+    developerUserId: row.developerId || null,
     status: row.status || row.data?.status || 'new', projectStage: row.projectStage || row.data?.projectStage || 'new_request',
     templateId: row.templateId || row.data?.templateId || '',
     contractAmount: row.agreedAmount == null ? row.data?.contractAmount ?? null : safeNumber(row.agreedAmount),
@@ -95,10 +95,9 @@ export async function loadNormalizedStore(client, defaultStore) {
   const leadById = new Map(next.leads.map(item => [item.id, item]));
   for (const row of projectRows) {
     const lead = leadById.get(row.requestId);
-    if (!lead) continue;
+    if (!lead || row.developerId !== lead.developerUserId) continue;
     const projectData = row.data || {};
     lead.projectStage = row.stage || lead.projectStage;
-    lead.developerUserId = row.developerId || lead.developerUserId || null;
     if (row.dueAt) lead.developerDueDate = isoDate(row.dueAt).toISOString();
     for (const key of ['developerTaskStatus', 'developerReviewStatus', 'developerCommissionRate', 'developerCommissionAmount', 'developerCommissionStatus', 'developerCommissionPaidAmount', 'developerCommissionOffsetAmount', 'developerCommissionDebtRemaining', 'developerWithdrawalId', 'projectHistory', 'projectStartedAt', 'projectDeliveredAt', 'projectCompletedAt']) {
       if (projectData[key] !== undefined) lead[key] = projectData[key];
@@ -106,9 +105,9 @@ export async function loadNormalizedStore(client, defaultStore) {
   }
   for (const row of assignmentRows) {
     const lead = leadById.get(row.projectId?.replace(/^project_/, '')) || leadById.get(row.projectId);
-    if (!lead || (lead.developerUserId && lead.developerUserId !== row.developerId)) continue;
+    // Assignment and commission rows remain as history after an offer ends.
+    if (!lead || lead.developerUserId !== row.developerId) continue;
     const assignment = row.data || {};
-    lead.developerUserId = row.developerId;
     lead.developerTaskStatus = row.state;
     lead.developerCommissionRate = safeNumber(row.commissionPercent) || 25;
     if (row.expectedCommission != null) lead.developerCommissionExpected = safeNumber(row.expectedCommission);
@@ -119,7 +118,7 @@ export async function loadNormalizedStore(client, defaultStore) {
     if (!lead) continue;
     const detail = row.data || {};
     if (row.kind === 'developer') {
-      lead.developerUserId = row.userId;
+      if (lead.developerUserId !== row.userId) continue;
       lead.developerCommissionRate = safeNumber(row.ratePercent);
       lead.developerCommissionAmount = safeNumber(row.amount);
       lead.developerCommissionStatus = row.status;

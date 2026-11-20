@@ -19,8 +19,8 @@ export function latestOrderUpdate(order: Order) {
   ), order.createdAt);
 }
 
-export function CustomerOrder({ order, conversation, language, onChange, onUnauthorized }: {
-  order: Order; conversation?: Conversation; language: Language; onChange: () => Promise<void>; onUnauthorized: () => void;
+export function CustomerOrder({ order, conversation, viewerId, language, onChange, onUnauthorized }: {
+  order: Order; conversation?: Conversation; viewerId: string; language: Language; onChange: () => Promise<void>; onUnauthorized: () => void;
 }) {
   const [pending, setPending] = useState('');
   const [feedback, setFeedback] = useState<{ text: string; ok: boolean } | null>(null);
@@ -109,7 +109,7 @@ export function CustomerOrder({ order, conversation, language, onChange, onUnaut
     </section>}
     {feedback && <p className={feedback.ok ? 'zc-success' : 'zc-error'} role={feedback.ok ? 'status' : 'alert'}>{feedback.text}</p>}
 
-    {conversation ? <CustomerMessages key={conversation.id} language={language} conversationId={conversation.id} leadId={order.id} onUnauthorized={onUnauthorized} />
+    {conversation ? <CustomerMessages key={conversation.id} language={language} conversationId={conversation.id} viewerId={viewerId} leadId={order.id} onUnauthorized={onUnauthorized} />
       : <section className="zc-panel"><h2>{t('التواصل مع الفريق', 'Contact the team')}</h2><p>{t('لا توجد محادثة مرتبطة بهذا الطلب. يمكنك مراسلة الفريق وذكر رقم الطلب.', 'No conversation is linked to this request. You can contact the team and include the request number.')}</p><a href={pageHref('/contact', language)} className="zc-button zc-secondary">{t('تواصل معنا', 'Contact us')}</a></section>}
 
     {['delivered', 'completed'].includes(order.projectStage || order.status) && <ProjectReviewPanel projectId={order.id} language={language} />}
