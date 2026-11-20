@@ -9,7 +9,7 @@ import { templateCatalog, templateById } from './public/template-catalog.js';
 import { buildWhatsAppUrl, normalizeWhatsAppNumber } from './public/whatsapp.js';
 import { consumeRateLimitBucket, currentPostgresClient, deleteRateLimitBucket, postgresConfigured, queryPostgres, withPostgresReadTransaction, withPostgresScopedTransaction, withPostgresTransaction } from './src/server/postgres-runtime.js';
 import { createStagingSession, isStagingSessionValid, STAGING_ACCESS_COOKIE, STAGING_SESSION_TTL_SECONDS, stagingPasswordMatches } from './src/server/staging-auth.js';
-import { deleteReferralTrackingForVisitor, loadNormalizedStore, persistNormalizedStore } from './src/server/postgres-store.js';
+import { capturePaymentStoreBaseline, deleteReferralTrackingForVisitor, loadNormalizedStore, persistNormalizedStore } from './src/server/postgres-store.js';
 import { loadPublicRuntimeSnapshot, loadPublicTrackRecord } from './src/server/public-read-repository.js';
 import { claimGuestConversations, findLoginAccount, loadClientDashboardData, loadConversationAssignees, loadConversationViews, loadCrmRecordsForViewer, loadCrmRelatedRows, loadEmployeeDashboardData, loadOrderManagerOrders, loadReferralEventsForUsers, loadSessionAccount, storeLoginSessionAndAudit } from './src/server/core-read-repository.js';
 import { changePostgresPassword, enablePostgresMfa, logoutPostgresSession, setupPostgresMfa } from './src/server/postgres-auth-repository.js';
@@ -28,6 +28,8 @@ import { createPostgresProjectRequest } from './src/server/postgres-project-requ
 import { updatePostgresEmployeePermissions } from './src/server/postgres-permission-repository.js';
 import { completePostgresPasswordResetEmail, consumePostgresPasswordReset, issuePostgresPasswordReset } from './src/server/postgres-password-recovery-repository.js';
 import { createPasswordResetUrl, passwordRecoveryEmailReady, passwordRecoveryFailureCode, passwordRecoveryMinimumResponseMs, sendPasswordRecoveryEmail, verifyPasswordRecoveryTransport } from './src/server/password-recovery-mailer.js';
+import { canUseDevelopmentManagerRoute, developmentAssignmentAllowed, developmentDeveloperView, developmentManagerIdentity, developmentManagerRole, developmentProjectAccessible, developmentProjectView, developmentStage, developmentTechnicalStages } from './src/server/development-management.js';
+import { loadDevelopmentManagement, saveDevelopmentEvents, saveDevelopmentMessage, saveDevelopmentProfile, saveDevelopmentProject, scopedDevelopmentProjectSql } from './src/server/development-management-repository.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const STAGING_MODE = process.env.ZEZO_STAGING === 'true';
@@ -50,12 +52,12 @@ const MAX_BODY = 6 * 1024 * 1024;
 const SESSION_TTL = 8 * 60 * 60 * 1000;
 const REFERRAL_ATTRIBUTION_COOKIE = 'zezo_referral_attribution';
 const REFERRAL_ATTRIBUTION_TTL_SECONDS = 30 * 24 * 60 * 60;
-const roles = ['admin', 'marketing_manager', 'hr_manager', 'order_manager', 'developer', 'marketer'];
+const roles = ['admin', 'marketing_manager', 'hr_manager', 'order_manager', 'developer', 'marketer', developmentManagerRole];
 const allRoles = [...roles, 'client'];
 const employeeRoles = ['marketer', 'developer'];
 const inviteableEmployeeRoles = ['marketer', 'developer', 'order_manager'];
 const managementRoles = ['admin', 'marketing_manager', 'hr_manager', 'order_manager'];
-const accountTypes = { employee:employeeRoles, management:managementRoles, client:['client'] };
+const accountTypes = { employee:employeeRoles, management:[...managementRoles, developmentManagerRole], client:['client'] };
 const permissionDefinitions = {
   'conversations.read': ['assigned','department','all'],
   'conversations.reply': ['assigned','department','all'],
@@ -110,6 +112,8 @@ const leadAttempts = new Map();
 const quoteAttempts = new Map();
 const clientRegistrationAttempts = new Map();
 const passwordResetAttempts = new Map();
+const developerMfaSetupAttempts = new Map();
+const developerMfaEnableAttempts = new Map();
 const conversationAttempts = new Map();
 
 const now = () => new Date().toISOString();
@@ -131,6 +135,10 @@ function setProjectStage(lead, stage, actor, note='', clientNote='') {
   if(lead.projectStage===stage&&!note&&!clientNote)return false;
   const at=now();lead.projectStage=stage;lead.projectHistory??=[];
   lead.projectHistory.push({stage,at,by:actor?.username||'system',note:clean(note,500),clientNote:clean(clientNote,500)});
+  if (actor?.role !== developmentManagerRole && (lead.developmentReview || stage === 'waiting_developer_acceptance')) {
+    lead.developmentReview ??= {};
+    lead.developmentReview.version = Number(lead.developmentReview.version || 0) + 1;
+  }
   if(stage==='in_progress'&&!lead.projectStartedAt)lead.projectStartedAt=at;
   if(stage==='delivered'&&!lead.projectDeliveredAt)lead.projectDeliveredAt=at;
   if(stage==='completed')lead.projectCompletedAt=at;
@@ -447,7 +455,7 @@ function audit(actor, action, target, detail = '') {
   store.audit = store.audit.slice(0, 500);
   emitAuditNotifications(entry,actor);
 }
-const notificationAllowedTabs={admin:['overview','requests','finance','referrals','ranks','withdrawals','team','marketing','crm','pricing','audit','conversations','permissions'],marketing_manager:['marketing','referrals','crm','conversations'],hr_manager:['people','referrals','conversations','orders'],order_manager:['conversations','orders'],marketer:['referral'],developer:['development','referral'],client:['orders','conversations']};
+const notificationAllowedTabs={admin:['overview','requests','finance','referrals','ranks','withdrawals','team','marketing','crm','pricing','audit','conversations','permissions'],marketing_manager:['marketing','referrals','crm','conversations'],hr_manager:['people','referrals','conversations','orders'],order_manager:['conversations','orders'],marketer:['referral'],developer:['development','referral'],client:['orders','conversations'],[developmentManagerRole]:['technical-requests']};
 function createNotification(userId,eventKey,{type='update',importance='normal',titleAr,titleEn,descriptionAr='',descriptionEn='',tab='',targetId='',targetKind=''}={}){
   if(!userId||!eventKey||!titleAr||!titleEn)return null;
   store.notifications??=[];
@@ -580,6 +588,26 @@ function notifyCurrentCommissions(lead){
   if(Number(lead.developerCommissionAmount||0)>0&&lead.developerUserId){const status=lead.developerCommissionStatus||'pending',amount=money(lead.developerCommissionAmount),key=`commission:${lead.id}:developer:${status}:${amount}`;notifyUser(lead.developerUserId,key,{type:'commission',importance:status==='confirmed'?'high':'normal',titleAr:status==='confirmed'?'استحقاق تنفيذ المشروع متاح':'تحدّث استحقاق تنفيذ المشروع',titleEn:status==='confirmed'?'Project execution entitlement is available':'Project execution entitlement updated',descriptionAr:'هذا الاستحقاق منفصل عن عمولة التسويق ويظهر في محفظة التنفيذ.',descriptionEn:'This entitlement is separate from marketing commission and appears in your execution wallet.'},{tab:'development',targetId:lead.id,targetKind:'lead'});}
 }
 function safeNotification(row){return {id:row.id,type:row.type,importance:row.importance,titleAr:row.titleAr,titleEn:row.titleEn,descriptionAr:row.descriptionAr,descriptionEn:row.descriptionEn,createdAt:row.createdAt,readAt:row.readAt||'',target:{tab:row.target?.tab||'',id:row.target?.id||'',kind:row.target?.kind||''}};}
+function canReadNotification(user, row) {
+  if (row.userId !== user.id) return false;
+  if (user.role !== developmentManagerRole) return true;
+  return row.eventKey?.startsWith('development-manager:') && developmentProjectAccessible(store.leads.find(lead => lead.id === row.target?.id), user.id);
+}
+function developmentNotificationScope(user, params) {
+  if (user.role !== developmentManagerRole) return 'TRUE';
+  const stages = `$${params.push(developmentTechnicalStages)}`;
+  return `(system_notifications.data->>'eventKey' LIKE 'development-manager:%' AND EXISTS (
+    SELECT 1 FROM project_requests project
+    WHERE project.id = system_notifications.data->'target'->>'id'
+      AND ${scopedDevelopmentProjectSql('project', 'system_notifications."userId"', stages)}
+  ))`;
+}
+async function countUnreadPostgresNotifications(client, user) {
+  const params = [user.id];
+  const scope = developmentNotificationScope(user, params);
+  const unread = await client.query(`SELECT COUNT(*)::int AS count FROM system_notifications WHERE "userId" = $1 AND "readAt" IS NULL AND ${scope}`, params);
+  return Number(unread.rows[0]?.count || 0);
+}
 function ownerDecisionsFor(){
   const decisions=[];
   for(const request of store.rankRequests.filter(row=>row.status==='pending')){const user=store.users.find(row=>row.id===request.userId);decisions.push({id:request.id,type:'rank',titleAr:`ترقية ${user?.name||'مسوّق'}`,titleEn:`Promote ${user?.name||'marketer'}`,descriptionAr:`${marketerRankTitles[request.targetRank]} · ${request.salesAtRequest}/${request.threshold} مبيعات مؤهلة`,descriptionEn:`${marketerRankTitles[request.targetRank]} · ${request.salesAtRequest}/${request.threshold} qualified sales`,createdAt:request.createdAt,target:{tab:'ranks',id:request.id,kind:'rank_request'}});}
@@ -814,14 +842,14 @@ async function processMailQueue() {
   }
   return undefined;
 }
-async function queueMail({ to = '', recipientType = 'direct', subject, text, kind, eventKey = '', expiresAt }) {
+async function queueMail({ to = '', recipientType = 'direct', subject, text, kind, eventKey = '', expiresAt, persistImmediately = true }) {
   const safeText=String(text??'').replace(/\r\n?/g,'\n').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g,'').trim().slice(0,6000);
   const mailId = eventKey ? `mail_${hash(eventKey).slice(0, 40)}` : id('mail');
   const prior = eventKey ? store.mailQueue.find(row => row.id === mailId) : null;
   if (prior) return prior;
   const item = { id: mailId, createdAt: now(), kind: clean(kind, 50), to: clean(to, 150), recipientType, subject: clean(subject, 180), text: safeText, state: 'pending', attempts: 0, lastError: '', ...(expiresAt ? { expiresAt } : {}) };
   store.mailQueue.unshift(item); store.mailQueue = store.mailQueue.slice(0, 1000);
-  await persist();
+  if (persistImmediately) await persist();
   // PostgreSQL deployments use the separately supervised durable worker; do not
   // send inside the request transaction or rely on a serverless timer.
   if (!postgresConfigured()) void processMailQueue();
@@ -899,7 +927,7 @@ function requireAuth(req, res, allowed = allRoles) {
   const route = new URL(req.url, 'http://localhost').pathname;
   if (auth.user.mustChangePassword && !['/api/auth/password','/api/auth/logout'].includes(route)) { json(res, 428, { error:'غيّر كلمة المرور المؤقتة أولاً / Change the temporary password first', mustChangePassword:true }); return null; }
   if (sensitiveManagementRole(auth.user.role) && !auth.user.mfaEnabledAt && !['/api/auth/mfa/setup','/api/auth/mfa/enable','/api/auth/password','/api/auth/logout'].includes(route)) { json(res, 428, { error:'أكمل إعداد التحقق بخطوتين قبل استخدام مساحة الإدارة / Complete two-step verification setup before using the management workspace', mfaSetupRequired:true }); return null; }
-  if (!allowed.includes(auth.user.role)) { json(res, 403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }); return null; }
+  if (!allowed.includes(auth.user.role) || (auth.user.role === developmentManagerRole && !canUseDevelopmentManagerRoute(route))) { json(res, 403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }); return null; }
   return auth;
 }
 async function directPostgresSessionUser(req) {
@@ -917,7 +945,7 @@ function directRequireAuth(req, res, user, allowed = allRoles) {
   if (sensitiveManagementRole(user.role) && !user.mfaEnabledAt && !['/api/auth/mfa/setup','/api/auth/mfa/enable','/api/auth/password','/api/auth/logout'].includes(route)) {
     json(res, 428, { error: 'أكمل إعداد التحقق بخطوتين قبل استخدام مساحة الإدارة / Complete two-step verification setup before using the management workspace', mfaSetupRequired: true }, responseSecurityHeaders()); return false;
   }
-  if (!allowed.includes(user.role)) { json(res, 403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }, responseSecurityHeaders()); return false; }
+  if (!allowed.includes(user.role) || (user.role === developmentManagerRole && !canUseDevelopmentManagerRoute(route))) { json(res, 403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }, responseSecurityHeaders()); return false; }
   return true;
 }
 function directCrmAggregate(records, events, { from = '', to = '', service = '' } = {}) {
@@ -1229,6 +1257,10 @@ async function handlePostgresCoreRead(req, res, path) {
     const username = clean(body.username, 40).toLowerCase();
     const email = normalizeEmail(body.email);
     const role = clean(body.role, 40);
+    if (role === developmentManagerRole && auth.user.role !== 'admin') {
+      json(res, 403, { error: 'تعيين مسؤول المبرمجين متاح للمالك فقط / Only the Owner can grant the Development Manager role' }, security);
+      return true;
+    }
     if (!roles.includes(role) || (role === 'admin' && auth.user.role !== 'admin') || name.length < 2 ||
         !/^[a-z0-9._-]{3,40}$/.test(username) || !/^\S+@\S+\.\S+$/.test(email)) {
       json(res, 400, { error: 'بيانات الموظف غير مكتملة أو الدور غير مسموح / Invalid employee details or role' }, security);
@@ -1311,7 +1343,7 @@ async function handlePostgresCoreRead(req, res, path) {
     if (!user || !passwordMatches(String(body.password || ''), user) || !accountTypes[body.accountType]?.includes(user.role)) {
       json(res, 401, { error: 'اسم المستخدم أو كلمة المرور غير صحيحة لهذا النوع من الدخول / Incorrect username or password for this sign-in type' }, security); return true;
     }
-    if (sensitiveManagementRole(user.role) && user.mfaEnabledAt && !validTotp(user.mfaSecret, body.mfaCode)) {
+    if (user.role !== 'client' && user.mfaEnabledAt && !validTotp(user.mfaSecret, body.mfaCode)) {
       json(res, 401, { error: 'أدخل رمز تطبيق المصادقة الحالي / Enter the current authenticator code', mfaRequired: true }, security); return true;
     }
     const sid = token(), at = now(), expiresAt = new Date(Date.now() + SESSION_TTL);
@@ -1342,11 +1374,24 @@ async function handlePostgresCoreRead(req, res, path) {
     return true;
   }
 
-  if (req.method === 'GET' && path === '/api/auth/mfa/setup') {
+  if (['GET', 'POST'].includes(req.method) && path === '/api/auth/mfa/setup') {
     const auth = await directPostgresSessionUser(req);
-    if (!directRequireAuth(req, res, auth?.user, ['admin', 'marketing_manager', 'hr_manager', 'order_manager'])) return true;
-    const result = await setupPostgresMfa({ sessionHash: sessionKey(auth.sid), userId: auth.user.id, proposedSecret: base32Encode(randomBytes(20)) });
+    const developerSetup = req.method === 'POST';
+    if (!directRequireAuth(req, res, auth?.user, developerSetup ? ['developer'] : mandatoryMfaRoles)) return true;
+    let currentPassword;
+    if (developerSetup) {
+      if (!await consumeRateLimitBucket('developer-mfa-setup', auth.user.id, 8, 15 * 60_000)) {
+        json(res, 429, { error: 'جرّب مجدداً بعد 15 دقيقة / Try again in 15 minutes' }, security); return true;
+      }
+      const body = await jsonBody(req);
+      currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword.slice(0, 201) : '';
+    }
+    const result = await setupPostgresMfa({
+      sessionHash: sessionKey(auth.sid), userId: auth.user.id, proposedSecret: base32Encode(randomBytes(20)),
+      currentPassword, verifyPassword: developerSetup ? passwordMatches : undefined
+    });
     if (result.kind === 'unauthenticated') json(res, 401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' }, security);
+    else if (result.kind === 'invalid_current_password') json(res, 401, { error: 'كلمة المرور الحالية غير صحيحة / Current password is incorrect' }, security);
     else if (result.kind === 'already_enabled') json(res, 409, { error: 'التحقق بخطوتين مفعّل مسبقاً / Two-step verification is already enabled' }, security);
     else {
       const issuer = 'ZEZO Forge';
@@ -1359,7 +1404,10 @@ async function handlePostgresCoreRead(req, res, path) {
 
   if (req.method === 'POST' && path === '/api/auth/mfa/enable') {
     const auth = await directPostgresSessionUser(req);
-    if (!directRequireAuth(req, res, auth?.user, ['admin', 'marketing_manager', 'hr_manager', 'order_manager'])) return true;
+    if (!directRequireAuth(req, res, auth?.user, mfaEnrollmentRoles)) return true;
+    if (auth.user.role === 'developer' && !await consumeRateLimitBucket('developer-mfa-enable', auth.user.id, 8, 15 * 60_000)) {
+      json(res, 429, { error: 'جرّب مجدداً بعد 15 دقيقة / Try again in 15 minutes' }, security); return true;
+    }
     const body = await jsonBody(req);
     const result = await enablePostgresMfa({
       sessionHash: sessionKey(auth.sid), userId: auth.user.id, code: body.code,
@@ -1406,16 +1454,18 @@ async function handlePostgresCoreRead(req, res, path) {
       return true;
     }
     const result = await withPostgresScopedTransaction(async client => {
-      const snapshot = await loadNotificationDeadlineSnapshot(client);
-      const beforeIds = new Set(snapshot.notifications.map(row => row.id));
-      const previousStore = store;
       let generated = [];
-      try {
-        store = snapshot;
-        emitDeadlineNotifications();
-        generated = store.notifications.filter(row => !beforeIds.has(row.id));
-      } finally {
-        store = previousStore;
+      if (auth.user.role !== developmentManagerRole) {
+        const snapshot = await loadNotificationDeadlineSnapshot(client);
+        const beforeIds = new Set(snapshot.notifications.map(row => row.id));
+        const previousStore = store;
+        try {
+          store = snapshot;
+          emitDeadlineNotifications();
+          generated = store.notifications.filter(row => !beforeIds.has(row.id));
+        } finally {
+          store = previousStore;
+        }
       }
 
       if (generated.length) {
@@ -1437,15 +1487,15 @@ async function handlePostgresCoreRead(req, res, path) {
         }
       }
 
-      const conditions = ['"userId" = $1'];
       const values = [auth.user.id];
+      const conditions = ['"userId" = $1', developmentNotificationScope(auth.user, values)];
       const addFilter = (condition, value) => { values.push(value); conditions.push(condition.replace('?', `$${values.length}`)); };
       if (type) addFilter('type = ?', type);
       if (status === 'read') conditions.push('"readAt" IS NOT NULL');
       if (status === 'unread') conditions.push('"readAt" IS NULL');
       if (from) addFilter('"createdAt" >= ?', new Date(`${from}T00:00:00.000Z`));
       if (to) addFilter('"createdAt" <= ?', new Date(`${to}T23:59:59.999Z`));
-      const unread = await client.query('SELECT COUNT(*)::int AS count FROM system_notifications WHERE "userId" = $1 AND "readAt" IS NULL', [auth.user.id]);
+      const unreadCount = await countUnreadPostgresNotifications(client, auth.user);
       values.push(limit);
       const rows = await client.query(`
         SELECT id, type, "readAt", data, "createdAt"
@@ -1460,7 +1510,7 @@ async function handlePostgresCoreRead(req, res, path) {
         readAt: row.readAt ? new Date(row.readAt).toISOString() : '',
         createdAt: new Date(row.createdAt).toISOString()
       }));
-      return { notifications, unreadCount: Number(unread.rows[0]?.count || 0) };
+      return { notifications, unreadCount };
     });
     json(res, 200, { ...result, authenticated: true, emailReady: emailReady() && adminEmailReady() }, security);
     return true;
@@ -1473,7 +1523,9 @@ async function handlePostgresCoreRead(req, res, path) {
     if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
     const notificationId = clean(path.split('/').at(-1), 100);
     const result = await withPostgresScopedTransaction(async client => {
-      const selected = await client.query('SELECT id, "userId", type, "readAt", data, "createdAt" FROM system_notifications WHERE id = $1 AND "userId" = $2 FOR UPDATE', [notificationId, auth.user.id]);
+      const params = [notificationId, auth.user.id];
+      const scope = developmentNotificationScope(auth.user, params);
+      const selected = await client.query(`SELECT id, "userId", type, "readAt", data, "createdAt" FROM system_notifications WHERE id = $1 AND "userId" = $2 AND ${scope} FOR UPDATE OF system_notifications`, params);
       if (!selected.rowCount) return null;
       let row = selected.rows[0];
       if (!row.readAt) {
@@ -1486,10 +1538,9 @@ async function handlePostgresCoreRead(req, res, path) {
         `, [notificationId, auth.user.id, at]);
         row = updated.rows[0];
       }
-      const unread = await client.query('SELECT COUNT(*)::int AS count FROM system_notifications WHERE "userId" = $1 AND "readAt" IS NULL', [auth.user.id]);
       return {
         notification: safeNotification({ ...(row.data || {}), id: row.id, type: row.type || row.data?.type || '', readAt: row.readAt ? new Date(row.readAt).toISOString() : '', createdAt: new Date(row.createdAt).toISOString() }),
-        unreadCount: Number(unread.rows[0]?.count || 0)
+        unreadCount: await countUnreadPostgresNotifications(client, auth.user)
       };
     });
     if (!result) { json(res, 404, { error: 'الإشعار غير موجود / Notification not found' }, security); return true; }
@@ -1501,11 +1552,13 @@ async function handlePostgresCoreRead(req, res, path) {
     const auth = await directPostgresSessionUser(req);
     if (!auth) { json(res, 401, { error: 'سجّل الدخول للمتابعة / Please sign in to continue' }, security); return true; }
     if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
+    const params = [auth.user.id];
+    const scope = developmentNotificationScope(auth.user, params);
     await withPostgresScopedTransaction(client => client.query(`
       UPDATE system_notifications
       SET "readAt" = NOW(), data = jsonb_set(data, '{readAt}', to_jsonb(NOW()::text), TRUE)
-      WHERE "userId" = $1 AND "readAt" IS NULL
-    `, [auth.user.id]));
+      WHERE "userId" = $1 AND "readAt" IS NULL AND ${scope}
+    `, params));
     json(res, 200, { ok: true, unreadCount: 0 }, security);
     return true;
   }
@@ -1686,7 +1739,12 @@ async function handlePostgresCoreRead(req, res, path) {
       json(res, 401, { error: 'سجّل الدخول للمتابعة / Please sign in to continue' }, security);
       return true;
     }
-    if (auth?.user.role === 'client') {
+    if (auth.user.role === developmentManagerRole) {
+      if (!directRequireAuth(req, res, auth.user, [developmentManagerRole])) return true;
+      json(res, 200, { role: developmentManagerRole, user: developmentManagerIdentity(auth.user) }, security);
+      return true;
+    }
+    if (auth.user.role === 'client') {
       if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
       const guest = guestSessionValue(req);
       if (guest) await claimGuestConversations(auth.user.id, hash(guest), now());
@@ -1904,14 +1962,17 @@ function validTotp(secret,code){
   if(!secret||!/^\d{6}$/.test(String(code||'')))return false;const current=Math.floor(Date.now()/30_000),candidate=Buffer.from(String(code));
   for(let drift=-1;drift<=1;drift++){const expected=Buffer.from(totpCode(secret,current+drift));if(candidate.length===expected.length&&timingSafeEqual(candidate,expected))return true;}return false;
 }
-const sensitiveManagementRole=role=>['admin','marketing_manager','hr_manager','order_manager'].includes(role);
+const mandatoryMfaRoles = ['admin', 'marketing_manager', 'hr_manager', 'order_manager', developmentManagerRole];
+const mfaEnrollmentRoles = [...mandatoryMfaRoles, 'developer'];
+const sensitiveManagementRole = role => mandatoryMfaRoles.includes(role);
 function effectivePermission(user,key){
   if(user?.role==='admin')return 'all';
+  if(user?.role===developmentManagerRole)return 'none';
   const value=user?.permissionOverrides&&Object.hasOwn(user.permissionOverrides,key)?user.permissionOverrides[key]:defaultRolePermissions[user?.role]?.[key];
   if(value===true)return 'all';if(value===false||value==null)return 'none';return String(value);
 }
 function permissionEnabled(user,key){return user?.role==='admin'||Boolean(permissionDefinitions[key]?.includes(effectivePermission(user,key)));}
-function roleDepartment(role){return role==='order_manager'?'orders':role==='hr_manager'?'people':role==='marketing_manager'||role==='marketer'?'marketing':role==='developer'?'development':'';}
+function roleDepartment(role){return role==='order_manager'?'orders':role==='hr_manager'?'people':role==='marketing_manager'||role==='marketer'?'marketing':role==='developer'||role===developmentManagerRole?'development':'';}
 function hasPermission(user,key,resource={}){
   if(user?.role==='admin')return true;
   const scope=effectivePermission(user,key);if(!permissionDefinitions[key]?.includes(scope))return false;
@@ -1964,7 +2025,7 @@ function validTemporaryPassword(value) { return typeof value === 'string' && val
 const rateLimitNames = new Map([
   [stagingLoginAttempts, 'staging-login'], [loginAttempts, 'login'], [leadAttempts, 'public-enquiry'],
   [quoteAttempts, 'quote'], [clientRegistrationAttempts, 'client-registration'], [passwordResetAttempts, 'password-reset'],
-  [conversationAttempts, 'conversation']
+  [conversationAttempts, 'conversation'], [developerMfaSetupAttempts, 'developer-mfa-setup'], [developerMfaEnableAttempts, 'developer-mfa-enable']
 ]);
 async function postgresRateAllowed(bucket, key, max, windowMs) {
   const client = currentPostgresClient();
@@ -2084,8 +2145,8 @@ function syncAllRankRequests() {
   for (const user of store.users) { const request = syncRankRequest(user); if (request) created.push(request); }
   return created;
 }
-async function queueRankRequestMail(request) {
-  await queueMail({ recipientType:'admin', kind:'rank_promotion_requested', subject:`طلب ترقية مسوّق — ${request.name}`, text:`بلغ المسوّق ${request.name} مستوى ${marketerRankTitles[request.targetRank]}\nالرتبة الحالية: ${marketerRankTitles[request.fromRank]}\nالمبيعات المؤهلة مدى الحياة: ${request.salesAtRequest}\nالحد المطلوب: ${request.threshold}\nراجع الطلب واتخذ قرار الموافقة أو الرفض من لوحة ZEZO.` });
+async function queueRankRequestMail(request, { persistImmediately = true } = {}) {
+  await queueMail({ recipientType:'admin', kind:'rank_promotion_requested', subject:`طلب ترقية مسوّق — ${request.name}`, text:`بلغ المسوّق ${request.name} مستوى ${marketerRankTitles[request.targetRank]}\nالرتبة الحالية: ${marketerRankTitles[request.fromRank]}\nالمبيعات المؤهلة مدى الحياة: ${request.salesAtRequest}\nالحد المطلوب: ${request.threshold}\nراجع الطلب واتخذ قرار الموافقة أو الرفض من لوحة ZEZO.`, persistImmediately });
 }
 function safeLead(lead, revealContact = false) {
   return {
@@ -2225,6 +2286,7 @@ function walletFor(userId){
     ledger:store.financeLedger.filter(row=>row.employeeId===userId&&row.type.startsWith('commission_')).slice(0,80).map(row=>({id:row.id,postedAt:row.postedAt,leadId:row.leadId,type:row.type,commissionKind:row.commissionKind,amount:fromCents(row.amountCents),currency:row.currency,status:row.statusSnapshot}))};
 }
 function dashboardFor(user) {
+  if (user.role === developmentManagerRole) return { role: developmentManagerRole, user: developmentManagerIdentity(user) };
   const allLeads = store.leads;
   if (user.role === 'admin') return {
     role: user.role, user: publicUser(user), currentPermissions:Object.fromEntries(Object.keys(permissionDefinitions).map(key=>[key,effectivePermission(user,key)])), summary: { leads: allLeads.length, open: allLeads.filter(l => !['completed','cancelled'].includes(l.status)).length, paid: money(allLeads.reduce((n,l) => n + l.paidTotal, 0)), employees: store.users.filter(u=>roles.includes(u.role)&&u.role!=='admin').length, commissionPending: money(allLeads.reduce((n,l)=>n+Number(l.commissionAmount||0)+Number(l.developerCommissionAmount||0),0)), visits: new Set(store.referralEvents.filter(event=>event.type==='visit'&&!event.reversedAt).map(event=>event.visitorHash).filter(Boolean)).size, withdrawals: store.withdrawals.filter(w=>['pending','under_review','approved','awaiting_transfer'].includes(w.status)).length },
@@ -2305,7 +2367,7 @@ function updateCommission(lead) {
 }
 function outstandingCommission(lead) { return money(Math.max(0, Number(lead.commissionAmount || 0) - Number(lead.commissionPaidAmount || 0))); }
 function outstandingCommissionDebt(userId) { return money(store.leads.filter(l=>l.referralUserId===userId).reduce((sum,l)=>sum+Number(l.commissionDebtRemaining||0),0)); }
-function cancelWithdrawalForLead(lead, actor = null) {
+function cancelWithdrawalForLead(lead, actor = null, { persistMailImmediately = true } = {}) {
   const withdrawalIds=new Set([lead.withdrawalId,lead.developerWithdrawalId].filter(Boolean));
   for(const withdrawal of store.withdrawals){
     if(!activeWithdrawalStatuses.has(withdrawal.status))continue;
@@ -2318,7 +2380,7 @@ function cancelWithdrawalForLead(lead, actor = null) {
     for(const item of withdrawal.commissionItems||[]){const reserved=store.leads.find(l=>l.id===item.leadId);if(!reserved)continue;if(item.kind==='developer'&&reserved.developerWithdrawalId===withdrawal.id)delete reserved.developerWithdrawalId;if(item.kind!=='developer'&&reserved.withdrawalId===withdrawal.id)delete reserved.withdrawalId;}
     audit(actor,'withdrawal_cancelled',withdrawal.id,'Related project was refunded or cancelled');
     appendFinanceEntry({idempotencyKey:`withdrawal:${withdrawal.id}:released`,type:'withdrawal_released',employeeId:withdrawal.userId,withdrawalId:withdrawal.id,amountCents:cents(withdrawal.amount),statusSnapshot:'rejected',actor:actor?.username||'system',note:'Related project refunded or cancelled'});
-    if(withdrawal.email)void queueMail({to:withdrawal.email,kind:'withdrawal_cancelled',subject:'تحديث طلب السحب لدى ZEZO',text:`مرحباً ${withdrawal.name}، أُلغي طلب السحب رقم ${withdrawal.id} بعد تعديل مالي على أحد المشاريع المرتبطة به. راجع رصيدك وقدم طلباً جديداً عند توفر الرصيد.`});
+    if(withdrawal.email)void queueMail({to:withdrawal.email,kind:'withdrawal_cancelled',subject:'تحديث طلب السحب لدى ZEZO',text:`مرحباً ${withdrawal.name}، أُلغي طلب السحب رقم ${withdrawal.id} بعد تعديل مالي على أحد المشاريع المرتبطة به. راجع رصيدك وقدم طلباً جديداً عند توفر الرصيد.`,persistImmediately:persistMailImmediately});
   }
 }
 
@@ -2725,13 +2787,16 @@ async function handlePostgresCoreWrite(req, res, path) {
     applyChanges: ({ actor, target }) => {
       const nextRole = body.role === undefined ? target.role : clean(body.role, 40);
       if (!roles.includes(nextRole) || nextRole === 'admin') return { kind: 'invalid_role' };
+      if (nextRole === developmentManagerRole && target.role === 'client') return { kind: 'invalid_role' };
       if (changes !== undefined && (!changes || typeof changes !== 'object' || Array.isArray(changes))) return { kind: 'invalid_permissions' };
-      const overrides = { ...(target.permissionOverrides || {}) };
+      if (nextRole === developmentManagerRole && Object.values(changes || {}).some(value => value !== null && value !== 'default' && value !== 'none')) return { kind: 'fixed_permissions' };
+      const fixedScope = nextRole === developmentManagerRole || target.role === developmentManagerRole;
+      const overrides = fixedScope ? {} : { ...(target.permissionOverrides || {}) };
       for (const [key, value] of Object.entries(changes || {})) {
         if (!Object.hasOwn(permissionDefinitions, key)) return { kind: 'unknown_permission', key };
         if (value === null || value === 'default') { delete overrides[key]; continue; }
         if (value !== 'none' && !permissionDefinitions[key].includes(value)) return { kind: 'invalid_scope', key };
-        overrides[key] = value;
+        if (!fixedScope) overrides[key] = value;
       }
       const before = { role: target.role, active: target.active, permissionOverrides: target.permissionOverrides || {} };
       target.role = nextRole;
@@ -2753,6 +2818,7 @@ async function handlePostgresCoreWrite(req, res, path) {
   if (result.kind === 'owner_protected') return respond(409, { error: 'حساب المالك محمي من تغيير الدور أو الصلاحيات من لوحة التفويض / Owner account is protected from permission changes here' }, security);
   if (result.kind === 'invalid_role') return respond(400, { error: 'اختر دور موظف صالحاً؛ تعيين Owner يحتاج دعوة مالك منفصلة / Choose a valid employee role; Owner accounts require a separate owner invitation' }, security);
   if (result.kind === 'invalid_permissions') return respond(400, { error: 'صيغة الصلاحيات غير صالحة / Invalid permission settings' }, security);
+  if (result.kind === 'fixed_permissions') return respond(403, { error: 'صلاحيات مسؤول المبرمجين محددة بنطاق المشاريع التقنية / Development Manager access is fixed to scoped technical projects' }, security);
   if (result.kind === 'unknown_permission') return respond(400, { error: `صلاحية غير معروفة / Unknown permission: ${result.key}` }, security);
   if (result.kind === 'invalid_scope') return respond(400, { error: `نطاق غير مسموح / Unsupported scope for ${result.key}` }, security);
   const target = result.target;
@@ -2833,6 +2899,314 @@ async function handlePostgresInvitationWrite(req, res, path) {
   if (result.kind === 'recently_reissued') return respond(409, { error: 'تم إصدار رابط جديد خلال آخر دقيقة. انتظر دقيقة ثم أعد الإصدار إذا لم يظهر الرابط / A link was issued within the last minute. Wait one minute before reissuing if it is not visible' });
   if (result.kind === 'duplicate') return respond(409, { error: 'تعذر تدوير رابط الدعوة بسبب تعارض. حدّث القائمة وحاول مرة واحدة / Invitation link rotation conflicted. Refresh the list and retry once' });
   return respond(200, { ok: true, user: publicUser(result.employee), activationToken: activation, expiresInHours: 24, emailQueued: emailReady() });
+}
+
+function projectDevelopmentConversations(lead, conversations) {
+  if (!lead.clientId || lead.developmentReview?.allowCustomerConversation !== true) return [];
+  return conversations.filter(conversation => conversation.leadId === lead.id && conversation.clientId === lead.clientId &&
+    ['orders', 'development'].includes(conversation.department || 'orders'));
+}
+
+function visibleDevelopmentMessages(conversation) {
+  return (conversation.messages || []).filter(message => ['client', 'staff'].includes(message.senderType) &&
+    !message.internal && ['public', 'customer', undefined, null].includes(message.visibility));
+}
+
+function developmentConversationView(conversation) {
+  let index = 0;
+  return {
+    id: conversation.id, status: conversation.status,
+    messages: visibleDevelopmentMessages(conversation).map(message => ({
+      id: message.id, senderType: message.senderType, text: message.text, createdAt: message.createdAt,
+      attachments: (message.attachments || []).map(file => ({ index: index++, name: file.originalName, size: file.size }))
+    }))
+  };
+}
+
+function developmentTags(value) {
+  if (!Array.isArray(value) || value.length > 20 || value.some(item => typeof item !== 'string')) return null;
+  return [...new Set(value.map(tag => clean(tag, 60)).filter(Boolean))];
+}
+
+function developmentWorkspace(user, leads, users, payments, workload = leads) {
+  const projects = leads.filter(lead => user.role === 'admin' || developmentProjectAccessible(lead, user.id));
+  return {
+    user: developmentManagerIdentity(user),
+    projects: projects.map(lead => developmentProjectView(lead, payments)),
+    developers: users.filter(account => account.role === 'developer').map(account => developmentDeveloperView(account, workload, now().slice(0, 10))),
+    ...(user.role === 'admin' ? { managers: users.filter(account => account.role === developmentManagerRole).map(account => ({
+      id: account.id, name: account.name, username: account.username, active: account.active && !account.accountDisabledAt
+    })) } : {})
+  };
+}
+
+const developmentProfileRoute = /^\/api\/development-manager\/developers\/([^/]+)\/profile$/;
+const developmentProjectRoute = /^\/api\/development-manager\/projects\/([^/]+)(?:\/(review|assignment|delegation|conversation|files\/(\d+)|customer-files\/(\d+)|conversation\/([^/]+)\/files\/(\d+)))?$/;
+const developmentRequestFields = {
+  profile: ['specialties', 'skills', 'availability', 'professionalContact', 'notes'],
+  delegation: ['managerId', 'allowCustomerConversation', 'technicalRequirements', 'version'],
+  review: ['category', 'complexity', 'skills', 'estimateDays', 'priority', 'note', 'updateRequest', 'escalatedIssue', 'requestRevision', 'inReview', 'version'],
+  assignment: ['developerId', 'dueAt', 'note', 'reason', 'version'],
+  conversation: ['conversationId', 'message']
+};
+const validDevelopmentBody = (body, action) => body && typeof body === 'object' && !Array.isArray(body) &&
+  Object.keys(body).every(key => developmentRequestFields[action].includes(key));
+
+function developmentRequestOriginAllowed(req) {
+  if (req.headers['sec-fetch-site'] === 'cross-site') return false;
+  const origin = req.headers.origin;
+  return !origin || origin === `${requestIsSecure(req) ? 'https' : 'http'}://${String(req.headers.host || '').toLowerCase()}`;
+}
+
+async function handleDevelopmentManager(req, res, path, security, postgres = null) {
+  const respond = (status, body) => json(res, status, body, { ...security, 'Cache-Control': 'private, no-store' });
+  const workspace = req.method === 'GET' && path === '/api/development-manager';
+  const profileMatch = developmentProfileRoute.exec(path);
+  const match = developmentProjectRoute.exec(path);
+  if (!workspace && !profileMatch && !match) return respond(404, { error: 'المسار غير موجود / Route not found' });
+  const [, projectId, action = '', fileIndex, customerFileIndex, conversationId, conversationFileIndex] = match || [];
+  const allowed = profileMatch || action === 'delegation' ? ['admin'] : ['admin', developmentManagerRole];
+  const auth = postgres ? postgres.auth : requireAuth(req, res, allowed);
+  if (postgres && !directRequireAuth(req, res, auth?.user, allowed)) return;
+  if (!auth) return;
+  const { user } = auth;
+  const client = postgres?.client;
+  const data = client ? await loadDevelopmentManagement(client, {
+    user, projectId, workspace, action: profileMatch ? 'profile' : action, write: req.method !== 'GET'
+  }) : store;
+  const { leads, users, payments, conversations, workload = leads } = data;
+  const audits = [];
+  const notifications = [];
+  const recordAudit = (event, target, detail = '') => {
+    if (!client) return audit(user, event, target, detail);
+    audits.push({ id: id('evt'), at: now(), actor: user.username, actorId: user.id, role: user.role, action: event, target, detail: clean(detail, 1600) });
+  };
+  const recordNotification = (userId, eventKey, copy, options) => {
+    if (!userId) return;
+    if (!client) return notifyUser(userId, eventKey, copy, options);
+    notifications.push({
+      id: `ntf_${hash(`${userId}:${eventKey}`).slice(0, 40)}`, userId, eventKey, ...copy,
+      descriptionAr: clean(copy.descriptionAr, 320), descriptionEn: clean(copy.descriptionEn, 320),
+      createdAt: now(), readAt: '', target: { tab: options.tab, id: options.targetId, kind: options.targetKind }
+    });
+  };
+  const notifyDevelopmentUser = (userId, lead, key, titleAr, titleEn, descriptionAr, descriptionEn, tab) =>
+    recordNotification(userId, `development-manager:${lead.id}:${key}`, { type: 'project', importance: 'high', titleAr, titleEn, descriptionAr, descriptionEn },
+      { tab, targetId: lead.id, targetKind: 'lead' });
+
+  if (workspace) return respond(200, developmentWorkspace(user, leads, users, payments, workload));
+
+  if (profileMatch && req.method === 'PATCH') {
+    const developer = users.find(account => account.role === 'developer' && account.id === profileMatch[1]);
+    if (!developer) return respond(404, { error: 'المبرمج غير موجود / Developer not found' });
+    const body = postgres ? postgres.body : await jsonBody(req, 32_768);
+    if (!validDevelopmentBody(body, 'profile')) return respond(400, { error: 'حقول الملف المهني غير صالحة / Invalid professional profile fields' });
+    const profile = { ...developer.developmentProfile };
+    for (const field of ['specialties', 'skills']) {
+      if (body[field] === undefined) continue;
+      const tags = developmentTags(body[field]);
+      if (!tags) return respond(400, { error: 'أدخل قائمة مهارات وتخصصات صالحة / Enter a valid skills and specialties list' });
+      profile[field] = tags;
+    }
+    if (body.availability !== undefined) {
+      if (!['', 'available', 'busy', 'unavailable'].includes(body.availability)) return respond(400, { error: 'حالة التوفر غير صالحة / Invalid availability' });
+      profile.availability = body.availability;
+    }
+    if (body.professionalContact !== undefined) profile.professionalContact = clean(body.professionalContact, 200);
+    if (body.notes !== undefined) profile.notes = clean(body.notes, 1000);
+    developer.developmentProfile = profile;
+    recordAudit('development_profile_updated', developer.id);
+    if (client) {
+      await saveDevelopmentProfile(client, developer, now());
+      await saveDevelopmentEvents(client, audits, notifications);
+    } else await persist();
+    return respond(200, { developer: developmentDeveloperView(developer, workload, now().slice(0, 10)) });
+  }
+
+  if (!match) return respond(405, { error: 'الإجراء غير مدعوم / Unsupported action' });
+  const lead = leads.find(project => project.id === projectId);
+  if (!lead || (user.role !== 'admin' && !developmentProjectAccessible(lead, user.id))) {
+    return respond(404, { error: 'المشروع غير موجود ضمن نطاقك / Project not found in your scope' });
+  }
+
+  if (req.method === 'GET') {
+    if (!action) return respond(200, { project: developmentProjectView(lead, payments) });
+    if (action === 'conversation') {
+      if (lead.developmentReview?.allowCustomerConversation !== true) return respond(403, { error: 'يجب أن يفوّض المالك هذه المحادثة / The Owner must authorize this conversation' });
+      return respond(200, { conversations: projectDevelopmentConversations(lead, conversations).map(developmentConversationView) });
+    }
+    let file;
+    if (fileIndex !== undefined) file = lead.developerAttachments?.[Number(fileIndex)];
+    if (customerFileIndex !== undefined && lead.developmentReview?.allowCustomerConversation === true) file = lead.attachments?.[Number(customerFileIndex)];
+    if (conversationFileIndex !== undefined) {
+      const conversation = projectDevelopmentConversations(lead, conversations).find(row => row.id === conversationId);
+      if (conversation) file = visibleDevelopmentMessages(conversation).flatMap(message => message.attachments || [])[Number(conversationFileIndex)];
+    }
+    if (file) return serveUpload(res, file, security);
+    return respond(404, { error: 'الملف غير موجود ضمن نطاقك / File not found in your scope' });
+  }
+
+  const requestMethod = { review: 'PATCH', assignment: 'POST', delegation: 'PATCH', conversation: 'POST' }[action];
+  if (req.method !== requestMethod) return respond(405, { error: 'الإجراء غير مدعوم / Unsupported action' });
+  const body = postgres ? postgres.body : await jsonBody(req, 32_768);
+  if (!validDevelopmentBody(body, action)) return respond(400, { error: 'الحقول المرسلة غير متاحة لهذا الإجراء / These fields are not allowed for this action' });
+  const at = now();
+  if (action === 'conversation') {
+    const scoped = projectDevelopmentConversations(lead, conversations);
+    const conversation = scoped.find(row => row.id === body.conversationId);
+    if (!conversation) return respond(404, { error: 'لم يفوّض المالك هذه المحادثة / The Owner has not authorized this conversation' });
+    if (conversation.status === 'closed') return respond(409, { error: 'المحادثة مغلقة / The conversation is closed' });
+    const messageText = cleanConversationMessage(body.message);
+    if (!messageText) return respond(400, { error: 'أدخل رسالة صحيحة / Enter a valid message' });
+    const message = appendConversationMessage(conversation, { senderType: 'staff', senderId: user.id, text: messageText });
+    if (conversation.status === 'waiting_customer') conversation.status = 'in_progress';
+    recordAudit('development_customer_message_sent', lead.id, message.id);
+    recordNotification(conversation.clientId, `conversation:${conversation.id}:message:${message.id}`, {
+      type: 'inquiry', importance: 'normal', titleAr: 'رد فريق ZEZO على محادثتك', titleEn: 'ZEZO replied to your conversation',
+      descriptionAr: 'افتح المحادثة لمتابعة الرد.', descriptionEn: 'Open the conversation to read the reply.'
+    }, { tab: 'conversations', targetId: conversation.id, targetKind: 'conversation' });
+    if (client) {
+      await saveDevelopmentMessage(client, conversation, message);
+      await saveDevelopmentEvents(client, audits, notifications);
+    } else await persist();
+    return respond(201, { conversation: developmentConversationView(conversation) });
+  }
+
+  const priorReview = lead.developmentReview || {};
+  const version = Number(priorReview.version || 0);
+  if (!Number.isSafeInteger(body.version) || body.version !== version) {
+    return respond(409, { error: 'تغيّر المشروع منذ فتحه. حدّث البيانات قبل إعادة المحاولة / The project changed. Refresh it before retrying' });
+  }
+  const review = { ...priorReview, version: version + 1 };
+  let previousDeveloperId = null;
+  let revisionRequested = false;
+  if (action === 'delegation') {
+    const managerId = clean(body.managerId, 100);
+    const manager = users.find(account => account.id === managerId && account.role === developmentManagerRole && account.active && !account.accountDisabledAt);
+    if (managerId && !manager) return respond(400, { error: 'اختر مسؤول مبرمجين نشطاً / Select an active Development Manager' });
+    if (body.allowCustomerConversation !== undefined && typeof body.allowCustomerConversation !== 'boolean') return respond(400, { error: 'تفويض محادثة غير صالح / Invalid conversation permission' });
+    if (body.allowCustomerConversation && !manager) return respond(400, { error: 'حدّد المسؤول قبل تفويض محادثة العميل / Select the manager before authorizing customer contact' });
+    review.managerId = manager?.id || null;
+    review.allowCustomerConversation = Boolean(manager && body.allowCustomerConversation);
+    if (body.technicalRequirements !== undefined) lead.technicalRequirements = clean(body.technicalRequirements, 6000);
+    recordAudit('development_project_delegated', lead.id, JSON.stringify({ previousManagerId: priorReview.managerId || null, managerId: review.managerId, allowCustomerConversation: review.allowCustomerConversation }));
+    if (manager && (manager.id !== priorReview.managerId || review.allowCustomerConversation !== priorReview.allowCustomerConversation)) {
+      notifyDevelopmentUser(manager.id, lead, `delegated:${review.version}`, 'فُوّضت بإدارة مشروع تقني', 'A technical project was delegated to you', 'افتح قسم المشاريع لمراجعة التفاصيل التقنية.', 'Open your projects to review the technical details.', 'technical-requests');
+    }
+  }
+
+  if (action === 'review') {
+    const note = clean(body.note, 1000);
+    const updateRequest = clean(body.updateRequest, 1000);
+    const escalatedIssue = clean(body.escalatedIssue, 1000);
+    const revision = clean(body.requestRevision, 1000);
+    if ((updateRequest || revision) && !lead.developerUserId) return respond(409, { error: 'أسند المشروع إلى مبرمج أولاً / Assign the project to a developer first' });
+    if (revision && (developmentStage(lead) !== 'technical_review' || lead.developerTaskStatus !== 'review_requested')) {
+      return respond(409, { error: 'لا توجد تسليمات تقنية تنتظر المراجعة / No technical delivery is awaiting review' });
+    }
+    if (body.category !== undefined) review.category = clean(body.category, 100);
+    if (body.complexity !== undefined) {
+      if (!['', 'low', 'medium', 'high'].includes(body.complexity)) return respond(400, { error: 'اختر مستوى تعقيد صالحاً / Select a valid complexity level' });
+      review.complexity = body.complexity;
+    }
+    if (body.priority !== undefined) {
+      if (!['', 'low', 'normal', 'medium', 'high', 'urgent'].includes(body.priority)) return respond(400, { error: 'اختر أولوية صالحة / Select a valid priority' });
+      review.priority = body.priority;
+    }
+    if (body.skills !== undefined) {
+      const skills = developmentTags(body.skills);
+      if (!skills) return respond(400, { error: 'أدخل قائمة مهارات صالحة / Enter a valid skills list' });
+      review.skills = skills;
+    }
+    if (body.estimateDays !== undefined) {
+      const days = body.estimateDays;
+      if (days !== null && (!Number.isSafeInteger(days) || days < 1 || days > 3650)) return respond(400, { error: 'أدخل مدة صحيحة بالأيام / Enter a valid duration in days' });
+      review.estimateDays = days;
+    }
+    if (body.inReview !== undefined && typeof body.inReview !== 'boolean') return respond(400, { error: 'حالة المراجعة غير صالحة / Invalid review state' });
+    if (body.inReview !== undefined) review.inReview = body.inReview;
+    review.reviewedAt = at;
+    review.reviewedBy = user.name || user.username;
+    const entries = [[note, 'note'], [updateRequest, 'update_request'], [escalatedIssue, 'owner_escalation'], [revision, 'revision']]
+      .filter(([value]) => value).map(([value, kind]) => ({ id: id('devnote'), kind, text: value, author: user.name || user.username, at }));
+    review.notes = [...entries, ...(priorReview.notes || [])];
+    if (revision) {
+      revisionRequested = true;
+      lead.developerTaskStatus = 'revision_requested';
+      lead.developerTaskNote = clean(revision, 500);
+      lead.developerUpdatedAt = at;
+      setProjectStage(lead, 'needs_revisions', { ...user, role: developmentManagerRole }, revision);
+    }
+    if (updateRequest || revision) {
+      notifyDevelopmentUser(lead.developerUserId, lead, `review:${review.version}`, revision ? 'ملاحظات على التسليم التقني' : 'طُلب تحديث تقني', revision ? 'Technical delivery revisions requested' : 'Technical update requested', clean([revision, updateRequest].filter(Boolean).join('\n'), 500), clean([revision, updateRequest].filter(Boolean).join('\n'), 500), 'development');
+    }
+    if (escalatedIssue) {
+      for (const owner of users.filter(account => account.active && !account.accountDisabledAt && account.role === 'admin' && account.id !== user.id)) {
+        notifyDevelopmentUser(owner.id, lead, `escalated:${review.version}`, 'مشكلة تقنية تتطلب مراجعة المالك', 'A technical issue needs Owner review', escalatedIssue, escalatedIssue, 'requests');
+      }
+    }
+    recordAudit(revision ? 'development_revision_requested' : 'development_review_updated', lead.id, entries.map(entry => entry.kind).join(', '));
+  }
+
+  if (action === 'assignment') {
+    const developerId = clean(body.developerId, 100);
+    const developer = users.find(account => account.id === developerId && account.role === 'developer' && account.active && !account.accountDisabledAt && account.developmentProfile?.availability !== 'unavailable');
+    if (!developer) return respond(400, { error: 'اختر مبرمجاً نشطاً ومتاحاً / Select an active, available developer' });
+    if (lead.developerUserId === developer.id) return respond(409, { error: 'المشروع مسند إلى هذا المبرمج بالفعل / The project is already assigned to this developer' });
+    if (!developmentAssignmentAllowed(lead, payments)) return respond(409, { error: 'تتطلب حالة المشروع مراجعة المالك قبل تغيير الإسناد / The project requires Owner review before assignment changes' });
+    const dueAt = body.dueAt ?? '';
+    if (typeof dueAt !== 'string' || (dueAt && (!/^\d{4}-\d{2}-\d{2}$/.test(dueAt) || !Number.isFinite(Date.parse(dueAt)) || new Date(dueAt).toISOString().slice(0, 10) !== dueAt))) {
+      return respond(400, { error: 'أدخل موعد تسليم صحيحاً / Enter a valid delivery date' });
+    }
+    const previousId = lead.developerUserId || null;
+    previousDeveloperId = previousId;
+    const previous = users.find(account => account.id === previousId);
+    const reason = clean(body.reason, 500);
+    const note = clean(body.note, 500);
+    if (previousId && !reason) return respond(400, { error: 'أدخل سبب إعادة الإسناد / Enter a reason for reassignment' });
+    const history = { fromDeveloperId: previousId, fromDeveloperName: previous?.name || '', developerId: developer.id, developerName: developer.name || '', reason, note, dueAt, actor: user.name || user.username, at };
+    review.assignmentHistory = [history, ...(priorReview.assignmentHistory || [])];
+    lead.developerUserId = developer.id;
+    lead.developerDueDate = dueAt;
+    lead.developerTaskNote = note;
+    lead.developerTaskStatus = 'offered';
+    lead.developerAssignedAt = at;
+    lead.developerRespondedAt = null;
+    lead.developerDeclinedAt = null;
+    setProjectStage(lead, 'waiting_developer_acceptance', { ...user, role: developmentManagerRole }, 'Developer assignment sent.');
+    recordAudit(previousId ? 'development_project_reassigned' : 'development_project_assigned', lead.id, JSON.stringify(history));
+    notifyDevelopmentUser(developer.id, lead, `assigned:${review.version}`, 'أُسند إليك مشروع جديد', 'A new project was assigned to you', 'راجع المهمة واقبلها أو اعتذر عنها.', 'Review the assignment and accept it or decline.', 'development');
+    if (previousId) notifyDevelopmentUser(previousId, lead, `reassigned:${review.version}`, 'أُعيد إسناد مشروع سابق', 'A previous project was reassigned', 'راجع إشعارات العمل بشأن هذا المشروع.', 'Check the project updates for details.', 'development');
+  }
+
+  lead.developmentReview = review;
+  lead.updatedAt = at;
+  if (client) {
+    await saveDevelopmentProject(client, lead, { action, previousDeveloperId, revision: revisionRequested, commissionRate: developerCommissionRate });
+    await saveDevelopmentEvents(client, audits, notifications);
+  } else await persist();
+  return respond(200, { project: developmentProjectView(lead, payments) });
+}
+
+async function handlePostgresDevelopmentManager(req, res, path) {
+  if (!stagingAuthorized(req)) return handleRequest(req, res);
+  const security = responseSecurityHeaders();
+  const work = (client, target, body) => directPostgresSessionUser(req)
+    .then(auth => handleDevelopmentManager(req, target, path, security, { client, auth, body }));
+  if (req.method === 'GET') return withPostgresReadTransaction(client => work(client, res));
+  if (!['POST', 'PATCH'].includes(req.method)) return json(res, 405, { error: 'الإجراء غير مدعوم / Unsupported action' }, security);
+  if (!developmentRequestOriginAllowed(req)) return json(res, 403, { error: 'هذا الطلب يجب أن يأتي من الموقع نفسه / This request must originate from the same site' }, security);
+  const project = developmentProjectRoute.exec(path);
+  const profile = developmentProfileRoute.test(path);
+  if (!project && !profile) return json(res, 404, { error: 'المسار غير موجود / Route not found' }, security);
+  const auth = await directPostgresSessionUser(req);
+  const allowed = profile || project?.[2] === 'delegation' ? ['admin'] : ['admin', developmentManagerRole];
+  if (!directRequireAuth(req, res, auth?.user, allowed)) return;
+  const response = { writeHead(status, headers) { this.status = status; this.headers = headers; }, end(body) { this.body = body; } };
+  const body = await jsonBody(req, 32_768);
+  await withPostgresTransaction(client => work(client, response, body));
+  res.writeHead(response.status, response.headers);
+  return res.end(response.body);
 }
 
 function feedbackPage(url) {
@@ -2954,6 +3328,7 @@ async function handle(req, res) {
   const path = new URL(req.url, `http://localhost:${PORT}`).pathname;
   if (await handlePlatformFeedback(req, res, path)) return;
   if (!postgresConfigured()) return handleRequest(req, res);
+  if (path === '/api/development-manager' || path.startsWith('/api/development-manager/')) return handlePostgresDevelopmentManager(req, res, path);
   // Public Owner setup is permanently closed. The first Owner is provisioned
   // only by scripts/provision-owner.mjs with direct administrative DB access.
   if (req.method === 'POST' && path === '/api/setup') return handleRequest(req, res);
@@ -3010,6 +3385,13 @@ async function handle(req, res) {
       return handleRequest(req, res);
     });
   }
+  const publicLegacyRoute = ['/api/public', '/api/quote', '/api/referral-inquiries', '/api/crm/inquiries'].includes(path);
+  if (!publicLegacyRoute && !canUseDevelopmentManagerRoute(path) && stagingAuthorized(req) && cookieValue(req, 'zezo_session')) {
+    const auth = await directPostgresSessionUser(req);
+    if (auth?.user.role === developmentManagerRole) {
+      return json(res, 403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }, responseSecurityHeaders());
+    }
+  }
 
   const buffered = new Writable({ write(chunk, _encoding, callback) { chunks.push(Buffer.from(chunk)); callback(); } });
   const chunks = [];
@@ -3028,10 +3410,14 @@ async function handle(req, res) {
   });
   await withPostgresTransaction(async client => {
     await loadPostgresStore(client);
+    const paymentBaseline = req.method === 'POST' && path === '/api/admin/payment' ? capturePaymentStoreBaseline(store) : null;
     ensureMonthlyReferralLinks();
     await handleRequest(req, buffered);
     if (!buffered.writableFinished) await finished;
-    await persistPostgresStore(client);
+    // Keep the financial lock and existing rules, and commit payments, derived
+    // movements and queued mail together without rewriting unrelated rows.
+    if (paymentBaseline) await persistNormalizedStore(client, store, { paymentBaseline });
+    else await persistPostgresStore(client);
   });
   res.writeHead(buffered.statusCode, buffered.responseHeaders);
   return res.end(Buffer.concat(chunks));
@@ -3091,6 +3477,10 @@ async function handleRequest(req, res) {
       const ordersPhone = STAGING_MODE ? '' : normalizeWhatsAppNumber(process.env.ZEZO_ORDERS_WHATSAPP !== undefined ? process.env.ZEZO_ORDERS_WHATSAPP : legacyPhone);
       const ordersUrl = buildWhatsAppUrl(ordersPhone);
       return json(res, 200, { prices: store.settings.prices.filter(price=>price.active!==false), templatePrices: store.settings.templatePrices || {}, templateInclusions:store.settings.templateInclusions||{}, templateActive:store.settings.templateActive||{}, commissionConfigured: store.settings.commissionPercent != null, customerSupportWhatsappNumber:customerSupportPhone, ordersWhatsappNumber:ordersPhone, customerSupportWhatsappUrl:buildWhatsAppUrl(customerSupportPhone), ordersWhatsappUrl:ordersUrl, whatsappUrl:ordersUrl, emailReady: emailReady() && adminEmailReady(), aiQuoteReady:!STAGING_MODE&&Boolean(process.env.OPENAI_API_KEY&&process.env.OPENAI_MODEL), stagingMode:STAGING_MODE }, security);
+    }
+    if (path === '/api/development-manager' || path.startsWith('/api/development-manager/')) {
+      if (req.method !== 'GET' && !developmentRequestOriginAllowed(req)) return json(res, 403, { error: 'هذا الطلب يجب أن يأتي من الموقع نفسه / This request must originate from the same site' }, security);
+      return handleDevelopmentManager(req, res, path, security);
     }
     if(req.method==='POST'&&path==='/api/conversations'){
       const auth=requireAuth(req,res,['client']);if(!auth)return;
@@ -3334,27 +3724,29 @@ async function handleRequest(req, res) {
     }
     if(req.method==='GET'&&path==='/api/notifications'){
       const auth=requireAuth(req,res);if(!auth)return;
-      const deadlineChanged=emitDeadlineNotifications();if(deadlineChanged)await persist();
+      const deadlineChanged=auth.user.role!==developmentManagerRole&&emitDeadlineNotifications();if(deadlineChanged)await persist();
       const type=clean(url.searchParams.get('type'),32),status=clean(url.searchParams.get('status'),12),from=clean(url.searchParams.get('from'),10),to=clean(url.searchParams.get('to'),10),limit=Math.min(100,Math.max(1,Number(url.searchParams.get('limit'))||50));
       const notificationTypes=['project','inquiry','withdrawal','rank','sale','commission','quote','payment','team','deadline','finance','referral','update'];
       if((type&&!notificationTypes.includes(type))||(status&&!['all','read','unread'].includes(status))||(from&&!/^\d{4}-\d{2}-\d{2}$/.test(from))||(to&&!/^\d{4}-\d{2}-\d{2}$/.test(to)))return json(res,400,{error:'فلاتر الإشعارات غير صالحة / Invalid notification filters'},security);
-      const unreadCount=store.notifications.filter(row=>row.userId===auth.user.id&&!row.readAt).length,start=from?Date.parse(`${from}T00:00:00.000Z`):-Infinity,end=to?Date.parse(`${to}T23:59:59.999Z`):Infinity;
-      const notifications=store.notifications.filter(row=>row.userId===auth.user.id&&(!type||row.type===type)&&(!status||status==='all'||(status==='read'?Boolean(row.readAt):!row.readAt))&&Date.parse(row.createdAt)>=start&&Date.parse(row.createdAt)<=end).slice(0,limit).map(safeNotification);
+      const visible=store.notifications.filter(row=>canReadNotification(auth.user,row));
+      const unreadCount=visible.filter(row=>!row.readAt).length,start=from?Date.parse(`${from}T00:00:00.000Z`):-Infinity,end=to?Date.parse(`${to}T23:59:59.999Z`):Infinity;
+      const notifications=visible.filter(row=>(!type||row.type===type)&&(!status||status==='all'||(status==='read'?Boolean(row.readAt):!row.readAt))&&Date.parse(row.createdAt)>=start&&Date.parse(row.createdAt)<=end).slice(0,limit).map(safeNotification);
       return json(res,200,{notifications,unreadCount,authenticated:true,emailReady:emailReady()&&adminEmailReady()},security);
     }
     if(req.method==='PATCH'&&path.startsWith('/api/notifications/')){
-      const auth=requireAuth(req,res);if(!auth)return;const notificationId=path.split('/').at(-1),notification=store.notifications.find(row=>row.id===notificationId&&row.userId===auth.user.id);
+      const auth=requireAuth(req,res);if(!auth)return;const notificationId=path.split('/').at(-1),notification=store.notifications.find(row=>row.id===notificationId&&canReadNotification(auth.user,row));
       if(!notification)return json(res,404,{error:'الإشعار غير موجود / Notification not found'},security);
       if(!notification.readAt){notification.readAt=now();await persist();}
-      return json(res,200,{notification:safeNotification(notification),unreadCount:store.notifications.filter(row=>row.userId===auth.user.id&&!row.readAt).length},security);
+      return json(res,200,{notification:safeNotification(notification),unreadCount:store.notifications.filter(row=>canReadNotification(auth.user,row)&&!row.readAt).length},security);
     }
     if(req.method==='POST'&&path==='/api/notifications/read-all'){
       const auth=requireAuth(req,res);if(!auth)return;let changed=false;const at=now();
-      for(const notification of store.notifications)if(notification.userId===auth.user.id&&!notification.readAt){notification.readAt=at;changed=true;}
+      for(const notification of store.notifications)if(canReadNotification(auth.user,notification)&&!notification.readAt){notification.readAt=at;changed=true;}
       if(changed)await persist();return json(res,200,{ok:true,unreadCount:0},security);
     }
     if (req.method === 'GET' && path === '/api/dashboard') {
       const auth = requireAuth(req,res); if (!auth) return;
+      if (auth.user.role === developmentManagerRole) return json(res, 200, dashboardFor(auth.user), security);
       let guestConversationsClaimed=false;if(auth.user.role==='client'&&guestSessionValue(req)){const guestHash=hash(guestSessionValue(req));for(const conversation of store.conversations)if(conversation.guestSessionHash===guestHash&&!conversation.clientId){conversation.clientId=auth.user.id;conversation.guestSessionHash=null;conversation.updatedAt=now();guestConversationsClaimed=true;}}
       let changed=guestConversationsClaimed||ensureMonthlyReferralLinks(); const eventCountBeforeCleanup=store.referralEvents.length;cleanReferralEvents();if(eventCountBeforeCleanup!==store.referralEvents.length)changed=true; const previousRankState=JSON.stringify(store.rankRequests);
       for (const lead of store.leads) { const before=JSON.stringify([lead.commissionStatus,lead.commissionAmount,lead.developerCommissionStatus,lead.developerCommissionAmount]); updateCommission(lead); updateDeveloperCommission(lead);syncLeadFinanceLedger(lead); if(before!==JSON.stringify([lead.commissionStatus,lead.commissionAmount,lead.developerCommissionStatus,lead.developerCommissionAmount])) { changed=true;notifyCurrentCommissions(lead); } }
@@ -3405,6 +3797,7 @@ async function handleRequest(req, res) {
       if(Number(user.passwordResetExpires)<=Date.now()){user.passwordResetHash=null;user.passwordResetExpires=0;await persist();return json(res,400,{error:'انتهت صلاحية رابط إعادة التعيين / Password reset link has expired'},security);}
       if(!validPassword(b.password))return json(res,400,{error:'كلمة المرور يجب أن تكون 12 خانة على الأقل / Password must contain at least 12 characters'},security);
       Object.assign(user,passwordRecord(String(b.password)));user.passwordResetHash=null;user.passwordResetExpires=0;user.mustChangePassword=false;audit(user,'password_reset',user.id);for(const [sid,session] of sessions)if(session.userId===user.id)sessions.delete(sid);await persist();
+      if(user.role!=='client'&&user.mfaEnabledAt)return json(res,200,{ok:true,user:publicUser(user)}, {...security,'Set-Cookie':cookie('zezo_session','',0,req)});
       const sid=token();sessions.set(sessionKey(sid),{userId:user.id,expires:Date.now()+SESSION_TTL});return json(res,200,{user:publicUser(user)}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
     }
     if (req.method === 'POST' && path === '/api/auth/login') {
@@ -3412,22 +3805,30 @@ async function handleRequest(req, res) {
       if (!await rateAllowed(key)) return json(res,429,{error:'محاولات كثيرة. جرّب بعد 15 دقيقة / Too many attempts; try again in 15 minutes'},security);
       const user=store.users.find(u=>u.username===username&&u.active);
       if (!user || !passwordMatches(String(b.password||''),user) || !accountTypes[b.accountType]?.includes(user.role)) return json(res,401,{error:'اسم المستخدم أو كلمة المرور غير صحيحة لهذا النوع من الدخول / Incorrect username or password for this sign-in type'},security);
-      if(sensitiveManagementRole(user.role)&&user.mfaEnabledAt&&!validTotp(user.mfaSecret,b.mfaCode))return json(res,401,{error:'أدخل رمز تطبيق المصادقة الحالي / Enter the current authenticator code',mfaRequired:true},security);
+      if(user.role!=='client'&&user.mfaEnabledAt&&!validTotp(user.mfaSecret,b.mfaCode))return json(res,401,{error:'أدخل رمز تطبيق المصادقة الحالي / Enter the current authenticator code',mfaRequired:true},security);
        loginAttempts.delete(key); await clearRateLimit('login', key); const sid=token(); sessions.set(sessionKey(sid),{userId:user.id,expires:Date.now()+SESSION_TTL}); audit(user,'login',user.id); await persist();
       return json(res,200,{user:publicUser(user)}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
     }
-    if(req.method==='GET'&&path==='/api/auth/mfa/setup'){
-      const auth=requireAuth(req,res,['admin','marketing_manager','hr_manager','order_manager']);if(!auth)return;
+    if(['GET','POST'].includes(req.method)&&path==='/api/auth/mfa/setup'){
+      const developerSetup=req.method==='POST';
+      const auth=requireAuth(req,res,developerSetup?['developer']:mandatoryMfaRoles);if(!auth)return;
       if(auth.user.mfaEnabledAt)return json(res,409,{error:'التحقق بخطوتين مفعّل مسبقاً / Two-step verification is already enabled'},security);
+      if(developerSetup){
+        if(!await rateAllowedFor(developerMfaSetupAttempts,auth.user.id,8,15*60_000))return json(res,429,{error:'جرّب مجدداً بعد 15 دقيقة / Try again in 15 minutes'},security);
+        const b=await jsonBody(req),password=typeof b.currentPassword==='string'?b.currentPassword.slice(0,201):'';
+        if(!passwordMatches(password,auth.user))return json(res,401,{error:'كلمة المرور الحالية غير صحيحة / Current password is incorrect'},security);
+      }
       auth.user.mfaSetupSecret ||= base32Encode(randomBytes(20));await persist();
       const issuer='ZEZO Forge',label=encodeURIComponent(`${issuer}:${auth.user.username}`),otpAuthUri=`otpauth://totp/${label}?secret=${auth.user.mfaSetupSecret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
       return json(res,200,{secret:auth.user.mfaSetupSecret,otpAuthUri},security);
     }
     if(req.method==='POST'&&path==='/api/auth/mfa/enable'){
-      const auth=requireAuth(req,res,['admin','marketing_manager','hr_manager','order_manager']);if(!auth)return;const b=await jsonBody(req);
+      const auth=requireAuth(req,res,mfaEnrollmentRoles);if(!auth)return;
+      if(auth.user.role==='developer'&&!await rateAllowedFor(developerMfaEnableAttempts,auth.user.id,8,15*60_000))return json(res,429,{error:'جرّب مجدداً بعد 15 دقيقة / Try again in 15 minutes'},security);
+      const b=await jsonBody(req);
       if(auth.user.mfaEnabledAt)return json(res,409,{error:'التحقق بخطوتين مفعّل مسبقاً / Two-step verification is already enabled'},security);
       if(!validTotp(auth.user.mfaSetupSecret,b.code))return json(res,400,{error:'رمز التحقق غير صحيح؛ افحص الساعة والرمز الحالي / Invalid code; check the device clock and current code'},security);
-      auth.user.mfaSecret=auth.user.mfaSetupSecret;delete auth.user.mfaSetupSecret;auth.user.mfaEnabledAt=now();audit(auth.user,'management_mfa_enabled',auth.user.id);await persist();
+      auth.user.mfaSecret=auth.user.mfaSetupSecret;delete auth.user.mfaSetupSecret;auth.user.mfaEnabledAt=now();audit(auth.user,auth.user.role==='developer'?'developer_mfa_enabled':'management_mfa_enabled',auth.user.id);await persist();
       return json(res,200,{ok:true,user:publicUser(auth.user)},security);
     }
     if (req.method === 'POST' && path === '/api/auth/logout') {
@@ -3541,6 +3942,7 @@ async function handleRequest(req, res) {
     if (req.method === 'POST' && path === '/api/admin/invite') {
       const auth=requireAuth(req,res,['admin','hr_manager']); if(!auth)return; const b=await jsonBody(req);
       const name=clean(b.name,80), username=clean(b.username,40).toLowerCase(), email=normalizeEmail(b.email); let role=clean(b.role,40);
+      if(role===developmentManagerRole&&auth.user.role!=='admin')return json(res,403,{error:'تعيين مسؤول المبرمجين متاح للمالك فقط / Only the Owner can grant the Development Manager role'},security);
       if(role==='admin'&&(auth.user.role!=='admin'||!auth.user.mfaEnabledAt||!validTotp(auth.user.mfaSecret,b.ownerMfaCode)))return json(res,403,{error:'إنشاء دعوة مالك يحتاج تحققاً إضافياً من تطبيق المصادقة / Creating an Owner invitation requires fresh authenticator verification'},security);
       if(auth.user.role==='hr_manager'&&!hasPermission(auth.user,'team.invite',{department:'people'}))return json(res,403,{error:'لا تملك تفويض إنشاء دعوات / You are not delegated to create invitations'},security);
       if(auth.user.role==='hr_manager'&&!(['marketer','developer'].includes(role)||(role==='order_manager'&&effectivePermission(auth.user,'team.invite')==='all'))) return json(res,403,{error:'مسؤول الموظفين لا يعيّن إلا الأدوار المفوضة له صراحة / HR cannot invite roles beyond its explicit delegation'},security);
@@ -3578,14 +3980,17 @@ async function handleRequest(req, res) {
       if(target.role==='admin')return json(res,409,{error:'حساب المالك محمي من تغيير الدور أو الصلاحيات من لوحة التفويض / Owner account is protected from permission changes here'},security);
       const b=await jsonBody(req),nextRole=b.role===undefined?target.role:clean(b.role,40);
       if(!roles.includes(nextRole)||nextRole==='admin')return json(res,400,{error:'اختر دور موظف صالحاً؛ تعيين Owner يحتاج دعوة مالك منفصلة / Choose a valid employee role; Owner accounts require a separate owner invitation'},security);
+      if(nextRole===developmentManagerRole&&target.role==='client')return json(res,400,{error:'اختر حساب موظف لهذا الدور / Select an employee account for this role'},security);
       const changes=b.permissions;
       if(changes!==undefined&&(!changes||typeof changes!=='object'||Array.isArray(changes)))return json(res,400,{error:'صيغة الصلاحيات غير صالحة / Invalid permission settings'},security);
-      const overrides={...(target.permissionOverrides||{})};
+      if(nextRole===developmentManagerRole&&Object.values(changes||{}).some(value=>value!==null&&value!=='default'&&value!=='none'))return json(res,403,{error:'صلاحيات مسؤول المبرمجين محددة بنطاق المشاريع التقنية / Development Manager access is fixed to scoped technical projects'},security);
+      const fixedScope=nextRole===developmentManagerRole||target.role===developmentManagerRole;
+      const overrides=fixedScope?{}:{...(target.permissionOverrides||{})};
       for(const [key,value] of Object.entries(changes||{})){
         if(!Object.hasOwn(permissionDefinitions,key))return json(res,400,{error:`صلاحية غير معروفة / Unknown permission: ${key}`},security);
         if(value===null||value==='default'){delete overrides[key];continue;}
         if(value!=='none'&&!permissionDefinitions[key].includes(value))return json(res,400,{error:`نطاق غير مسموح / Unsupported scope for ${key}`},security);
-        overrides[key]=value;
+        if(!fixedScope)overrides[key]=value;
       }
       if(b.active===false&&target.role==='admin')return json(res,409,{error:'حساب المالك محمي من التعطيل العرضي / Owner account is protected from accidental deactivation'},security);
       const before={role:target.role,active:target.active,permissionOverrides:target.permissionOverrides||{}};
@@ -3602,7 +4007,7 @@ async function handleRequest(req, res) {
       const b=await jsonBody(req);
       if(target.role==='admin'||b.role==='admin')return json(res,409,{error:'حساب المالك محمي؛ لا يمكن تغيير الملكية أو دور Owner من هذا المسار / Owner accounts are protected from role transfer here'},security);
       if(['email','phone','instagram','socialLinks','telegramUsername'].some(key=>Object.hasOwn(b,key))) return json(res,403,{error:'يحدّث الموظف بيانات تواصله من ملفه الشخصي / Employees update their own contact details from their profile'},security);
-      if(b.role!==undefined){if(!roles.includes(b.role))return json(res,400,{error:'الدور غير صالح / Invalid role'},security);if(target.role==='admin'&&b.role!=='admin'&&store.users.filter(u=>u.role==='admin'&&u.active).length<=1)return json(res,409,{error:'يجب أن يبقى حساب مالك نشط واحد على الأقل / Keep at least one active owner account'},security);target.role=b.role;if(referralEnabled(target)){target.referralCode ||= newReferralCode();target.rank ||= 'rookie';target.activeCommissionRate ??= 15;target.teamLeaderTermsPending ??= false;}}
+      if(b.role!==undefined){if(!roles.includes(b.role))return json(res,400,{error:'الدور غير صالح / Invalid role'},security);if(target.role===developmentManagerRole||b.role===developmentManagerRole)return json(res,409,{error:'غيّر دور مسؤول المبرمجين من إدارة الصلاحيات / Change the Development Manager role under Access Management'},security);if(target.role==='admin'&&b.role!=='admin'&&store.users.filter(u=>u.role==='admin'&&u.active).length<=1)return json(res,409,{error:'يجب أن يبقى حساب مالك نشط واحد على الأقل / Keep at least one active owner account'},security);target.role=b.role;if(referralEnabled(target)){target.referralCode ||= newReferralCode();target.rank ||= 'rookie';target.activeCommissionRate ??= 15;target.teamLeaderTermsPending ??= false;}}
       if(b.active===false&&target.role==='admin'&&store.users.filter(u=>u.role==='admin'&&u.active).length<=1)return json(res,409,{error:'لا يمكن تعطيل آخر حساب مالك نشط / Cannot disable the last active owner account'},security);
       if(typeof b.active==='boolean'){target.active=b.active;if(b.active)delete target.accountDisabledAt;else target.accountDisabledAt=now();}
       if(b.name) target.name=clean(b.name,80);
@@ -3876,20 +4281,26 @@ async function handleRequest(req, res) {
       const idempotencyKey=clean(b.idempotencyKey,80);
       if(!idempotencyKey)return json(res,400,{error:'مفتاح فريد مطلوب لمنع تكرار الحركة / A unique key is required to prevent duplicate transactions'},security);
       if(!/^[a-zA-Z0-9_-]{12,80}$/.test(idempotencyKey))return json(res,400,{error:'مفتاح الحركة غير صالح / Invalid transaction key'},security);
-      const existing=store.payments.find(row=>row.idempotencyKey===idempotencyKey);if(existing)return json(res,200,{payment:existing,lead:safeLead(lead,true),duplicate:true},security);
+      const existing=store.payments.find(row=>row.idempotencyKey===idempotencyKey);
+      if(existing){
+        if(existing.leadId!==lead.id||(existing.kind||existing.status)!==b.kind||Number(existing.amount)!==money(amount))return json(res,409,{error:'مفتاح الحركة مستخدم لعملية مختلفة / This transaction key was already used for a different operation'},security);
+        return json(res,200,{payment:existing,lead:safeLead(lead,true),duplicate:true},security);
+      }
       if(b.kind==='payment'&&(!lead.contractAmount||!['active','waiting_payment','completed'].includes(lead.status))) return json(res,409,{error:'حدّد قيمة العقد وفعّل المشروع قبل تسجيل دفعة / Set the contract amount and activate the project before recording a payment'},security);
+      const transactionOwnsPersistence=Boolean(currentPostgresClient())&&url.pathname==='/api/admin/payment';
       const payment={id:id('pay'),idempotencyKey:idempotencyKey||null,leadId:lead.id,at:now(),kind:b.kind,amount:money(amount),note:clean(b.note,300),verifiedBy:auth.user.username};
       if(b.kind==='refund'){
         if(amount>lead.paidTotal)return json(res,400,{error:'المبلغ المسترد أكبر من المدفوع المسجل / Refund exceeds recorded payments'},security);
-        cancelWithdrawalForLead(lead,auth.user);lead.paidTotal=money(lead.paidTotal-amount);lead.refunded=true;lead.refundAt=now();lead.commissionHoldUntil=lead.refundAt;
+        cancelWithdrawalForLead(lead,auth.user,{persistMailImmediately:!transactionOwnsPersistence});lead.paidTotal=money(lead.paidTotal-amount);lead.refunded=true;lead.refundAt=now();lead.commissionHoldUntil=lead.refundAt;
       } else {
         if(lead.paidTotal+amount>lead.contractAmount)return json(res,400,{error:'الدفعة تتجاوز رصيد العقد / Payment exceeds the remaining contract balance'},security);
         const wasFullyPaid=lead.paidTotal>=lead.contractAmount;lead.paidTotal=money(lead.paidTotal+amount);
         if(!wasFullyPaid&&lead.paidTotal>=lead.contractAmount){lead.fullyPaidAt=now();lead.everFullyPaid=true;lead.commissionHoldUntil=lead.fullyPaidAt;}
         if(lead.paidTotal>=lead.contractAmount)lead.refunded=false;
       }
-      store.payments.unshift(payment); if(lead.referralUserId)recordReferralEvent({userId:lead.referralUserId,code:lead.referralCode,linkId:lead.referralLinkId,type:b.kind==='refund'?'refund':'payment_received',leadId:lead.id,idempotencyKey:`${b.kind==='refund'?'refund':'payment_received'}:${payment.id}`});updateCommission(lead); updateDeveloperCommission(lead);syncLeadFinanceLedger(lead,auth.user);syncLeadReferralMilestones(lead,auth.user);syncCrmCaseForOrder(lead,auth.user); const rankRequestsCreated=syncAllRankRequests(); audit(auth.user,b.kind==='refund'?'refund_recorded':'manual_payment_verified',lead.id,`${amount} ILS`); await persist();
-      for(const request of rankRequestsCreated) await queueRankRequestMail(request);
+      store.payments.unshift(payment); if(lead.referralUserId)recordReferralEvent({userId:lead.referralUserId,code:lead.referralCode,linkId:lead.referralLinkId,type:b.kind==='refund'?'refund':'payment_received',leadId:lead.id,idempotencyKey:`${b.kind==='refund'?'refund':'payment_received'}:${payment.id}`});updateCommission(lead); updateDeveloperCommission(lead);syncLeadFinanceLedger(lead,auth.user);syncLeadReferralMilestones(lead,auth.user);syncCrmCaseForOrder(lead,auth.user); const rankRequestsCreated=syncAllRankRequests(); audit(auth.user,b.kind==='refund'?'refund_recorded':'manual_payment_verified',lead.id,`${amount} ILS`);
+      if(!transactionOwnsPersistence) await persist();
+      for(const request of rankRequestsCreated) await queueRankRequestMail(request,{persistImmediately:!transactionOwnsPersistence});
       return json(res,201,{payment,lead:safeLead(lead,true)},security);
     }
     if (req.method === 'POST' && path === '/api/admin/commission/paid') {

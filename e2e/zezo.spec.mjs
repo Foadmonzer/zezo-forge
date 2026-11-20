@@ -4,6 +4,7 @@ import pg from 'pg';
 import { provisionFirstOwner } from '../src/server/owner-bootstrap.js';
 import { readFile } from 'node:fs/promises';
 import { randomUUID, createHmac } from 'node:crypto';
+import { runDevelopmentManagerRegression } from './development-manager.regression.mjs';
 
 const widths = [375, 390, 768, 1366, 1440];
 const baseURL = process.env.PLAYWRIGHT_BASE_URL || 'http://127.0.0.1:3000';
@@ -40,16 +41,23 @@ async function json(response) {
   return body;
 }
 
-async function loginThroughUI(page, { username, password, accountType = 'employee', mfaCode }) {
+async function submitTeamCredentials(page, { username, password, accountType = 'employee' }) {
   await page.goto('/team');
   await waitForZezoApp(page);
   const form = accountType === 'management' ? '#managerLoginForm' : '#employeeLoginForm';
   await page.locator(`${form} input[name="username"]`).fill(username);
   await page.locator(`${form} input[name="password"]`).fill(password);
   await page.locator(`${form} button[type="submit"]`).click();
+  return form;
+}
+
+async function loginThroughUI(page, { username, password, accountType = 'employee', mfaCode }) {
+  const form = await submitTeamCredentials(page, { username, password, accountType });
   if (mfaCode) {
-    await expect(page.locator('#managerMfaField')).toBeVisible();
-    await page.locator(`${form} input[name="mfaCode"]`).fill(mfaCode);
+    const challenge = page.locator(`${form} input[name="mfaCode"]`);
+    await expect(challenge).toBeVisible();
+    await expect(page.locator('#dashboardBackdrop.open')).toHaveCount(0);
+    await challenge.fill(mfaCode);
     await page.locator(`${form} button[type="submit"]`).click();
   }
   await expect(page.locator('#dashboardBackdrop.open')).toBeVisible();
@@ -263,7 +271,7 @@ test('all 40 catalog templates open and both request actions route to the correc
 });
 
 test('customer, Order Manager, developer, marketer, and Owner complete a synthetic browser journey', async ({ page, browser, request, browserName }, testInfo) => {
-  test.setTimeout(240_000);
+  test.setTimeout(360_000);
   test.skip(browserName !== 'chromium', 'Stateful synthetic business journey runs once in Chromium.');
   const suffix = randomUUID().replaceAll('-', '').slice(0, 10);
   const ownerUsername = `e2e_owner_${suffix}`;
@@ -300,14 +308,8 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
     } }));
     const activationApi = await playwrightRequest.newContext({ baseURL });
     const activation = await json(await activationApi.post('/api/auth/activate', { data: { token: invite.activationToken, password } }));
-    let mfaSecret = '';
-    if (['hr_manager', 'marketing_manager', 'order_manager'].includes(role)) {
-      const mfa = await json(await activationApi.get('/api/auth/mfa/setup'));
-      mfaSecret = mfa.secret;
-      await json(await activationApi.post('/api/auth/mfa/enable', { data: { code: totp(mfa.secret) } }));
-    }
     await activationApi.dispose();
-    return { id: activation.user.id, username, password, mfaSecret };
+    return { id: activation.user.id, username, password };
   }
 
   const orderManager = await createEmployee('order_manager');
@@ -490,7 +492,14 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   // An Owner assigns the conversation. The Order Manager responds and drafts a quote through the UI.
   await json(await ownerApi.patch(`/api/conversations/${encodeURIComponent(conversationId)}`, { data: { assignedUserId: orderManager.id } }));
   const orderPage = await browser.newPage({ viewport: { width: 1366, height: 900 } });
-  await loginThroughUI(orderPage, { username: orderManager.username, password: orderManager.password, accountType: 'management', mfaCode: totp(orderManager.mfaSecret) });
+  await submitTeamCredentials(orderPage, { ...orderManager, accountType: 'management' });
+  const orderMfaPanel = orderPage.locator('#mfaSetupPanel');
+  await expect(orderMfaPanel).toBeVisible();
+  await expect(orderPage.locator('#dashboardBackdrop.open')).toHaveCount(0);
+  expect((await orderPage.request.get('/api/dashboard')).status()).toBe(428);
+  await orderMfaPanel.locator('[name="code"]').fill(totp(await orderMfaPanel.locator('#mfaSecretValue').innerText()));
+  await orderMfaPanel.getByRole('button', { name: 'تفعيل التحقق بخطوتين' }).click();
+  await expect(orderPage.locator('#dashboardBackdrop.open')).toBeVisible();
   await orderPage.locator('[data-dash-tab="conversations"]').click();
   const staffConversation = orderPage.locator('details.conversation-staff-card').filter({ hasText: 'مطعم السعادة' });
   await expect(staffConversation).toBeVisible();
@@ -560,7 +569,26 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
 
   // Owner: assign developer and record a synthetic, verified manual payment in the UI.
   const ownerPage = await browser.newPage({ viewport: { width: 1366, height: 900 } });
+  await ownerPage.clock.install();
   await loginThroughUI(ownerPage, { username: ownerUsername, password: ownerPassword, accountType: 'management', mfaCode: totp(ownerMfa.secret) });
+  await expect(ownerPage.locator('#notificationBell')).not.toHaveAttribute('hidden', '');
+  let hiddenNotificationRequests = 0;
+  const isNotificationPreview = url => new URL(url).pathname === '/api/notifications' && new URL(url).searchParams.get('limit') === '8';
+  const observeNotification = request => { if (isNotificationPreview(request.url())) hiddenNotificationRequests++; };
+  ownerPage.on('request', observeNotification);
+  await ownerPage.evaluate(() => {
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await ownerPage.clock.fastForward(31_000);
+  expect(hiddenNotificationRequests).toBe(0);
+  ownerPage.off('request', observeNotification);
+  const restoredNotification = ownerPage.waitForResponse(response => isNotificationPreview(response.url()));
+  await ownerPage.evaluate(() => {
+    delete document.hidden;
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  expect((await restoredNotification).status()).toBe(200);
   await expect(ownerPage.locator('#dashboardTabs .dashboard-nav-group')).toHaveCount(5);
   await expect(ownerPage.locator('#dashboardTabs')).toContainText('العملاء والطلبات');
   await expect(ownerPage.locator('#dashboardTabs')).toContainText('الفريق والإحالات');
@@ -728,6 +756,24 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   // Developer accepts, submits synthetic delivery; Owner reviews and completes it.
   const devPage = await browser.newPage({ viewport: { width: 1366, height: 900 } });
   await loginThroughUI(devPage, { username: developer.username, password: developer.password });
+  expect((await devPage.request.get('/api/auth/mfa/setup')).status()).toBe(403);
+  await devPage.locator('[data-dash-tab="profile"]').click();
+  const developerSetup = devPage.locator('#developerMfaSetupForm');
+  await developerSetup.locator('[name="currentPassword"]').fill('Synthetic-wrong-current-password');
+  await developerSetup.getByRole('button', { name: 'إعداد التحقق بخطوتين' }).click();
+  await expect(developerSetup.getByRole('alert')).toContainText('كلمة المرور الحالية غير صحيحة');
+  await developerSetup.locator('[name="currentPassword"]').fill(developer.password);
+  await developerSetup.getByRole('button', { name: 'إعداد التحقق بخطوتين' }).click();
+  const developerMfaPanel = devPage.locator('#mfaSetupPanel');
+  await expect(developerMfaPanel).toBeVisible();
+  const developerMfaSecret = await developerMfaPanel.locator('#mfaSecretValue').innerText();
+  await developerMfaPanel.locator('[name="code"]').fill(totp(developerMfaSecret));
+  await developerMfaPanel.getByRole('button', { name: 'تفعيل التحقق بخطوتين' }).click();
+  await expect(devPage.locator('#dashboardContent')).toContainText('التحقق بخطوتين مفعّل');
+  await expect(devPage.locator('#mfaSecretValue')).toBeEmpty();
+  await devPage.locator('#dashboardLogout').click();
+  await expect(devPage.locator('#dashboardBackdrop.open')).toHaveCount(0);
+  await loginThroughUI(devPage, { ...developer, mfaCode: totp(developerMfaSecret) });
   const dualRoleDeveloper = await devPage.evaluate(async () => {
     const response = await fetch('/api/dashboard', { cache: 'no-store' });
     return response.json();
@@ -889,7 +935,11 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
     await newCustomerPage.screenshot({ path: testInfo.outputPath('platform-customer-dashboard-mobile.png'), fullPage: true });
   } finally { await newCustomerPage.close(); }
 
-  await Promise.all([ownerApi.dispose(), marketerJourneyApi.dispose(), ownerPage.close(), marketerPage.close(), referralDb.end()]);
+  try {
+    await runDevelopmentManagerRegression({ browser, ownerApi, baseURL, testInfo });
+  } finally {
+    await Promise.all([ownerApi.dispose(), marketerJourneyApi.dispose(), ownerPage.close(), marketerPage.close(), referralDb.end()]);
+  }
 });
 
 test('interactive demos perform their core local actions without external services', async ({ page, browserName }) => {

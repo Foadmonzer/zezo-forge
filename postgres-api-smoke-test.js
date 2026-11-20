@@ -1137,6 +1137,10 @@ try {
     body: { leadId: syntheticLeadId, amount: 1, kind: 'payment', verified: true }, cookie: ownerCookie
   });
   assert(missingPaymentKey.status === 400, 'Payment endpoint accepted a payment without an idempotency key.');
+  const paymentUnrelatedSettingsUpdatedAt = async () => (await client.query(
+    `SELECT "updatedAt"::text AS timestamp FROM app_settings WHERE key = 'zezo-runtime'`
+  )).rows[0].timestamp;
+  const settingsBeforePayment = await paymentUnrelatedSettingsUpdatedAt();
   const idempotencyKey = `synthetic_${testSuffix}_payment`;
   const payment = await request('POST', '/api/admin/payment', {
     body: { leadId: syntheticLeadId, amount: 200, kind: 'payment', verified: true, idempotencyKey }, cookie: ownerCookie
@@ -1160,6 +1164,11 @@ try {
   };
   const duplicateRows = await client.query('SELECT count(*)::int AS count FROM payments WHERE "requestId" = $1 AND "idempotencyKey" = $2', [syntheticLeadId, idempotencyKey]);
   assert(Number(duplicateRows.rows[0].count) === 1, 'Concurrent payment requests created more than one payment row.');
+  const differentPayment = await request('POST', '/api/admin/payment', {
+    body: { leadId: syntheticLeadId, amount: 201, kind: 'payment', verified: true, idempotencyKey }, cookie: ownerCookie
+  });
+  assert(differentPayment.status === 409, 'A changed payment was reported as a successful replay for the same key.');
+  assert(await paymentUnrelatedSettingsUpdatedAt() === settingsBeforePayment, 'Payment or replay rewrote unrelated application settings.');
   const normalizedCommissions = await client.query('SELECT kind, "ratePercent"::float8 AS rate, amount::float8 AS amount, status FROM commissions WHERE "requestId" = $1 ORDER BY kind', [syntheticLeadId]);
   assert(normalizedCommissions.rowCount === 2, 'A project must retain one marketing and one developer commission record.');
   assert(normalizedCommissions.rows.some(row => row.kind === 'referral' && row.rate === 15 && row.amount === 30), 'The normalized Rookie commission row is missing or incorrect.');
@@ -1339,6 +1348,32 @@ try {
     };
     console.log(`[FINANCE_STRESS] ${JSON.stringify({ payments: paymentStress, withdrawals: withdrawalStress, walletReads: walletStress, wallMs: Number((performance.now() - walletReadStartedAt).toFixed(1))})}`);
     results.push(`concurrent distinct payments stop exactly at contract balance (8 accepted / 4 rejected, p50 ${paymentStress.p50Ms}ms / p95 ${paymentStress.p95Ms}ms); 24 simultaneous withdrawal requests reserve once per employee (p50 ${withdrawalStress.p50Ms}ms / p95 ${withdrawalStress.p95Ms}ms); partial carry-over and rejection release preserve remaining wallet balances`);
+
+    const refundBody = { leadId: syntheticLeadId, amount: 100, kind: 'refund', verified: true, idempotencyKey: `refund_${testSuffix}_record` };
+    const refunds = await Promise.all([1, 2].map(() => request('POST', '/api/admin/payment', { body: refundBody, cookie: ownerCookie })));
+    const refund = refunds.find(result => result.status === 201);
+    assert(refund?.data.lead?.paidTotal === 900 && refunds.some(result => result.status === 200 && result.data.duplicate === true),
+      'Concurrent refund replay deducted funds more than once or failed to commit.');
+    const refundRows = await client.query('SELECT count(*)::int AS count FROM payments WHERE "idempotencyKey" = $1', [refundBody.idempotencyKey]);
+    assert(refundRows.rows[0].count === 1, 'A replay created duplicate refund rows.');
+    const releasedIds = savedWithdrawals.rows.map(row => row.id);
+    const releasedRows = await client.query('SELECT status FROM withdrawal_requests WHERE id = ANY($1::text[])', [releasedIds]);
+    assert(releasedRows.rowCount === 2 && releasedRows.rows.every(row => row.status === 'rejected'), 'The refund did not release both related reservations.');
+    const releaseKeys = releasedIds.map(withdrawalId => `withdrawal:${withdrawalId}:released`);
+    const refundLedger = await client.query('SELECT "idempotencyKey" FROM finance_ledger_entries WHERE "idempotencyKey" = ANY($1::text[])', [
+      [`payment:${refund.data.payment.id}`, ...releaseKeys]
+    ]);
+    assert(refundLedger.rowCount === 3, 'The refund did not atomically record its ledger movement and both releases.');
+    const refundMail = await client.query(
+      `SELECT count(*)::int AS count FROM outbox_messages
+       WHERE data->>'kind' = 'withdrawal_cancelled' AND recipient = ANY($1::text[])`,
+      [[employees.marketer.email, employees.developer.email]]
+    );
+    assert(refundMail.rows[0].count === 2, 'Refund notifications were missing or duplicated in the outbox.');
+    const refundedCommissions = await client.query('SELECT kind, "ratePercent"::float8 AS rate, amount::float8 AS amount FROM commissions WHERE "requestId" = $1', [syntheticLeadId]);
+    assert(refundedCommissions.rowCount === 2 && refundedCommissions.rows.some(row => row.kind === 'referral' && row.rate === 15 && row.amount === 135) &&
+      refundedCommissions.rows.some(row => row.kind === 'developer' && row.rate === 25 && row.amount === 225), 'The refund did not apply the existing rates to the remaining collected balance.');
+    results.push('payment writes leave unrelated settings alone; mismatched idempotency keys fail; a refunded reservation releases both wallets and queues exactly one notification for each employee');
   } finally {
     const restoredPricing = await request('POST', '/api/admin/pricing', {
       body: { prices: originalPrices, commissionHoldDays: originalHoldDays }, cookie: ownerCookie

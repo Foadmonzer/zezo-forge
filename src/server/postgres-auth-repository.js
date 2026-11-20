@@ -39,12 +39,15 @@ export async function changePostgresPassword({ sessionHash, userId, currentPassw
   });
 }
 
-export async function setupPostgresMfa({ sessionHash, userId, proposedSecret }) {
+export async function setupPostgresMfa({ sessionHash, userId, proposedSecret, currentPassword, verifyPassword }) {
   return withPostgresScopedTransaction(async client => {
     const row = await selectSessionAccountForUpdate(client, sessionHash, userId);
     if (!row) return { kind: 'unauthenticated' };
     const data = object(row.data);
     if (data.mfaEnabledAt) return { kind: 'already_enabled' };
+    if (verifyPassword && !verifyPassword(currentPassword, { ...data, passwordHash: row.passwordHash || '' })) {
+      return { kind: 'invalid_current_password' };
+    }
     const secret = data.mfaSetupSecret || proposedSecret;
     if (!data.mfaSetupSecret) {
       await client.query(
@@ -71,7 +74,8 @@ export async function enablePostgresMfa({ sessionHash, userId, code, verifyTotp,
       'UPDATE user_accounts SET data = $2::jsonb, "updatedAt" = $3 WHERE id = $1',
       [row.id, JSON.stringify(data), at]
     );
-    await insertAudit(client, { auditId, user, action: 'management_mfa_enabled', detail: '', at });
+    const action = user.role === 'developer' ? 'developer_mfa_enabled' : 'management_mfa_enabled';
+    await insertAudit(client, { auditId, user, action, detail: '', at });
     return { kind: 'enabled', user: { ...oldData, ...data, id: row.id, username: row.username || '', email: row.email || '', role: row.role, active: row.active } };
   });
 }

@@ -183,8 +183,27 @@ export async function loadNormalizedStore(client, defaultStore) {
   return next;
 }
 
-export async function persistNormalizedStore(client, store) {
+const paymentCollections = [
+  'users', 'leads', 'crmLeads', 'payments', 'withdrawals', 'rankRequests',
+  'referralLinks', 'referralEvents', 'financeLedger', 'notifications', 'audit', 'mailQueue'
+];
+
+export function capturePaymentStoreBaseline(store) {
+  return Object.fromEntries(paymentCollections.map(collection => [collection,
+    new Map((store[collection] || []).map(row => [row.id, json(row)]))
+  ]));
+}
+
+export async function persistNormalizedStore(client, store, { paymentBaseline } = {}) {
   const userIds = new Set(store.users.map(user => user.id));
+  let expiredReferralEventIds;
+  if (paymentBaseline) {
+    const retainedEventIds = new Set(store.referralEvents.map(row => row.id));
+    expiredReferralEventIds = [...paymentBaseline.referralEvents.keys()].filter(id => !retainedEventIds.has(id));
+    store = Object.fromEntries(paymentCollections.map(collection => [collection,
+      (store[collection] || []).filter(row => paymentBaseline[collection].get(row.id) !== json(row))
+    ]));
+  }
   const dateField = (row, key, fallback = row.createdAt) => isoDate(row[key] || fallback);
   const userRows = store.users.map(user => ({ ...user, createdAt: user.createdAt || new Date().toISOString() }));
   await upsert(client, 'user_accounts', 'id', [
@@ -258,18 +277,19 @@ export async function persistNormalizedStore(client, store) {
   for (const lead of leads) {
     if (lead.referralUserId && lead.commissionRate != null && Number.isFinite(Number(lead.commissionAmount))) commissions.push({
       id: `commission_referral_${lead.id}`, userId: lead.referralUserId, requestId: lead.id, kind: 'referral', ratePercent: safeNumber(lead.commissionRate),
-      amount: safeNumber(lead.commissionAmount), status: lead.commissionStatus || 'pending', sourcePaymentId: null,
+      amount: safeNumber(lead.commissionAmount), status: lead.commissionStatus || 'pending',
       details: Object.fromEntries(Object.entries(lead).filter(([key]) => ['commissionPaidAmount', 'commissionOffsetAmount', 'commissionDebtRemaining', 'withdrawalId', 'commissionRank', 'commissionRateSetAt', 'commissionHoldUntil'].includes(key))), createdAt: lead.createdAt
     });
     if (lead.developerUserId) commissions.push({
       id: `commission_developer_${lead.id}`, userId: lead.developerUserId, requestId: lead.id, kind: 'developer', ratePercent: 25,
-      amount: safeNumber(lead.developerCommissionAmount), status: lead.developerCommissionStatus || 'pending', sourcePaymentId: null,
+      amount: safeNumber(lead.developerCommissionAmount), status: lead.developerCommissionStatus || 'pending',
       details: Object.fromEntries(Object.entries(lead).filter(([key]) => key.startsWith('developerCommission') || ['developerWithdrawalId', 'developerReviewStatus', 'developerReviewApprovedAt', 'developerCommissionHoldUntil'].includes(key))), createdAt: lead.createdAt
     });
   }
+  // The compatibility snapshot does not own the link to a source payment.
   await upsert(client, 'commissions', 'id', [
     ['id', row => row.id], ['userId', row => row.userId], ['requestId', row => row.requestId], ['kind', row => row.kind], ['ratePercent', row => row.ratePercent],
-    ['amount', row => row.amount], ['currency', () => 'ILS'], ['status', row => row.status], ['sourcePaymentId', row => row.sourcePaymentId],
+    ['amount', row => row.amount], ['currency', () => 'ILS'], ['status', row => row.status],
     ['data', row => json(row.details)], ['createdAt', row => isoDate(row.createdAt)]
   ], commissions.filter(row => userIds.has(row.userId)));
 
@@ -300,8 +320,13 @@ export async function persistNormalizedStore(client, store) {
     ['visitorHash', row => row.visitorHash || null], ['resourceId', row => row.resourceId || null], ['requestId', row => row.leadId || row.requestId || null],
     ['idempotencyKey', row => row.idempotencyKey || null], ['createdAt', row => isoDate(row.createdAt)], ['data', row => json(row)]
   ], events);
-  await client.query('DELETE FROM referral_events WHERE NOT (id = ANY($1::text[]))', [events.map(row => row.id)]);
-  await client.query('DELETE FROM referral_attributions WHERE "expiresAt" <= NOW()');
+  if (!paymentBaseline) {
+    await client.query('DELETE FROM referral_events WHERE NOT (id = ANY($1::text[]))', [events.map(row => row.id)]);
+    await client.query('DELETE FROM referral_attributions WHERE "expiresAt" <= NOW()');
+  } else if (expiredReferralEventIds.length) {
+    // The payment only owns its snapshot changes. A scoped referral write may have inserted other events after the snapshot loaded.
+    await client.query('DELETE FROM referral_events WHERE id = ANY($1::text[])', [expiredReferralEventIds]);
+  }
   const attributions = (store.referralAttributions || []).filter(row => userIds.has(row.userId) && row.visitorHash && Number(row.expiresAt) > Date.now());
   await upsert(client, 'referral_attributions', 'id', [
     ['id', row => row.id || `att_${row.visitorHash}`], ['userId', row => row.userId], ['requestId', row => row.requestId || null], ['code', row => row.code],
@@ -346,6 +371,8 @@ export async function persistNormalizedStore(client, store) {
     ['id', row => row.id], ['email', row => row.email], ['role', row => row.role], ['status', row => row.status], ['expiresAt', row => row.expiresAt],
     ['invitedById', row => row.invitedById], ['data', row => json({ employeeId: row.employeeId })], ['createdAt', row => isoDate(row.createdAt)]
   ], invitations);
+
+  if (paymentBaseline) return;
 
   const settingsData = store.settings || {};
   await client.query(
