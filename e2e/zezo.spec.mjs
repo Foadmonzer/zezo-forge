@@ -157,11 +157,15 @@ test('browser navigation works in Chromium, Firefox, and WebKit', async ({ page,
   await page.goto('/about?lang=en', { waitUntil: 'domcontentloaded' });
   await expect(page.getByRole('heading', { name: 'About ZEZO', exact: true })).toBeVisible();
   await expect.poll(() => page.locator('[data-zezo-art="about"] img').evaluate(image => image.naturalWidth)).toBeGreaterThan(0);
+  const galleryConfig = page.waitForResponse(response => new URL(response.url()).pathname === '/api/public' && response.ok());
   await page.goto('/templates?lang=en');
   await expect(page.getByRole('heading', { name: 'Template library' })).toBeVisible();
   await expect(page.locator('.zezo-platform')).toHaveAttribute('dir', 'ltr');
+  await (await galleryConfig).finished();
+  const previewConfig = page.waitForResponse(response => new URL(response.url()).pathname === '/api/public' && response.ok());
   await page.goto('/?preview=web-thread-studio', { waitUntil: 'domcontentloaded' });
   await waitForZezoApp(page);
+  await (await previewConfig).finished();
   await expect(page.locator('#templatePreviewApp .template-preview-shell h1')).toBeVisible();
   await expect(page.locator('#templatePreviewApp .template-preview-actions a')).toHaveCount(2);
   await page.locator('#templatePreviewLanguage').click();
@@ -708,13 +712,27 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   const permissionForm = ownerPage.locator(`[data-permission-form="${marketer.id}"]`);
   await expect(permissionForm).toBeVisible();
   await permissionForm.locator('[name="perm_conversations.read"]').selectOption('assigned');
-  await measureDashboardAction(ownerPage, `/api/admin/permissions/${encodeURIComponent(marketer.id)}`, 'PATCH', async () => {
-    await permissionForm.locator('button[type="submit"]').click();
-    await expect(permissionForm.locator('button[type="submit"]')).toBeDisabled();
-    await expect(ownerPage.locator('.zezo-submit-status')).toContainText('جارٍ تنفيذ العملية');
-  }, async () => {
-    await expect(ownerPage.locator(`[data-permission-form="${marketer.id}"] [name="perm_conversations.read"]`)).toHaveValue('assigned');
-  }, { waitDashboard: true });
+  const permissionPath = `/api/admin/permissions/${encodeURIComponent(marketer.id)}`;
+  const permissionRoute = `**${permissionPath}`;
+  let releasePermissionRequest;
+  const permissionGate = new Promise(resolve => { releasePermissionRequest = resolve; });
+  await ownerPage.route(permissionRoute, async route => {
+    await permissionGate;
+    await route.continue();
+  });
+  try {
+    await measureDashboardAction(ownerPage, permissionPath, 'PATCH', async () => {
+      await permissionForm.locator('button[type="submit"]').click();
+      await expect(permissionForm.locator('button[type="submit"]')).toBeDisabled();
+      await expect(ownerPage.locator('.zezo-submit-status')).toContainText('جارٍ تنفيذ العملية');
+      releasePermissionRequest();
+    }, async () => {
+      await expect(ownerPage.locator(`[data-permission-form="${marketer.id}"] [name="perm_conversations.read"]`)).toHaveValue('assigned');
+    }, { waitDashboard: true });
+  } finally {
+    releasePermissionRequest();
+    await ownerPage.unroute(permissionRoute);
+  }
 
   await ownerPage.locator('[data-dash-tab="requests"]').click();
   const leadCard = ownerPage.locator(`[data-lead-card="${leadId}"]`);
