@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from 'next';
 import type { ReactNode } from 'react';
 import { getPublicSiteOrigin } from '../src/public-site-origin.js';
+import { zezoShareDescription, zezoShareImage, zezoShareTitle } from './platform/share-metadata';
 import './platform/platform.css';
 
 const staging = process.env.ZEZO_STAGING === 'true';
@@ -18,16 +19,16 @@ export const metadata: Metadata = {
     locale: 'ar_AE',
     alternateLocale: ['en_US'],
     siteName: 'ZEZO Digital Solutions & AI',
-    title,
-    description,
+    title: zezoShareTitle,
+    description: zezoShareDescription,
     url: '/',
-    images: [{ url: '/assets/zezo-planet-texture.jpg', alt: 'ZEZO Digital Solutions & AI' }]
+    images: [zezoShareImage]
   },
   twitter: {
     card: 'summary_large_image',
-    title,
-    description,
-    images: ['/assets/zezo-planet-texture.jpg']
+    title: zezoShareTitle,
+    description: zezoShareDescription,
+    images: [zezoShareImage]
   },
   robots: staging ? { index: false, follow: false, noarchive: true, nosnippet: true } : undefined,
   icons: { icon: '/favicon.svg' }

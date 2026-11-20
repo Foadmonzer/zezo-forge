@@ -1,11 +1,11 @@
 import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 import LegacyPage from '../legacy-page';
+import { privatePageMetadata } from '../platform/share-metadata';
 
 export const metadata: Metadata = {
+  ...privatePageMetadata,
   title: 'مساحة فريق ZEZO',
-  robots: { index: false, follow: false, noarchive: true, nosnippet: true },
-  referrer: 'no-referrer'
 };
 
 export const dynamicParams = false;

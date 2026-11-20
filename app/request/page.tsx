@@ -5,6 +5,7 @@ import { CustomerRequest } from '../platform/customer-request';
 import { languageFrom, value, type Search } from '../platform/customer-data';
 import { PlatformShell } from '../platform/shell';
 import { publicContentMetadata, publicReferral } from '../platform/public-content';
+import { privatePageMetadata } from '../platform/share-metadata';
 import '../platform/customer.css';
 
 export async function generateMetadata({ searchParams }: { searchParams: Promise<Search> }): Promise<Metadata> {
@@ -13,7 +14,7 @@ export async function generateMetadata({ searchParams }: { searchParams: Promise
   const meta = publicContentMetadata('/request', language,
     language === 'ar' ? 'اطلب مشروعك' : 'Request a project',
     language === 'ar' ? 'صف مشروعك الرقمي وأرسل طلبك إلى فريق ZEZO Forge.' : 'Describe your digital project and send your request to the ZEZO Forge team.');
-  return value(query.conversation) ? { ...meta, robots: { index: false, follow: false }, referrer: 'no-referrer' } : meta;
+  return value(query.conversation) ? { ...meta, ...privatePageMetadata } : meta;
 }
 
 const templates = templateCatalog.map(({ id, service, category, title }) => ({ id, service, category, title }));

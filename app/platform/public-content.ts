@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import { templateCatalog } from '../../public/template-catalog.js';
+import { zezoShareImage, zezoShareTitle } from './share-metadata';
 
 export type PublicLanguage = 'ar' | 'en';
 export type Localized = { ar: string; en: string };
@@ -28,14 +29,16 @@ export function startRequest(language: PublicLanguage, values: { service?: Servi
   return publicHref(params.size ? `/request?${params}` : '/request', language);
 }
 
-export function publicContentMetadata(path: string, language: PublicLanguage, title: string, description: string, image = '/assets/zezo-planet-texture.jpg'): Metadata {
+export function publicContentMetadata(path: string, language: PublicLanguage, title: string, description: string, image?: string): Metadata {
   const canonical = publicHref(path, language);
+  const shareTitle = path === '/' ? zezoShareTitle : title;
+  const shareImage = image ? { url: image } : zezoShareImage;
   return {
     title: `${title} | ZEZO Forge`,
     description,
     alternates: { canonical, languages: { ar: path, en: publicHref(path, 'en'), 'x-default': path } },
-    openGraph: { type: 'website', url: canonical, siteName: 'ZEZO Forge', title, description, locale: language === 'ar' ? 'ar_AE' : 'en_US', images: [{ url: image }] },
-    twitter: { card: 'summary_large_image', title, description, images: [image] }
+    openGraph: { type: 'website', url: canonical, siteName: 'ZEZO Forge', title: shareTitle, description, locale: language === 'ar' ? 'ar_AE' : 'en_US', images: [shareImage] },
+    twitter: { card: 'summary_large_image', title: shareTitle, description, images: [shareImage] }
   };
 }
 
