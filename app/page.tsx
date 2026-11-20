@@ -3,16 +3,15 @@ import LegacyPage from './legacy-page';
 import { PublicHome } from './platform/public-home';
 import { publicContentMetadata, publicHref, publicLanguage, type PublicQuery } from './platform/public-content';
 import { PlatformShell } from './platform/shell';
-
-const privateLink = { robots: { index: false, follow: false }, referrer: 'no-referrer' as const };
+import { privatePageMetadata, zezoShareDescription } from './platform/share-metadata';
 
 export async function generateMetadata({ searchParams }: { searchParams: PublicQuery }) {
   const query = await searchParams;
-  if (query.preview || query.track || query.token || query.verifyEmail || query.resetPassword) return privateLink;
+  if (query.preview || query.track || query.token || query.verifyEmail || query.resetPassword) return privatePageMetadata;
   const language = publicLanguage(query);
   return publicContentMetadata('/', language,
     language === 'ar' ? 'من الفكرة إلى الواقع الرقمي' : 'From idea to digital reality',
-    language === 'ar' ? 'مواقع وتطبيقات وحلول ذكاء اصطناعي من ZEZO Digital Solutions & AI.' : 'Websites, apps and AI solutions by ZEZO Digital Solutions & AI.');
+    language === 'ar' ? zezoShareDescription : 'From idea to digital reality — websites, apps, and AI solutions.');
 }
 
 export default async function HomePage({ searchParams }: { searchParams: PublicQuery }) {

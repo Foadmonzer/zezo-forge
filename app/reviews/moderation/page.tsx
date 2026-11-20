@@ -2,8 +2,9 @@ import type { Metadata } from 'next';
 import { ProjectReviewModeration } from '../../platform/project-reviews';
 import { publicLanguage, type PublicQuery } from '../../platform/public-content';
 import { PlatformShell } from '../../platform/shell';
+import { privatePageMetadata } from '../../platform/share-metadata';
 
-export const metadata: Metadata = { title: 'مراجعة التقييمات | ZEZO Forge', robots: { index: false, follow: false, noarchive: true }, referrer: 'no-referrer' };
+export const metadata: Metadata = { ...privatePageMetadata, title: 'مراجعة التقييمات | ZEZO Forge' };
 
 export default async function ReviewModerationPage({ searchParams }: { searchParams: PublicQuery }) {
   const language = publicLanguage(await searchParams);

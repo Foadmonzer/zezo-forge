@@ -1,10 +1,10 @@
 import type { Metadata } from 'next';
 import LegacyPage from '../legacy-page';
+import { privatePageMetadata } from '../platform/share-metadata';
 
 export const metadata: Metadata = {
+  ...privatePageMetadata,
   title: 'ZEZO Forge',
-  robots: { index: false, follow: false },
-  referrer: 'no-referrer'
 };
 
 export default function ClassicPage() {
