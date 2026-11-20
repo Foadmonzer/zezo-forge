@@ -490,12 +490,22 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await expect(staffConversation).toBeVisible();
   await staffConversation.locator(':scope > summary').click();
   await staffConversation.locator(`[data-conversation-reply="${conversationId}"] textarea[name="message"]`).fill('Synthetic Order Manager response.');
-  await measureDashboardAction(orderPage, `/api/conversations/${encodeURIComponent(conversationId)}/messages`, 'POST', () =>
-    staffConversation.locator(`[data-conversation-reply="${conversationId}"] button[type="submit"]`).click(),
-  async () => expect(staffConversation).toContainText('Synthetic Order Manager response.', { timeout: 30_000 }), { waitDashboard: true });
+  let dashboardReloads = 0;
+  const observeDashboardReload = request => {
+    if (request.method() === 'GET' && new URL(request.url()).pathname === '/api/dashboard') dashboardReloads++;
+  };
+  orderPage.on('request', observeDashboardReload);
+  try {
+    await measureDashboardAction(orderPage, `/api/conversations/${encodeURIComponent(conversationId)}/messages`, 'POST', () =>
+      staffConversation.locator(`[data-conversation-reply="${conversationId}"] button[type="submit"]`).click(), async () => {
+      await expect(staffConversation.getByRole('log')).toContainText('Synthetic Order Manager response.');
+      await expect(staffConversation).toHaveAttribute('open', '');
+    });
+    expect(dashboardReloads).toBe(0);
+  } finally {
+    orderPage.off('request', observeDashboardReload);
+  }
   const quoteEditor = staffConversation.locator('details.conversation-quote-editor');
-  // The saved reply refreshes the dashboard markup; explicitly expand both native details panes afterward.
-  await staffConversation.evaluate(element => { element.open = true; });
   await quoteEditor.evaluate(element => { element.open = true; });
   await expect(quoteEditor.locator('[name="amount"]')).toBeVisible();
   await quoteEditor.locator('[name="amount"]').fill('200');
