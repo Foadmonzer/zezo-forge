@@ -141,9 +141,11 @@ test('browser navigation works in Chromium, Firefox, and WebKit', async ({ page,
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.goto('/', { waitUntil: 'domcontentloaded' });
-  await waitForZezoApp(page);
-  await expect(page.locator('#heroTitle')).toBeVisible();
-  await expect(page.locator('#templateGrid .template-card')).toHaveCount(40);
+  await expect(page.locator('#zf-content h1')).toBeVisible();
+  await expect(page.locator('script[src="/app.js"]')).toHaveCount(0);
+  await page.goto('/templates?lang=en');
+  await expect(page.getByRole('heading', { name: 'Template library' })).toBeVisible();
+  await expect(page.locator('.zezo-platform')).toHaveAttribute('dir', 'ltr');
   await page.goto('/?preview=web-thread-studio', { waitUntil: 'domcontentloaded' });
   await waitForZezoApp(page);
   await expect(page.locator('#templatePreviewApp .template-preview-shell h1')).toBeVisible();
@@ -154,12 +156,22 @@ test('browser navigation works in Chromium, Firefox, and WebKit', async ({ page,
 });
 
 test('responsive page layouts, navigation, and screenshots at requested widths', async ({ page, browserName }, testInfo) => {
+  test.setTimeout(240_000);
   test.skip(browserName !== 'chromium', 'Viewport screenshot matrix is run in Chromium; cross-browser navigation runs separately.');
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   const pages = [
     { name: 'home', url: '/' },
-    { name: 'templates', url: '/#templates' },
+    { name: 'templates', url: '/templates' },
+    { name: 'services', url: '/services' },
+    { name: 'service-detail', url: '/services/web' },
+    { name: 'template-detail', url: '/templates/web-copper-table' },
+    { name: 'request', url: '/request?template=web-copper-table' },
+    { name: 'work', url: '/work' },
+    { name: 'reviews', url: '/reviews' },
+    { name: 'about', url: '/about' },
+    { name: 'contact', url: '/contact' },
+    { name: 'account', url: '/account' },
     { name: 'team', url: '/team' },
     { name: 'template-web-thread-studio', url: '/?preview=web-thread-studio' }
   ];
@@ -168,9 +180,8 @@ test('responsive page layouts, navigation, and screenshots at requested widths',
       await page.setViewportSize({ width, height: 900 });
       await page.goto(route.url);
       if (route.name === 'team') await expect(page.locator('#authModal')).toHaveAttribute('aria-hidden', 'false');
-      else if (route.name === 'templates') await expect(page.locator('#templateGrid .template-card')).toHaveCount(40);
-      else if (route.name.startsWith('template-')) await expect(page.locator('#templatePreviewApp .template-preview-shell')).toBeVisible();
-      else await expect(page.locator('#heroTitle')).toBeVisible();
+      else if (route.name === 'template-web-thread-studio') await expect(page.locator('#templatePreviewApp .template-preview-shell')).toBeVisible();
+      else await expect(page.locator('#zf-content h1')).toBeVisible();
 
       const dimensions = await page.evaluate(() => ({ viewport: document.documentElement.clientWidth, content: document.documentElement.scrollWidth }));
       expect(dimensions.content, `${route.name} has horizontal overflow at ${width}px (${JSON.stringify(dimensions)})`).toBeLessThanOrEqual(dimensions.viewport + 1);
@@ -180,12 +191,17 @@ test('responsive page layouts, navigation, and screenshots at requested widths',
 
   await page.setViewportSize({ width: 375, height: 812 });
   await page.goto('/');
-  await expect(page.locator('#mobileMenu')).toBeVisible();
-  await page.locator('#mobileMenu').click();
-  await expect(page.locator('#mainNav')).toHaveClass(/open/);
-  await page.locator('#mainNav a[href="#templates"]').click();
-  await expect(page).toHaveURL(/#templates$/);
-  await expect(page.locator('#mainNav')).not.toHaveClass(/open/);
+  const menu = page.getByRole('button', { name: 'افتح القائمة' });
+  await expect(menu).toBeVisible();
+  await menu.click();
+  await expect(page.locator('#zf-navigation')).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('mobile-navigation-375.png') });
+  await page.keyboard.press('Escape');
+  await expect(menu).toBeFocused();
+  await menu.click();
+  await page.locator('#zf-navigation a[href="/templates"]').click();
+  await expect(page).toHaveURL(/\/templates$/);
+  await expect(page.locator('#zf-navigation')).not.toBeVisible();
   expect(errors).toEqual([]);
 });
 
@@ -193,12 +209,10 @@ test('the mobile recovery form stays actionable while the privacy choice is pend
   test.skip(browserName !== 'chromium', 'Mobile stacking check runs once in Chromium.');
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(`/#resetPassword=${'A'.repeat(43)}`);
-  await waitForZezoApp(page);
-  await expect(page.locator('#analyticsConsent')).toBeVisible();
-  await expect(page.locator('#resetPasswordForm')).toBeVisible();
-  await page.locator('#resetPasswordForm button[type="submit"]').click({ trial: true });
-  await page.locator('#authModal [data-close-modal]').click();
-  await expect(page.locator('#analyticsConsent')).toBeVisible();
+  await expect(page).toHaveURL(/\/account(?:#.*)?$/);
+  await expect(page.locator('.zf-privacy')).toBeVisible();
+  await expect(page.getByLabel('كلمة المرور الجديدة (12 خانة على الأقل)')).toBeVisible();
+  await page.locator('.zc-form button').click({ trial: true });
 });
 
 test('all 40 catalog templates open and both request actions route to the correct template', async ({ page, browserName }, testInfo) => {
@@ -206,7 +220,7 @@ test('all 40 catalog templates open and both request actions route to the correc
   test.skip(browserName !== 'chromium', 'The 40-template sweep runs once in Chromium.');
   const ids = await templateIds();
   expect(ids).toHaveLength(40);
-  await page.goto('/#templates');
+  await page.goto('/classic#templates');
   await expect(page.locator('#templateGrid .template-card')).toHaveCount(40);
 
   const report = [];
@@ -227,7 +241,7 @@ test('all 40 catalog templates open and both request actions route to the correc
   expect(report).toHaveLength(40);
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  await page.goto('/#templates');
+  await page.goto('/classic#templates');
   for (const id of ids) {
     for (const action of ['order', 'customize']) {
       const requestButton = page.locator(`[data-template-id="${id}"] [data-template-request="${id}"][data-template-action="${action}"]`);
@@ -243,6 +257,7 @@ test('all 40 catalog templates open and both request actions route to the correc
 });
 
 test('customer, Order Manager, developer, marketer, and Owner complete a synthetic browser journey', async ({ page, browser, request, browserName }, testInfo) => {
+  test.setTimeout(240_000);
   test.skip(browserName !== 'chromium', 'Stateful synthetic business journey runs once in Chromium.');
   const suffix = randomUUID().replaceAll('-', '').slice(0, 10);
   const ownerUsername = `e2e_owner_${suffix}`;
@@ -319,7 +334,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
     name: 'zezo_session', value: staffSessionCookie, domain: browserOrigin.hostname, path: '/',
     httpOnly: true, secure: browserOrigin.protocol === 'https:', sameSite: 'Lax'
   }]);
-  await staffSwitchPage.goto('/');
+  await staffSwitchPage.goto('/classic');
   await waitForZezoApp(staffSwitchPage);
   await expect(staffSwitchPage.locator('#notificationBell')).toBeHidden();
   const staffConversationPosts = [];
@@ -350,7 +365,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   // Reproduce the visitor journey from a clean page: keep the referral, template,
   // and message until the visitor creates a client account, then create one chat.
   await page.setViewportSize({ width: 1366, height: 900 });
-  await page.goto(`/?ref=${encodeURIComponent(referralCode)}`);
+  await page.goto(`/classic?ref=${encodeURIComponent(referralCode)}`);
   await waitForZezoApp(page);
   await expect(page.locator('#notificationBell')).toBeHidden();
   const anonymousNotifications = await page.evaluate(async () => {
@@ -770,6 +785,60 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await expect(marketerPage.locator('#dashboardContent')).not.toContainText('Synthetic E2E Owner');
   await workspaceViewportMatrix(marketerPage, 'referral', 'marketer', testInfo);
   await expect(page.locator('#dashboardContent')).not.toContainText('Synthetic E2E Owner');
+
+  const newCustomerPage = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  try {
+    await newCustomerPage.goto(`/?lang=en&ref=${encodeURIComponent(referralCode)}`);
+    await expect.poll(async () => (await newCustomerPage.context().cookies(baseURL)).some(cookie => cookie.name === 'zezo_referral_attribution' && cookie.httpOnly)).toBe(true);
+    await newCustomerPage.goto('/templates/web-copper-table?lang=en');
+    await newCustomerPage.locator('main a[href*="/request?"][href*="template=web-copper-table"][href*="action=order"]').first().click();
+    await expect(newCustomerPage.getByLabel('Template (optional)')).toHaveValue('web-copper-table');
+    await newCustomerPage.screenshot({ path: testInfo.outputPath('platform-request-mobile.png') });
+    await newCustomerPage.getByRole('button', { name: 'Continue', exact: true }).click();
+    const projectDetails = `Synthetic referral request through the new customer portal ${suffix}.`;
+    await newCustomerPage.getByLabel('What would you like to build?').fill(projectDetails);
+    await newCustomerPage.getByLabel('International WhatsApp number').fill('+971551234568');
+    await newCustomerPage.getByRole('button', { name: 'Continue', exact: true }).click();
+    await newCustomerPage.getByLabel('Attachment (optional)').setInputFiles({
+      name: 'synthetic-request.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4\n% Platform acceptance attachment.\n')
+    });
+    await newCustomerPage.getByRole('button', { name: 'Continue', exact: true }).click();
+    await newCustomerPage.getByRole('checkbox').check();
+    await newCustomerPage.getByRole('button', { name: 'Sign in to continue' }).click();
+    await expect(newCustomerPage).toHaveURL(/\/account\?/);
+    await newCustomerPage.getByRole('button', { name: 'Create an account', exact: true }).click();
+    await newCustomerPage.getByLabel('Full name').fill('Synthetic Platform Customer');
+    await newCustomerPage.getByLabel('Email address').fill(`platform_${suffix}@example.test`);
+    const password = `Platform!${suffix}2026`;
+    await newCustomerPage.locator('input[name="password"]').fill(password);
+    await newCustomerPage.getByLabel('Confirm password').fill(password);
+    await newCustomerPage.getByRole('button', { name: 'Create a customer account' }).click();
+    await expect(newCustomerPage).toHaveURL(/\/request\?lang=en$/);
+    await expect(newCustomerPage.getByText(projectDetails, { exact: true })).toBeVisible();
+    await expect(newCustomerPage.getByText('synthetic-request.pdf', { exact: true })).toBeVisible();
+    const submission = newCustomerPage.waitForResponse(response => new URL(response.url()).pathname === '/api/leads' && response.request().method() === 'POST');
+    await newCustomerPage.getByRole('button', { name: 'Submit request', exact: true }).click();
+    const response = await submission;
+    expect(response.status()).toBe(201);
+    const submitted = await response.json();
+    await expect(newCustomerPage).toHaveURL(new RegExp(`/account/orders/${submitted.id}\\?lang=en$`));
+    await expect(newCustomerPage.getByRole('log')).toContainText(projectDetails);
+    await expect(newCustomerPage.getByText('synthetic-request.pdf', { exact: true })).toBeVisible();
+    const saved = await referralDb.query(`
+      SELECT p."referrerId", p."templateId", c.id AS conversation_id, c."customerId" AS chat_customer,
+        p."customerId" AS request_customer
+      FROM project_requests p JOIN conversations c ON c.id = p.data->>'conversationId'
+      WHERE p.id = $1 AND c.data->>'leadId' = p.id
+    `, [submitted.id]);
+    expect(saved.rows).toHaveLength(1);
+    expect(saved.rows[0]).toMatchObject({ referrerId: marketer.id, templateId: 'web-copper-table', chat_customer: saved.rows[0].request_customer });
+    const noAccess = await request.get(`/api/conversations/${saved.rows[0].conversation_id}`);
+    expect([401, 404]).toContain(noAccess.status());
+    await newCustomerPage.screenshot({ path: testInfo.outputPath('platform-order-with-chat-mobile.png'), fullPage: true });
+    await newCustomerPage.goto('/account/overview?lang=en');
+    await expect(newCustomerPage.getByText('Synthetic Platform Customer', { exact: true })).toBeVisible();
+    await newCustomerPage.screenshot({ path: testInfo.outputPath('platform-customer-dashboard-mobile.png'), fullPage: true });
+  } finally { await newCustomerPage.close(); }
 
   await Promise.all([ownerApi.dispose(), marketerJourneyApi.dispose(), ownerPage.close(), marketerPage.close(), referralDb.end()]);
 });

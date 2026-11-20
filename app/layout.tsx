@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from 'next';
 import type { ReactNode } from 'react';
 import { getPublicSiteOrigin } from '../src/public-site-origin.js';
+import './platform/platform.css';
 
 const staging = process.env.ZEZO_STAGING === 'true';
 const publicSiteUrl = getPublicSiteOrigin();
@@ -46,14 +47,6 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           logo: `${publicSiteUrl}/favicon.svg`,
           sameAs: ['https://www.instagram.com/zezo_prime_ai/']
         }).replace(/</g, '\\u003c') }} />
-        <link rel="stylesheet" href="/styles.css" />
-        <link rel="stylesheet" href="/templates.css" />
-        <link rel="stylesheet" href="/live-demos.css" />
-        <link rel="stylesheet" href="/demo-web.css" />
-        <link rel="stylesheet" href="/demo-apps.css" />
-        <link rel="stylesheet" href="/demo-ai.css" />
-        <link rel="stylesheet" href="/demo-ideas.css" />
-        <link rel="preload" as="image" href="/assets/zezo-planet-texture.jpg" fetchPriority="high" />
       </head>
       <body>{children}</body>
     </html>

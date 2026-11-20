@@ -121,8 +121,21 @@ async function insertConversationMessage(client, { id, conversationId, actor, se
   return messageData;
 }
 
-export async function createPostgresConversation({ conversation, message, attachmentFile, actor, guestHash, idempotencyHash, auditId, messageId, referral, at, authorizeRecipient }) {
+export async function createPostgresConversation({ conversation, message, attachmentFile, actor, guestHash, idempotencyHash, auditId, messageId, referral, at, authorizeRecipient, sessionHash }) {
   return withPostgresScopedTransaction(async client => {
+    const contact = conversation.source === 'contact' && sessionHash;
+    if (contact) {
+      await client.query(`SET LOCAL lock_timeout = '3s'`);
+      await client.query('LOCK TABLE user_accounts, system_notifications, audit_entries IN ROW EXCLUSIVE MODE');
+      const authorized = await client.query(`
+        SELECT u.id FROM auth_sessions s JOIN user_accounts u ON u.id = s."userId"
+        WHERE s.id = $1 AND u.id = $2 AND u.role = 'client' AND u.active = TRUE AND s."expiresAt" > NOW()
+          AND COALESCE(u.data->>'accountDisabledAt', '') IN ('', 'false', '0')
+          AND COALESCE(u.data->>'mustChangePassword', 'false') <> 'true'
+        FOR SHARE OF s, u
+      `, [sessionHash, actor.id]);
+      if (!authorized.rowCount) return { kind: 'unauthorized' };
+    }
     const data = { ...conversation, idempotencyHash };
     delete data.messages;
     const inserted = await client.query(`
@@ -149,8 +162,8 @@ export async function createPostgresConversation({ conversation, message, attach
     });
 
     await insertAudit(client, {
-      id: auditId, actor, action: 'template_conversation_created', targetId: conversation.id,
-      detail: `${conversation.templateId}; referral=${conversation.referralCode || 'none'}`, at
+      id: auditId, actor, action: contact ? 'contact_enquiry_created' : 'template_conversation_created', targetId: conversation.id,
+      detail: contact ? 'contact' : `${conversation.templateId}; referral=${conversation.referralCode || 'none'}`, at
     });
     if (referral?.userId) {
       await client.query(`
@@ -161,7 +174,10 @@ export async function createPostgresConversation({ conversation, message, attach
     }
 
     const eventKey = `conversation:${conversation.id}:created`;
-    const copy = {
+    const copy = contact ? {
+      type: 'inquiry', titleAr: 'استفسار تواصل جديد', titleEn: 'New contact enquiry',
+      descriptionAr: 'أرسل عميل رسالة من صفحة التواصل.', descriptionEn: 'A customer sent a message from the contact page.'
+    } : {
       type: 'inquiry', importance: 'high', titleAr: 'محادثة قالب جديدة', titleEn: 'New template conversation',
       descriptionAr: `وصل استفسار حول ${conversation.templateName}. عيّن مسؤول متابعة للرد.`,
       descriptionEn: `A new enquiry arrived for ${conversation.templateName}. Assign an owner to reply.`

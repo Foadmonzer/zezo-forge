@@ -270,3 +270,9 @@ button[aria-busy="true"]::after{content:"";display:inline-block;width:10px;heigh
   .dashboard-nav-group>span{display:none}
   .dashboard-nav-group>div{display:flex;gap:3px}
 }
+
+@media (max-width:760px), (pointer:coarse), (prefers-reduced-motion:reduce) {
+  #hero #starfield, #hero .planet-canvas, #hero .scene-guide { display:none; }
+  #hero .saturn-ring, #hero .star-ping, .signal-track { animation:none; will-change:auto; }
+  #hero .orbit-stage { transition:none; }
+}

@@ -13,6 +13,7 @@ const commands = [
   { executable, args: ['exec', 'prisma', 'migrate', 'deploy'] },
   { executable, args: ['test:postgres'] },
   { executable, args: ['test:password-recovery-email'] },
+  { executable: process.execPath, args: ['scripts/platform-feedback-regression.mjs'] },
   { executable: process.execPath, args: ['postgres-core-read-benchmark.js'] }
 ];
 
