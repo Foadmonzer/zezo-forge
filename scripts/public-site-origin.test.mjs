@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { DEFAULT_PUBLIC_SITE_ORIGIN, getPublicSiteOrigin, getRequestPublicSiteOrigin, normalizePublicSiteOrigin } from '../src/public-site-origin.js';
 
 const netlifyConfig = await readFile(new URL('../netlify.toml', import.meta.url), 'utf8');
-const publicHtml = await readFile(new URL('../public/index.html', import.meta.url), 'utf8');
+const publicHtml = await readFile(new URL('../src/legacy/index.html', import.meta.url), 'utf8');
 
 test('uses the configured verified HTTPS origin and strips the trailing slash', () => {
   assert.equal(getPublicSiteOrigin({ ZEZO_PUBLIC_URL: 'https://zezoforge.com/', NODE_ENV: 'production' }), 'https://zezoforge.com');
@@ -55,4 +55,8 @@ test('public metadata and organization links use the official domain', () => {
   assert.match(publicHtml, /<meta property="og:url" content="https:\/\/zezoforge\.com\/">/);
   assert.match(publicHtml, /"url":"https:\/\/zezoforge\.com\/"/);
   assert.doesNotMatch(publicHtml, /zezo-forge-fouad\.netlify\.app/);
+});
+
+test('the Netlify public asset directory cannot shadow the Next home route', async () => {
+  await assert.rejects(access(new URL('../public/index.html', import.meta.url)), { code: 'ENOENT' });
 });
