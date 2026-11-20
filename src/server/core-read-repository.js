@@ -114,7 +114,7 @@ export async function loadConversationViews(user, options = {}) {
   const rows = conversations.rows;
   if (!rows.length) return [];
   const ids = rows.map(row => row.id);
-  const messageResult = await queryPostgres(`
+  const messageResult = options.includeMessages === false ? { rows: [] } : await queryPostgres(`
     SELECT m.id, m."conversationId", m."senderId", m.body, m.data, m."createdAt",
       sender."fullName" AS sender_name
     FROM conversation_messages m
@@ -122,7 +122,7 @@ export async function loadConversationViews(user, options = {}) {
     WHERE m."conversationId" = ANY($1::text[])
     ORDER BY m."createdAt", m.id
   `, [ids]);
-  const quoteResult = await queryPostgres(
+  const quoteResult = options.includeMessages === false ? { rows: [] } : await queryPostgres(
     'SELECT id, "conversationId", amount, currency, state, data, "createdAt" FROM quotes WHERE "conversationId" = ANY($1::text[]) ORDER BY "createdAt" DESC',
     [ids]
   );
@@ -292,7 +292,7 @@ export async function loadEmployeeDashboardData(userId) {
   const leads = requestResult.rows.map(row => ({
     ...object(row.data), id: row.id, clientId: row.customerId || row.data?.clientId || null,
     referralUserId: row.referrerId || row.data?.referralUserId || null,
-    developerUserId: row.developerId || row.data?.developerUserId || null,
+    developerUserId: row.developerId || null,
     status: row.status || row.data?.status || 'new', projectStage: row.projectStage || row.data?.projectStage || 'new_request',
     templateId: row.templateId || row.data?.templateId || '',
     contractAmount: row.agreedAmount == null ? row.data?.contractAmount ?? null : Number(row.agreedAmount),
@@ -308,10 +308,9 @@ export async function loadEmployeeDashboardData(userId) {
     const leadById = new Map(leads.map(row => [row.id, row]));
     for (const row of projectResult.rows) {
       const lead = leadById.get(row.requestId);
-      if (!lead) continue;
+      if (!lead || row.developerId !== lead.developerUserId) continue;
       const data = object(row.data);
       lead.projectStage = row.stage || lead.projectStage;
-      lead.developerUserId = row.developerId || lead.developerUserId || null;
       if (row.dueAt) lead.developerDueDate = asIso(row.dueAt);
       for (const key of ['developerTaskStatus', 'developerReviewStatus', 'developerCommissionRate', 'developerCommissionAmount', 'developerCommissionStatus', 'developerCommissionPaidAmount', 'developerCommissionOffsetAmount', 'developerCommissionDebtRemaining', 'developerWithdrawalId', 'projectHistory', 'projectStartedAt', 'projectDeliveredAt', 'projectCompletedAt']) {
         if (data[key] !== undefined) lead[key] = data[key];
@@ -319,9 +318,8 @@ export async function loadEmployeeDashboardData(userId) {
     }
     for (const row of assignmentResult.rows) {
       const lead = leadById.get(row.projectId.replace(/^project_/, ''));
-      if (!lead || (lead.developerUserId && lead.developerUserId !== row.developerId)) continue;
+      if (!lead || lead.developerUserId !== row.developerId) continue;
       const data = object(row.data);
-      lead.developerUserId = row.developerId;
       lead.developerTaskStatus = row.state;
       lead.developerCommissionRate = Number(row.commissionPercent) || 25;
       if (row.expectedCommission != null) lead.developerCommissionExpected = Number(row.expectedCommission);
@@ -332,7 +330,7 @@ export async function loadEmployeeDashboardData(userId) {
       if (!lead) continue;
       const data = object(row.data);
       if (row.kind === 'developer') {
-        lead.developerUserId = row.userId;
+        if (lead.developerUserId !== row.userId) continue;
         lead.developerCommissionRate = Number(row.ratePercent);
         lead.developerCommissionAmount = Number(row.amount);
         lead.developerCommissionStatus = row.status;

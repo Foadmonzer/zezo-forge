@@ -490,12 +490,22 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
   await expect(staffConversation).toBeVisible();
   await staffConversation.locator(':scope > summary').click();
   await staffConversation.locator(`[data-conversation-reply="${conversationId}"] textarea[name="message"]`).fill('Synthetic Order Manager response.');
-  await measureDashboardAction(orderPage, `/api/conversations/${encodeURIComponent(conversationId)}/messages`, 'POST', () =>
-    staffConversation.locator(`[data-conversation-reply="${conversationId}"] button[type="submit"]`).click(),
-  async () => expect(staffConversation).toContainText('Synthetic Order Manager response.', { timeout: 30_000 }), { waitDashboard: true });
+  let dashboardReloads = 0;
+  const observeDashboardReload = request => {
+    if (request.method() === 'GET' && new URL(request.url()).pathname === '/api/dashboard') dashboardReloads++;
+  };
+  orderPage.on('request', observeDashboardReload);
+  try {
+    await measureDashboardAction(orderPage, `/api/conversations/${encodeURIComponent(conversationId)}/messages`, 'POST', () =>
+      staffConversation.locator(`[data-conversation-reply="${conversationId}"] button[type="submit"]`).click(), async () => {
+      await expect(staffConversation.getByRole('log')).toContainText('Synthetic Order Manager response.');
+      await expect(staffConversation).toHaveAttribute('open', '');
+    });
+    expect(dashboardReloads).toBe(0);
+  } finally {
+    orderPage.off('request', observeDashboardReload);
+  }
   const quoteEditor = staffConversation.locator('details.conversation-quote-editor');
-  // The saved reply refreshes the dashboard markup; explicitly expand both native details panes afterward.
-  await staffConversation.evaluate(element => { element.open = true; });
   await quoteEditor.evaluate(element => { element.open = true; });
   await expect(quoteEditor.locator('[name="amount"]')).toBeVisible();
   await quoteEditor.locator('[name="amount"]').fill('200');
@@ -834,6 +844,39 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
     expect(saved.rows[0]).toMatchObject({ referrerId: marketer.id, templateId: 'web-copper-table', chat_customer: saved.rows[0].request_customer });
     const noAccess = await request.get(`/api/conversations/${saved.rows[0].conversation_id}`);
     expect([401, 404]).toContain(noAccess.status());
+    const threadId = saved.rows[0].conversation_id;
+    const threadApi = `/api/conversations/${threadId}/messages`;
+    const draftText = 'Synthetic chat line one.\nSynthetic chat line two.';
+    await newCustomerPage.getByRole('textbox', { name: 'Your message' }).fill(draftText);
+    await newCustomerPage.route(url => url.pathname === threadApi, route => route.abort('failed'), { times: 1 });
+    await newCustomerPage.getByRole('button', { name: 'Send message', exact: true }).click();
+    await expect(newCustomerPage.getByRole('button', { name: 'Retry sending' })).toBeVisible();
+    await newCustomerPage.reload();
+    await expect(newCustomerPage.getByRole('textbox', { name: 'Your message' })).toHaveValue(draftText);
+    let sendRequests = 0;
+    newCustomerPage.on('request', item => { if (item.method() === 'POST' && new URL(item.url()).pathname === threadApi) sendRequests++; });
+    await newCustomerPage.locator('.zc-chat-composer').evaluate(form => { form.requestSubmit(); form.requestSubmit(); });
+    await expect(newCustomerPage.getByRole('log')).toContainText(/Synthetic chat line one\.\s+Synthetic chat line two\./);
+    expect(sendRequests).toBe(1);
+    const persistedChat = await referralDb.query('SELECT COUNT(*)::int AS count FROM conversation_messages WHERE "conversationId" = $1 AND body = $2', [threadId, draftText]);
+    expect(persistedChat.rows[0].count).toBe(1);
+    await ownerPage.reload();
+    await ownerPage.locator('[data-dash-tab="conversations"]').click();
+    const staffThread = ownerPage.locator(`[data-staff-chat="${threadId}"]`);
+    await staffThread.locator(':scope > summary').click();
+    await expect(staffThread.getByRole('log')).toContainText(/Synthetic chat line one\.\s+Synthetic chat line two\./);
+    const staffThreadReply = staffThread.locator('[data-conversation-reply]');
+    await staffThreadReply.locator('[name="message"]').fill('Synthetic reply to the mobile customer.');
+    await staffThreadReply.locator('[name="attachment"]').setInputFiles({ name: 'synthetic-chat-reply.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4\n% Browser chat attachment.\n') });
+    await staffThreadReply.locator('button[type="submit"]').click();
+    await expect(staffThread.getByRole('log')).toContainText('Synthetic reply to the mobile customer.');
+    await expect(staffThread).toHaveAttribute('open', '');
+    await expect(newCustomerPage.getByRole('log')).toContainText('Synthetic reply to the mobile customer.', { timeout: 24_000 });
+    const chatAttachment = newCustomerPage.getByRole('link', { name: 'synthetic-chat-reply.pdf' });
+    await expect(chatAttachment).toBeVisible();
+    const fileResponse = await newCustomerPage.request.get(await chatAttachment.getAttribute('href'));
+    expect(fileResponse.status()).toBe(200);
+    expect(fileResponse.headers()['content-type']).toContain('application/pdf');
     await newCustomerPage.screenshot({ path: testInfo.outputPath('platform-order-with-chat-mobile.png'), fullPage: true });
     await newCustomerPage.goto('/account/overview?lang=en');
     await expect(newCustomerPage.getByText('Synthetic Platform Customer', { exact: true })).toBeVisible();

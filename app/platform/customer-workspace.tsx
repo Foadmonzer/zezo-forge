@@ -21,7 +21,10 @@ function isMessageNotice(notice: Notice) {
 
 export function CustomerWorkspace({ language, view, orderId = '', tab = '', conversationId = '' }: Props) {
   const [access, setAccess] = useState<Access>('checking');
+  const [viewer, setViewer] = useState<Customer | null>(null);
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
+  const [inbox, setInbox] = useState<Conversation[] | null>(null);
+  const [inboxError, setInboxError] = useState('');
   const [notices, setNotices] = useState<Notices | null>(null);
   const [noticeError, setNoticeError] = useState('');
   const [error, setError] = useState('');
@@ -30,10 +33,13 @@ export function CustomerWorkspace({ language, view, orderId = '', tab = '', conv
   const currentPath = view === 'settings' ? pageHref('/account/settings', language, { tab, conversation: conversationId })
     : view === 'order' ? orderHref(orderId, language) : pageHref('/account/' + view, language);
   const signIn = accountHref(language, currentPath);
+  const isInbox = view === 'settings' && tab !== 'profile' && tab !== 'notifications';
 
   const expire = useCallback(() => {
     hostRequest.current?.abort();
     setDashboard(null);
+    setViewer(null);
+    setInbox(null);
     setNotices(null);
     setAccess('guest');
   }, []);
@@ -46,30 +52,52 @@ export function CustomerWorkspace({ language, view, orderId = '', tab = '', conv
     if (hide) {
       setAccess('checking');
       setDashboard(null);
+      setViewer(null);
+      setInbox(null);
       setNotices(null);
     }
     setError('');
     setNoticeError('');
+    setInboxError('');
     try {
       const session = await customerApi<{ user?: Customer }>('/api/auth/session', options);
       if (controller.signal.aborted) return;
       if (!session.user) return expire();
       if (session.user.role !== 'client') {
         setDashboard(null);
+        setViewer(null);
+        setInbox(null);
         setNotices(null);
         setAccess('team');
         return;
       }
-      const data = await customerApi<Dashboard | { role: string }>('/api/dashboard', options);
-      if (controller.signal.aborted) return;
-      if (data.role !== 'client' || !('orders' in data) || data.user.id !== session.user.id) {
-        setDashboard(null);
-        setNotices(null);
-        setAccess('team');
-        return;
+      if (isInbox) {
+        // The protected detail can load while the small conversation list loads.
+        setViewer(session.user);
+        setAccess('client');
+        try {
+          const { conversations } = await customerApi<{ conversations: Conversation[] }>('/api/conversations?summary=1', options);
+          if (controller.signal.aborted) return;
+          setInbox(conversations);
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          if (error instanceof CustomerApiError && [401, 428].includes(error.status)) return expire();
+          setInboxError(errorLabel(error, language));
+        }
+      } else {
+        const data = await customerApi<Dashboard | { role: string }>('/api/dashboard', options);
+        if (controller.signal.aborted) return;
+        if (data.role !== 'client' || !('orders' in data) || data.user.id !== session.user.id) {
+          setDashboard(null);
+          setViewer(null);
+          setNotices(null);
+          setAccess('team');
+          return;
+        }
+        setViewer(data.user);
+        setDashboard(data);
+        setAccess('client');
       }
-      setDashboard(data);
-      setAccess('client');
       if (view === 'orders' || view === 'order' || (view === 'settings' && tab === 'profile')) return;
       try {
         const result = await customerApi<Notices>('/api/notifications?limit=40', options);
@@ -85,7 +113,7 @@ export function CustomerWorkspace({ language, view, orderId = '', tab = '', conv
       setError(errorLabel(error, language));
       setAccess('error');
     }
-  }, [expire, language, view, tab]);
+  }, [expire, isInbox, language, view, tab]);
 
   useEffect(() => {
     void load(true);
@@ -113,7 +141,7 @@ export function CustomerWorkspace({ language, view, orderId = '', tab = '', conv
   ];
 
   const order = dashboard?.orders.find(item => item.id === orderId);
-  const selectedConversation = safeId(conversationId) ? dashboard?.conversations.find(item => item.id === conversationId) : undefined;
+  const selectedConversation = safeId(conversationId) ? conversationId : '';
   const currentTab = tab === 'notifications' || tab === 'profile' ? tab : 'messages';
   const showNoticeIssue = noticeError && <p role="status" className="zc-error">{noticeError} <button type="button" className="zc-inline" onClick={() => void load()}>{t('إعادة المحاولة', 'Try again')}</button></p>;
 
@@ -126,17 +154,17 @@ export function CustomerWorkspace({ language, view, orderId = '', tab = '', conv
     {access === 'guest' && <section className="zc-panel"><h2>{t('سجّل الدخول للمتابعة', 'Sign in to continue')}</h2><a className="zc-button" href={signIn}>{t('تسجيل دخول العميل', 'Customer sign-in')}</a></section>}
     {access === 'team' && <section className="zc-panel"><p>{t('تستخدم حساب فريق. مساحة العميل تتطلب حساب عميل.', 'You are using a team account. The customer workspace requires a customer account.')}</p><div className="zc-actions"><a href={pageHref('/team', language)} className="zc-button">{t('مساحة الفريق', 'Team workspace')}</a><a href={signIn} className="zc-button zc-secondary">{t('تبديل الحساب', 'Switch account')}</a></div></section>}
     {access === 'error' && <section className="zc-panel"><p role="alert" className="zc-error">{error}</p><button type="button" className="zc-button zc-secondary" onClick={() => void load(true)}>{t('إعادة المحاولة', 'Try again')}</button></section>}
-    {access === 'client' && dashboard && <div className="zc-stack" key={dashboard.user.id}>
+    {access === 'client' && viewer && <div className="zc-stack" key={viewer.id}>
       <nav className="zc-tabs" aria-label={t('مساحة العميل', 'Customer workspace')}>
         {tabs.map(item => <a key={item.view} href={item.href} aria-current={item.view === view || (item.view === 'orders' && view === 'order') ? 'page' : undefined}>{item.label}</a>)}
       </nav>
-      {view === 'overview' && <>
+      {view === 'overview' && dashboard && <>
         <Overview dashboard={dashboard} notices={notices} language={language} />
         {showNoticeIssue}
       </>}
-      {view === 'orders' && <Orders orders={dashboard.orders} language={language} />}
-      {view === 'order' && (order
-        ? <CustomerOrder key={order.id} order={order} conversation={dashboard.conversations.find(item => item.leadId === order.id)} language={language} onChange={load} onUnauthorized={expire} />
+      {view === 'orders' && dashboard && <Orders orders={dashboard.orders} language={language} />}
+      {view === 'order' && dashboard && (order
+        ? <CustomerOrder key={order.id} order={order} conversation={dashboard.conversations.find(item => item.leadId === order.id)} viewerId={viewer.id} language={language} onChange={load} onUnauthorized={expire} />
         : <section className="zc-panel"><p role="alert">{t('الطلب غير موجود في حسابك.', 'This request is not in your account.')}</p><a className="zc-button zc-secondary" href={pageHref('/account/orders', language)}>{t('عرض طلباتي', 'View my orders')}</a></section>)}
       {view === 'settings' && <>
         <nav className="zc-tabs zc-subtabs" aria-label={t('أقسام إعدادات الحساب', 'Account settings sections')}>
@@ -148,16 +176,18 @@ export function CustomerWorkspace({ language, view, orderId = '', tab = '', conv
         </nav>
         {currentTab === 'messages' && <div className="zc-inbox">
           <section className="zc-panel"><h2>{t('المحادثات', 'Conversations')}</h2>
-            <ConversationList items={dashboard.conversations} notices={notices?.notifications || []} language={language} current={conversationId} />
-            {!dashboard.conversations.length && <p>{t('ستظهر المحادثات المرتبطة بحسابك هنا.', 'Conversations linked to your account will appear here.')}</p>}
+            <ConversationList items={inbox || []} notices={notices?.notifications || []} language={language} current={conversationId} />
+            {!inbox && !inboxError && <p role="status">{t('جارٍ تحميل قائمة المحادثات…', 'Loading conversations…')}</p>}
+            {inboxError && <p role="status" className="zc-error">{inboxError} <button type="button" className="zc-inline" onClick={() => void load()}>{t('إعادة المحاولة', 'Try again')}</button></p>}
+            {inbox?.length === 0 && <p>{t('ستظهر المحادثات المرتبطة بحسابك هنا.', 'Conversations linked to your account will appear here.')}</p>}
             {showNoticeIssue}
           </section>
           {selectedConversation
-            ? <CustomerMessages key={selectedConversation.id} language={language} conversationId={selectedConversation.id} onUnauthorized={expire} />
+            ? <CustomerMessages key={selectedConversation} language={language} conversationId={selectedConversation} viewerId={viewer.id} onUnauthorized={expire} />
             : <section className="zc-panel"><p role={conversationId ? 'alert' : undefined}>{conversationId ? t('هذه المحادثة غير موجودة في حسابك.', 'This conversation is not in your account.') : t('اختر محادثة لقراءة الرسائل والردّ.', 'Choose a conversation to read and reply.')}</p><a href={pageHref('/contact', language)} className="zc-button zc-secondary">{t('تواصل مع الفريق', 'Contact the team')}</a></section>}
         </div>}
         {currentTab === 'notifications' && <NotificationList language={language} notices={notices} update={setNotices} error={showNoticeIssue} onUnauthorized={expire} />}
-        {currentTab === 'profile' && <CustomerSettings profile={dashboard.profile} userId={dashboard.user.id} language={language} reload={() => load()} />}
+        {currentTab === 'profile' && dashboard && <CustomerSettings profile={dashboard.profile} userId={dashboard.user.id} language={language} reload={() => load()} />}
       </>}
     </div>}
   </section>;

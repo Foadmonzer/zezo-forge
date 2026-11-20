@@ -943,6 +943,32 @@ try {
   const oversizedRow = await client.query('SELECT count(*)::int AS count FROM stored_attachments WHERE "fileName" = $1', ['synthetic-oversize.pdf']);
   assert(Number(oversizedRow.rows[0].count) === 0, 'Oversized attachment bytes were persisted.');
   results.push('BYTEA attachment access controls plus exact 4 MB accepted / 4 MB + 1 byte rejected boundary');
+  const threadPath = `/api/conversations/${syntheticConversationId}`;
+  await client.query(`UPDATE user_accounts SET data = jsonb_set(data,'{permissionOverrides}',
+    '{"conversations.read":"assigned","conversations.reply":"assigned"}'::jsonb)
+    WHERE id = $1`, [employees.developer.id]);
+  const developerChat = { message: 'Synthetic line one\nSynthetic line two.', idempotencyKey: randomUUID().replaceAll('-', '') };
+  const forbiddenChat = await request('POST', staffReplyEndpoint, { body: developerChat, cookie: employees.developer.cookie });
+  assert(forbiddenChat.status === 404, 'Developer sent a message to an unrelated conversation.');
+  const assignedDeveloperChat = await request('PATCH', threadPath, { body: { assignedUserId: employees.developer.id }, cookie: ownerCookie });
+  assert(assignedDeveloperChat.status === 200, 'Owner could not assign a conversation to the scoped developer.');
+  const chatRetries = await Promise.all(Array.from({ length: 3 }, () => request('POST', staffReplyEndpoint, { body: developerChat, cookie: employees.developer.cookie })));
+  assert(chatRetries.filter(item => item.status === 201).length === 1 && chatRetries.filter(item => item.status === 200).length === 2,
+    'Assigned developer chat was not accepted once across concurrent retries.');
+  const storedDeveloperReply = await client.query(`SELECT body,data->>'senderType' AS sender_type FROM conversation_messages WHERE "conversationId"=$1 AND "senderId"=$2`, [syntheticConversationId, employees.developer.id]);
+  assert(storedDeveloperReply.rowCount === 1 && storedDeveloperReply.rows[0].body === developerChat.message && storedDeveloperReply.rows[0].sender_type === 'staff',
+    'Developer reply lost its line breaks, author type, or idempotency.');
+  const listOnly = await request('GET', '/api/conversations?summary=1', { cookie: customerCookie });
+  assert(listOnly.status === 200 && listOnly.data.conversations.some(item => item.id === syntheticConversationId && !item.messages.length),
+    'Chat summary must keep the authorized thread without loading its history.');
+  const closedChat = await request('PATCH', threadPath, { body: { status: 'closed', assignedUserId: employees.order_manager.id }, cookie: ownerCookie });
+  assert(closedChat.status === 200, 'Owner could not close the synthetic thread.');
+  assert((await request('POST', staffReplyEndpoint, { body: { ...developerChat, idempotencyKey: randomUUID().replaceAll('-', '') }, cookie: customerCookie })).status === 409,
+    'A new message was accepted for a closed conversation.');
+  assert((await request('GET', threadPath, { cookie: employees.developer.cookie })).status === 404, 'The former chat assignee retained access.');
+  const reopenedChat = await request('PATCH', threadPath, { body: { status: 'in_progress' }, cookie: ownerCookie });
+  assert(reopenedChat.status === 200, 'Could not reopen the synthetic conversation for quote testing.');
+  results.push('developer replies require assigned access, preserve multiline text and sender type, deduplicate retries, and honor closed threads');
   const quoteLockHolder = new pg.Client({ connectionString: process.env.DATABASE_URL });
   await quoteLockHolder.connect();
   let quoteWhileLocked;
@@ -1091,6 +1117,18 @@ try {
     'Developer dashboard still waited on the global advisory lock or lost the assigned project.');
   assert(!developerDashboardWhileLocked.value.data.projects?.some(project => project.id !== syntheticLeadId), 'Developer dashboard exposed another employee project.');
   results.push('developer dashboard reads scoped project, commission, wallet, and referral data without the global advisory lock');
+  const decisionPath = `/api/developer/projects/${syntheticLeadId}/decision`;
+  const declined = await request('POST', decisionPath, { body: { decision: 'decline' }, cookie: employees.developer.cookie });
+  assert(declined.status === 200, 'Developer could not decline an unstarted offer.');
+  const afterDecline = await request('GET', '/api/dashboard', { cookie: employees.developer.cookie });
+  assert(afterDecline.status === 200 && !afterDecline.data.projects.some(project => project.id === syntheticLeadId), 'Declined assignment still appeared in the developer workspace.');
+  assert((await request('POST', decisionPath, { body: { decision: 'accept' }, cookie: employees.developer.cookie })).status === 404,
+    'A historical assignment restored the former developer’s write permission.');
+  const offeredAgain = await request('PATCH', `/api/projects/${syntheticLeadId}/assignment`, {
+    body: { developerUserId: employees.developer.id, developerDueDate: '2026-12-01' }, cookie: ownerCookie
+  });
+  assert(offeredAgain.status === 200, 'Owner could not explicitly assign the project again.');
+  results.push('declining an assignment revokes project access until a new Owner assignment');
   const developerDecision = await request('POST', `/api/developer/projects/${syntheticLeadId}/decision`, {
     body: { decision: 'accept', note: 'Synthetic acceptance for the database test.' }, cookie: employees.developer.cookie
   });
