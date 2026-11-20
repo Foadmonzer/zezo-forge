@@ -124,7 +124,7 @@ export function CustomerRequest({ language, templates, options }: { language: La
     const { draft, user } = state;
     setIssue('');
     if (draft.step === 1 && (!phoneValid(draft.phone) || draft.details.trim().length < 12)) {
-      return setIssue(t('أضف تفاصيل المشروع ورقم واتساب دولياً صالحاً.', 'Add your project details and a valid international WhatsApp number.'));
+      return setIssue(t('أضف تفاصيل المشروع وأدخل رقم واتساب صحيحًا مع رمز الدولة.', 'Add your project details and a valid WhatsApp number with its country code.'));
     }
     if (draft.step < 3) return go(draft.step + 1);
     if (!user || user.role !== 'client') {
@@ -178,7 +178,7 @@ export function CustomerRequest({ language, templates, options }: { language: La
     <section className="zc zc-request">
       <header className="zc-heading">
         <h1>{t('اطلب مشروعك', 'Request a project')}</h1>
-        <p>{t('صف ما تريد تنفيذه. تابع طلبك وعروض الأسعار من حسابك.', 'Tell us what you want to build. Track the request and quotes from your account.')}</p>
+        <p>{t('اختر الخدمة وشاركنا تفاصيل مشروعك. يمكنك متابعة الطلب وعروض الأسعار من حسابك.', 'Choose a service and tell us about your project. Track your request and quotes in your account.')}</p>
       </header>
       <div className="zc-steps-layout">
         <aside aria-label={t('مراحل الطلب', 'Request steps')}>
@@ -208,7 +208,10 @@ export function CustomerRequest({ language, templates, options }: { language: La
             </select></label>}
           </>}
           {step === 1 && <>
-            <label>{t('ما الذي تريد تنفيذه؟', 'What would you like to build?')}<textarea rows={6} required minLength={12} maxLength={3000} dir="auto" value={draft.details} onChange={event => update({ details: event.target.value })} /></label>
+            <div>
+              <label>{t('ما المشروع الذي ترغب في تنفيذه؟', 'What would you like to build?')}<textarea rows={6} required minLength={12} maxLength={3000} dir="auto" aria-describedby="zc-project-details-help" value={draft.details} onChange={event => update({ details: event.target.value })} /></label>
+              <p id="zc-project-details-help">{t('شاركنا فكرتك ومتطلبات مشروعك، وسنساعدك على تحويلها إلى حل رقمي متكامل.', 'Share your idea and project requirements. We’ll help you turn them into a complete digital solution.')}</p>
+            </div>
             <label>{t('رقم واتساب الدولي', 'International WhatsApp number')}<input required type="tel" autoComplete="tel" dir="ltr" placeholder="+971500000000" maxLength={25} value={draft.phone} onChange={event => update({ phone: event.target.value })} /></label>
             <label>{t('الميزانية المتوقعة (اختياري)', 'Estimated budget (optional)')}<input maxLength={80} value={draft.budget} onChange={event => update({ budget: event.target.value })} /></label>
           </>}

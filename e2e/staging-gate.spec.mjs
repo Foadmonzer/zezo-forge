@@ -20,6 +20,10 @@ test('staging gate protects pages, API, and static assets until a secure session
   expect(staticAsset.headers()['content-type']).toContain('text/html');
   expect(await staticAsset.text()).toContain('دخول بيئة الاختبار');
 
+  const artwork = await request.get('/assets/zezo-idea-to-product.svg');
+  expect(artwork.headers()['content-type']).toContain('text/html');
+  expect(await artwork.text()).toContain('دخول بيئة الاختبار');
+
   const wrongInternalSecret = await request.post('/api/staging/rate-limit', {
     data: { address: 'synthetic-test' }
   });
@@ -60,7 +64,7 @@ test('staging gate protects pages, API, and static assets until a secure session
   // The form already redirected to '/'. Wait for the protected content in
   // that document instead of racing the dev server with another navigation.
   await expect(page.locator('#zf-content h1')).toBeVisible();
-  const protectedHero = page.locator('.zpub-planet img');
+  const protectedHero = page.locator('[data-zezo-art="hero"] img');
   await expect.poll(() => protectedHero.evaluate(image => image.naturalWidth)).toBeGreaterThan(0);
   await expect(page.locator('body')).not.toContainText('دخول بيئة الاختبار');
 

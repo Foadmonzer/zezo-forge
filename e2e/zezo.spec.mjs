@@ -143,6 +143,12 @@ test('browser navigation works in Chromium, Firefox, and WebKit', async ({ page,
   await page.goto('/', { waitUntil: 'domcontentloaded' });
   await expect(page.locator('#zf-content h1')).toBeVisible();
   await expect(page.locator('script[src="/app.js"]')).toHaveCount(0);
+  await expect.poll(() => page.locator('[data-zezo-art="hero"] img').evaluate(image => image.naturalWidth)).toBeGreaterThan(0);
+  await expect(page.locator('#zf-content canvas')).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'ما المشروع الذي ترغب في تنفيذه؟', exact: true })).toBeVisible();
+  await page.goto('/about?lang=en', { waitUntil: 'domcontentloaded' });
+  await expect(page.getByRole('heading', { name: 'About ZEZO', exact: true })).toBeVisible();
+  await expect.poll(() => page.locator('[data-zezo-art="about"] img').evaluate(image => image.naturalWidth)).toBeGreaterThan(0);
   await page.goto('/templates?lang=en');
   await expect(page.getByRole('heading', { name: 'Template library' })).toBeVisible();
   await expect(page.locator('.zezo-platform')).toHaveAttribute('dir', 'ltr');

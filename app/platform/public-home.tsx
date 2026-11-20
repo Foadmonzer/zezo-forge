@@ -1,5 +1,4 @@
-import Image from 'next/image';
-import { PublicBlock, PublicHero, PublicButton, PublicSectionTitle, ServiceGrid, ExampleTiles, ProcessSteps, PublicCallout } from './public-blocks';
+import { PublicArt, PublicBlock, PublicHero, PublicButton, PublicSectionTitle, ServiceGrid, ExampleTiles, ProcessSteps, PublicCallout } from './public-blocks';
 import { publicHref, publicTemplates, startRequest, type PublicLanguage } from './public-content';
 import { PublicReviewPreview } from './public-review-preview';
 
@@ -10,29 +9,22 @@ export function PublicHome({ language }: { language: PublicLanguage }) {
   return (
     <PublicBlock language={language}>
       <PublicHero
-        label="ZEZO DIGITAL SOLUTIONS & AI"
+        label="ZEZO Digital Solutions & AI"
         title={isAr ? 'من الفكرة إلى الواقع الرقمي.' : 'From idea to digital reality.'}
-        detail={isAr ? 'نصمّم ونطوّر مواقع وتطبيقات وحلول ذكاء اصطناعي تساعد مشروعك على البدء والنمو.' : 'We design and build websites, apps, and AI solutions that help your project get started and grow.'}
+        detail={isAr ? 'نصمّم ونطوّر مواقع وتطبيقات وحلول ذكاء اصطناعي تساعدك على إطلاق مشروعك وتطويره.' : 'We design and build websites, apps, and AI solutions that help you launch and grow your business.'}
         actions={<><PublicButton href={startRequest(language)} primary>{isAr ? 'اطلب مشروعك' : 'Start a project'}</PublicButton>
           <PublicButton href={publicHref('/templates', language)}>{isAr ? 'استكشف القوالب' : 'Explore templates'}</PublicButton></>}>
-        <div className="zpub-hero-art" aria-hidden="true">
-          <span className="zpub-orbit" />
-          <span className="zpub-orbit zpub-orbit-outer" />
-          <div className="zpub-planet">
-            <Image src="/assets/zezo-planet-texture.jpg" alt="" fill sizes="(max-width: 550px) 230px, (max-width: 900px) 290px, 390px" loading="eager" fetchPriority="high" decoding="async" />
-          </div>
-          <span className="zpub-orbit-point"/>
-        </div>
+        <PublicArt scene="hero" />
       </PublicHero>
       <section className="zpub-section">
         <PublicSectionTitle title={isAr ? 'خدماتنا' : 'Our services'}
-          detail={isAr ? 'اختر نوع المشروع الأقرب إلى هدفك.' : 'Choose the service that fits what you want to do.'}
+          detail={isAr ? 'اختر الخدمة التي تناسب هدف مشروعك.' : 'Choose the service that fits your project.'}
           action={<PublicButton href={publicHref('/services', language)}>{isAr ? 'جميع الخدمات' : 'All services'}</PublicButton>} />
         <ServiceGrid language={language} />
       </section>
       <section className="zpub-section">
-        <PublicSectionTitle title={isAr ? 'جرّب فكرة قبل أن تطلبها' : 'Try an idea before you request it'}
-          detail={isAr ? 'نماذج تفاعلية من مكتبة ZEZO تساعدك على اختيار نقطة البداية.' : 'Interactive demos from the ZEZO library can help you choose a starting point.'}
+        <PublicSectionTitle title={isAr ? 'جرّب النماذج التفاعلية' : 'Try our interactive demos'}
+          detail={isAr ? 'استكشف نماذج من مكتبة ZEZO واختر ما يناسب فكرتك.' : 'Explore the ZEZO library and find a starting point for your idea.'}
           action={<PublicButton href={publicHref('/work', language)}>{isAr ? 'شاهد أعمالنا' : 'Explore our work'}</PublicButton>} />
         <ExampleTiles templates={publicTemplates.filter(template => highlights.includes(template.id))} language={language} />
       </section>

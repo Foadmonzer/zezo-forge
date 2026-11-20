@@ -55,7 +55,7 @@ function PriceLabel({ template, pricing, language }: { template: PublicTemplate;
   const isAr = language === 'ar';
   if (pricing.state === 'loading') return <span className="zpub-price is-muted">{isAr ? 'جارٍ تحميل السعر…' : 'Loading price…'}</span>;
   if (pricing.state === 'unavailable') return <span className="zpub-price is-muted">{isAr ? 'السعر غير متاح الآن' : 'Price temporarily unavailable'}</span>;
-  if (pricing.value.templateActive[template.id] === false) return <span className="zpub-price is-muted">{isAr ? 'متوقف للطلبات مؤقتاً' : 'Temporarily unavailable for orders'}</span>;
+  if (pricing.value.templateActive[template.id] === false) return <span className="zpub-price is-muted">{isAr ? 'الطلب غير متاح مؤقتًا' : 'Temporarily unavailable to order'}</span>;
   const amount = priceOf(template, pricing);
   if (amount === null) return <span className="zpub-price">{isAr ? 'عرض سعر حسب الطلب' : 'Quote on request'}</span>;
   const formatted = new Intl.NumberFormat(isAr ? 'ar' : 'en', { style: 'currency', currency: 'ILS', maximumFractionDigits: 2 }).format(amount);
@@ -66,7 +66,7 @@ function PricingNotice({ pricing, language, retry }: { pricing: Pricing; languag
   if (pricing.state !== 'unavailable') return null;
   const isAr = language === 'ar';
   return <div role="status" className="zpub-data-notice">
-    <span>{isAr ? 'تعذّر تحميل الأسعار الحالية. لا تزال المعاينات متاحة.' : 'Current prices could not be loaded. You can still open previews.'}</span>
+    <span>{isAr ? 'تعذّر تحميل الأسعار. يمكنك معاينة القوالب الآن والمحاولة مجدّدًا.' : 'Prices didn’t load. You can preview templates and try again.'}</span>
     <button className="zpub-button" type="button" onClick={retry}>{isAr ? 'أعد المحاولة' : 'Retry'}</button>
   </div>;
 }
@@ -108,7 +108,7 @@ export function TemplateLibrary({ templates, language, initialService }: { templ
           <span>{isAr ? 'الخدمة' : 'Service'}</span>
           <select name="service" value={service} onChange={event => { setService(event.target.value as ServiceId | 'all'); setLimit(pageSize); }}>
             <option value="all">{isAr ? 'جميع الخدمات' : 'All services'}</option>
-            {publicServices.map(item => <option key={item.id} value={item.id}>{item.label[language]}</option>)}
+            {publicServices.map(item => <option key={item.id} value={item.id}>{item.title[language]}</option>)}
           </select>
         </label>
         <label>
@@ -116,16 +116,16 @@ export function TemplateLibrary({ templates, language, initialService }: { templ
           <select name="sort" value={sort} onChange={event => { setSort(event.target.value as typeof sort); setLimit(pageSize); }}>
             <option value="featured">{isAr ? 'الترتيب الأصلي' : 'Default order'}</option>
             <option value="name">{isAr ? 'الاسم' : 'Name'}</option>
-            <option value="price" disabled={pricing.state !== 'ready'}>{isAr ? 'السعر: الأقل أولاً' : 'Price: low to high'}</option>
+            <option value="price" disabled={pricing.state !== 'ready'}>{isAr ? 'من السعر الأقل إلى الأعلى' : 'Price, low to high'}</option>
           </select>
         </label>
       </div>
-      <p aria-live="polite" className="zpub-results-count">{isAr ? `عرض ${Math.min(limit, filtered.length)} من ${filtered.length} قالباً` : `Showing ${Math.min(limit, filtered.length)} of ${filtered.length} templates`}</p>
+      <p aria-live="polite" className="zpub-results-count">{isAr ? `القوالب المعروضة (${Math.min(limit, filtered.length)} من ${filtered.length})` : `Showing ${Math.min(limit, filtered.length)} of ${filtered.length} templates`}</p>
       <PricingNotice pricing={pricing} language={language} retry={reload} />
       {!filtered.length && <div className="zpub-copy-panel">
         <h2>{isAr ? 'لم نجد قوالب مطابقة' : 'No matching templates'}</h2>
         <p>{isAr ? 'جرّب عبارة مختلفة أو اختر جميع الخدمات.' : 'Try a different term or select all services.'}</p>
-        <button className="zpub-button" type="button" onClick={() => { setQuery(''); setService('all'); setLimit(pageSize); }}>{isAr ? 'امسح عوامل التصفية' : 'Clear filters'}</button>
+        <button className="zpub-button" type="button" onClick={() => { setQuery(''); setService('all'); setLimit(pageSize); }}>{isAr ? 'إلغاء التصفية' : 'Clear filters'}</button>
       </div>}
       <div className="zpub-template-grid">
         {filtered.slice(0, limit).map(template => <article className="zpub-template-card" key={template.id} data-template-id={template.id}>
@@ -133,7 +133,7 @@ export function TemplateLibrary({ templates, language, initialService }: { templ
             <PublicPhoto template={template} language={language} />
           </Link>
           <div className="zpub-template-card-content">
-            <p className="zpub-template-category"><bdi>{template.code}</bdi><span>{findPublicService(template.service)?.label[language]}</span></p>
+            <p className="zpub-template-category"><bdi>{template.code}</bdi><span>{findPublicService(template.service)?.title[language]}</span></p>
             <h2><Link href={publicHref(`/templates/${template.id}`, language)} prefetch={false}>{template.title[language]}</Link></h2>
             <p className="zpub-template-description">{template.description[language]}</p>
             <PriceLabel template={template} pricing={pricing} language={language} />

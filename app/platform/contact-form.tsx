@@ -66,20 +66,20 @@ export function ContactForm({ language }: { language: FeedbackLanguage }) {
   const accountHref = `/account?${new URLSearchParams({ next: en ? '/contact?lang=en' : '/contact', ...(en ? { lang: 'en' } : {}) })}`;
   const threadHref = `/account/settings?${new URLSearchParams({ tab: 'messages', conversation: requestId, ...(en ? { lang: 'en' } : {}) })}`;
   return <section className="zf-feedback-box" aria-labelledby="contact-enquiry-heading">
-    <h2 id="contact-enquiry-heading">{en ? 'Send an enquiry' : 'أرسل استفساراً'}</h2>
+    <h2 id="contact-enquiry-heading">{en ? 'Send an enquiry' : 'أرسل استفسارًا'}</h2>
     {requestId ? <div className="zf-feedback-success">
-      <p role="status">{en ? 'Your enquiry was saved. Follow replies in your account.' : 'حُفظ استفسارك. يمكنك متابعة الردود من حسابك.'}</p>
+      <p role="status">{en ? 'We’ve received your enquiry. Check Messages in your account for replies.' : 'وصلنا استفسارك. تابع قسم الرسائل في حسابك للاطّلاع على الردود.'}</p>
       <a className="zf-button zf-button--primary" href={threadHref}>{en ? 'Open conversation' : 'افتح المحادثة'}</a>
-      <button type="button" className="zf-button" onClick={() => setRequestId('')}>{en ? 'Send another enquiry' : 'أرسل استفساراً آخر'}</button>
+      <button type="button" className="zf-button" onClick={() => setRequestId('')}>{en ? 'Send another enquiry' : 'أرسل استفسارًا آخر'}</button>
     </div> : <form className="zf-feedback-form" onSubmit={submit} aria-busy={busy}>
-      <p>{en ? 'Sign in with a customer account to send an enquiry and receive replies here.' : 'سجّل الدخول بحساب عميل لإرسال الاستفسار ومتابعة الردود هنا.'}</p>
+      <p>{en ? 'Sign in with your customer account to send an enquiry and read replies.' : 'سجّل الدخول إلى حساب العميل لإرسال استفسارك ومتابعة الردود.'}</p>
       <label>{en ? 'Your message' : 'رسالتك'}<textarea rows={6} dir="auto" required minLength={10} maxLength={2000} value={message}
         onChange={event => setMessage(event.target.value)} disabled={busy} /></label>
       <div className="zf-contact-trap" aria-hidden="true"><label>Website<input type="text" name="website" tabIndex={-1} autoComplete="off" /></label></div>
       <p>{en ? 'Please leave out passwords and financial information.' : 'يرجى عدم إدراج كلمات المرور أو المعلومات المالية.'}</p>
       {error && <p role="alert" className="zf-feedback-error">{error}</p>}
       <div className="zf-feedback-buttons">
-        {signIn ? <a className="zf-button zf-button--primary" href={accountHref}>{en ? 'Sign in or create an account' : 'سجّل الدخول أو أنشئ حساباً'}</a>
+        {signIn ? <a className="zf-button zf-button--primary" href={accountHref}>{en ? 'Sign in or create an account' : 'سجّل الدخول أو أنشئ حسابًا'}</a>
           : <button type="submit" className="zf-button zf-button--primary" disabled={busy}>{busy ? (en ? 'Sending…' : 'جارٍ الإرسال…') : (en ? 'Send enquiry' : 'إرسال الاستفسار')}</button>}
       </div>
     </form>}
