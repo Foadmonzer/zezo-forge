@@ -8,6 +8,11 @@ const buildDir = requestedBuildDir && /^\.next-[a-z0-9-]+$/.test(requestedBuildD
 const nextConfig: NextConfig = {
   distDir: buildDir,
   poweredByHeader: false,
+  images: {
+    // The optimizer's internal asset request does not carry the staging
+    // cookie. Let the authenticated browser request the protected image.
+    unoptimized: process.env.ZEZO_STAGING === 'true' || process.env.CONTEXT === 'deploy-preview'
+  },
   async headers() {
     return [
       {

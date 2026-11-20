@@ -15,6 +15,7 @@ import { claimGuestConversations, findLoginAccount, loadClientDashboardData, loa
 import { changePostgresPassword, enablePostgresMfa, logoutPostgresSession, setupPostgresMfa } from './src/server/postgres-auth-repository.js';
 import { getRequestPublicSiteOrigin } from './src/public-site-origin.js';
 import { acceptPostgresQuote, createPostgresConversation, createPostgresConversationMessage, createPostgresQuote } from './src/server/postgres-conversation-repository.js';
+import { listPublishedProjectReviews, listProjectReviewsForModeration, loadCustomerProjectReview, moderateProjectReview, submitProjectReview } from './src/server/postgres-project-review-repository.js';
 import { approvalEmail, mailWithFooter, teamInvitationEmail, verificationEmail } from './src/server/transactional-email.js';
 import { postgresOutboxSettings } from './src/server/outbox-worker.js';
 import { ResendMailError, sendWithResend } from './src/server/resend-mail.js';
@@ -1829,19 +1830,20 @@ async function handlePostgresCoreRead(req, res, path) {
   }
   return false;
 }
-async function bodyBuffer(req) {
+async function bodyBuffer(req, max = MAX_BODY) {
   const declared = Number(req.headers['content-length'] || 0);
-  if (declared > MAX_BODY) throw Object.assign(new Error('حجم الطلب أكبر من المسموح (6MB)'), { status: 413 });
+  const sizeError = () => Object.assign(new Error(max === MAX_BODY ? 'حجم الطلب أكبر من المسموح (6MB)' : 'حجم الطلب أكبر من المسموح / Request is too large'), { status: 413 });
+  if (declared > max) throw sizeError();
   const chunks = []; let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > MAX_BODY) throw Object.assign(new Error('حجم الطلب أكبر من المسموح (6MB)'), { status: 413 });
+    if (size > max) throw sizeError();
     chunks.push(chunk);
   }
   return Buffer.concat(chunks);
 }
-async function jsonBody(req) {
-  const buf = await bodyBuffer(req);
+async function jsonBody(req, max) {
+  const buf = await bodyBuffer(req, max);
   if (!buf.length) return {};
   try { return JSON.parse(buf.toString('utf8')); }
   catch { throw Object.assign(new Error('صيغة البيانات غير صالحة / Invalid request data'), { status: 400 }); }
@@ -2429,6 +2431,7 @@ async function handlePostgresProjectRequest(req, res, path) {
   }
 
   const conversationId = clean(body.conversationId, 80);
+  const createConversation = !conversationId && body.createConversation === 'true';
   // A registered customer's stored attribution is the only authority for a
   // project request. URL/body fields remain untrusted display/legacy values.
   const suppliedKey = clean(req.headers['idempotency-key'] || body.idempotencyKey, 120);
@@ -2441,6 +2444,7 @@ async function handlePostgresProjectRequest(req, res, path) {
     payload: {
       customerId: auth.user.id, phone, service, category, details,
       budget: clean(body.budget, 80), templateId, templateAction, conversationId,
+      createConversation,
       guestHash: guestSessionValue(req) ? hash(guestSessionValue(req)) : '',
       language: body.lang === 'en' ? 'en' : 'ar'
     },
@@ -2448,7 +2452,11 @@ async function handlePostgresProjectRequest(req, res, path) {
     siteBase: siteBase(req), trackingTtlMs: TRACKING_TTL_MS,
     defaultTemplateInclusion,
     auditId: id('evt'), messageId: id('msg'), at: createdAt, file: attachmentFile
+  }).catch(error => {
+    if (createConversation && ['55P03', '40P01', '40001'].includes(error.code)) return { kind: 'busy' };
+    throw error;
   });
+  if (result.kind === 'busy') return respond(503, { error: 'الخدمة مشغولة الآن. مسودتك محفوظة؛ حاول مجدداً / The service is busy. Your draft is saved; please retry.' });
   if (result.kind === 'unauthenticated') return respond(401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' });
   if (result.kind === 'forbidden') return respond(403, { error: 'استخدم حساب العميل لإرسال الطلب / Use a client account to submit this request' });
   if (result.kind === 'conversation_forbidden') return respond(403, { error: 'لا يمكن ربط الطلب بهذه المحادثة / This conversation cannot be linked to your request' });
@@ -2812,9 +2820,125 @@ async function handlePostgresInvitationWrite(req, res, path) {
   return respond(200, { ok: true, user: publicUser(result.employee), activationToken: activation, expiresInHours: 24, emailQueued: emailReady() });
 }
 
+function feedbackPage(url) {
+  const boundedNumber = (name, fallback, max) => {
+    const value = url.searchParams.get(name);
+    return /^\d{1,5}$/.test(value || '') ? Math.min(Number(value), max) : fallback;
+  };
+  return { limit: Math.max(1, boundedNumber('limit', 12, 40)), offset: boundedNumber('offset', 0, 10000) };
+}
+
+function feedbackText(value, min, max) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  return text.length >= min && text.length <= max && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text) ? text : null;
+}
+
+const projectReviewStatus = ['pending', 'published', 'hidden'];
+
+async function handlePlatformFeedback(req, res, path) {
+  const customerReview = /^\/api\/client\/project-reviews\/([A-Za-z0-9_-]{1,96})$/.exec(path);
+  const moderateReview = /^\/api\/admin\/project-reviews\/([A-Za-z0-9_-]{1,96})$/.exec(path);
+  const publicReviews = path === '/api/reviews';
+  const moderationList = path === '/api/admin/project-reviews';
+  const contact = path === '/api/contact';
+  if (!publicReviews && !moderationList && !contact && !customerReview && !moderateReview) return false;
+
+  const respond = (status, data, extraHeaders = {}) => {
+    json(res, status, data, { ...responseSecurityHeaders(), ...extraHeaders });
+    return true;
+  };
+  const failure = (status, error) => respond(status, { error });
+  if (!stagingAuthorized(req)) return failure(401, 'دخول بيئة الاختبار مطلوب / Staging authentication required');
+  if (!postgresConfigured()) return failure(503, 'الخدمة غير متاحة مؤقتاً / This service is temporarily unavailable');
+
+  const allowed = customerReview ? ['GET', 'POST'] : contact ? ['POST'] : moderateReview ? ['PATCH'] : ['GET'];
+  if (!allowed.includes(req.method)) return respond(405, { error: 'عملية غير متاحة / Method not allowed' }, { Allow: allowed.join(', ') });
+  const isWrite = req.method !== 'GET';
+  if (isWrite && (!referralRequestHasSameOrigin(req) || !/^application\/json(?:\s*;|$)/i.test(String(req.headers['content-type'] || '')))) {
+    return failure(403, 'تعذر التحقق من مصدر الطلب / The request source could not be verified');
+  }
+
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  try {
+    if (publicReviews) return respond(200, await listPublishedProjectReviews({ ...feedbackPage(url), sort: url.searchParams.get('sort') }));
+
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, moderationList || moderateReview ? ['admin'] : ['client'])) return true;
+    if (auth.user.accountDisabledAt) return failure(403, 'هذا الحساب غير متاح / This account is disabled');
+    if (moderationList) {
+      const status = url.searchParams.get('status');
+      return respond(200, await listProjectReviewsForModeration({ ...feedbackPage(url), status: projectReviewStatus.includes(status) ? status : null }));
+    }
+    if (customerReview && !isWrite) {
+      const review = await loadCustomerProjectReview(customerReview[1], auth.user.id);
+      return review ? respond(200, review) : failure(404, 'المشروع غير متاح / Project not available');
+    }
+
+    const key = sessionKey(auth.sid);
+    const body = await jsonBody(req, 12_000);
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return failure(400, 'صيغة البيانات غير صالحة / Invalid request data');
+    if (contact) {
+      const message = feedbackText(body.message, 10, 2000);
+      const requestKey = req.headers['idempotency-key'];
+      if (!message || body.website || typeof requestKey !== 'string' || !/^[a-zA-Z0-9_-]{32,120}$/.test(requestKey)) {
+        return failure(400, 'أدخل رسالة بين 10 و2000 حرف وحاول مجدداً / Enter a message of 10–2,000 characters and try again');
+      }
+      const ip = req.socket?.remoteAddress || 'unknown';
+      if (!await consumeRateLimitBucket('contact-enquiry-client', auth.user.id, 8, 60 * 60_000) ||
+          !await consumeRateLimitBucket('contact-enquiry-ip', ip, 25, 60 * 60_000)) {
+        return failure(429, 'بلغت الحد المؤقت للاستفسارات. حاول لاحقاً / Enquiry limit reached. Try again later');
+      }
+      const referral = await resolvePostgresReferralForConversation(auth.user);
+      const createdAt = now();
+      const conversation = {
+        id: `chat_${hash(`contact:${auth.user.id}:${requestKey}`).slice(0, 40)}`,
+        createdAt, updatedAt: createdAt, templateId: null, templateName: '', templateService: '', templateCategory: '',
+        source: 'contact', department: 'orders', status: 'new', clientId: auth.user.id, assignedUserId: null,
+        guestSessionHash: null, leadId: null, messages: [],
+        referralCode: referral?.code || '', referralLinkId: referral?.linkId || null, referralUserId: referral?.userId || null
+      };
+      const result = await createPostgresConversation({
+        conversation, message, actor: auth.user, guestHash: '', idempotencyHash: hash(`contact:${requestKey}:${message}`),
+        auditId: id('evt'), messageId: id('msg'), at: createdAt, referral, authorizeRecipient: canReceiveConversationNotification,
+        sessionHash: key
+      });
+      if (result.kind === 'unauthorized') return failure(401, 'انتهت الجلسة. سجّل الدخول / Your session has ended. Sign in again');
+      if (result.kind === 'conflict') return failure(409, 'تغيّر محتوى طلب سبق إرساله. حدّث الصفحة وحاول مجدداً / An existing enquiry has different content. Refresh and try again');
+      return respond(result.kind === 'duplicate' ? 200 : 201, { ok: true, id: conversation.id });
+    }
+
+    let result;
+    if (customerReview) {
+      const review = feedbackText(body.body, 8, 1200);
+      if (!review || !Number.isInteger(body.rating) || body.rating < 1 || body.rating > 5) {
+        return failure(400, 'اختر تقييماً من 1 إلى 5 واكتب من 8 إلى 1200 حرف / Choose 1–5 stars and write 8–1,200 characters');
+      }
+      result = await submitProjectReview({ sessionHash: key, actorId: auth.user.id, projectId: customerReview[1], rating: body.rating, body: review });
+    } else {
+      const hasReply = Object.hasOwn(body, 'reply');
+      const reply = hasReply ? feedbackText(body.reply, 0, 1200) : undefined;
+      const hasStatus = Object.hasOwn(body, 'status');
+      if (hasStatus === hasReply || (hasReply && reply === null) || (hasStatus && !['published', 'hidden'].includes(body.status))) {
+        return failure(400, 'إجراء المراجعة غير صالح / Invalid moderation action');
+      }
+      result = await moderateProjectReview({ sessionHash: key, actorId: auth.user.id, projectId: moderateReview[1], status: body.status, reply });
+    }
+    if (result.kind === 'unauthorized') return failure(401, 'انتهت الجلسة. سجّل الدخول / Your session has ended. Sign in again');
+    if (result.kind === 'missing') return failure(404, 'المشروع أو التقييم غير متاح / Project or review not available');
+    if (result.kind === 'ineligible') return failure(409, 'التقييم متاح بعد إكمال المشروع وتسليمه. الرد متاح بعد النشر / Only completed, delivered projects can be reviewed. Publish before replying');
+    return respond(result.kind === 'created' ? 201 : 200, { review: result.review });
+  } catch (error) {
+    if (error.status === 400 || error.status === 413) return failure(error.status, error.message);
+    if (['55P03', '40P01', '40001'].includes(error.code)) return failure(503, 'الخدمة مشغولة الآن. حاول بعد لحظات / The service is busy. Please try again in a moment');
+    throw error;
+  }
+}
+
 async function handle(req, res) {
-  if (!postgresConfigured()) return handleRequest(req, res);
   const path = new URL(req.url, `http://localhost:${PORT}`).pathname;
+  if (await handlePlatformFeedback(req, res, path)) return;
+  if (!postgresConfigured()) return handleRequest(req, res);
   // Public Owner setup is permanently closed. The first Owner is provisioned
   // only by scripts/provision-owner.mjs with direct administrative DB access.
   if (req.method === 'POST' && path === '/api/setup') return handleRequest(req, res);

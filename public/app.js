@@ -474,15 +474,19 @@ function observeReveals(){
   nodes.forEach(n=>observer.observe(n));
 }
 function setupHero(){
+  if (document.getElementById('zezo-legacy-root')?.classList.contains('template-preview-mode') ||
+      location.pathname === '/team' || location.pathname === '/activate' || state.motion ||
+      matchMedia('(max-width: 760px), (pointer: coarse), (prefers-reduced-motion: reduce)').matches ||
+      navigator.connection?.saveData) return;
   const hero=$('#hero'),scene=$('#heroVisual'),stage=$('#orbitStage'),starCanvas=$('#starfield'),planetCanvas=$('#planetCanvas'),body=$('#saturnBody');
   const starCtx=starCanvas?.getContext('2d',{alpha:true});
   if(!hero||!scene||!stage||!starCtx||!planetCanvas)return;
   const pointer={x:-1000,y:-1000,nx:0,ny:0,active:false};
-  const stars=[],bursts=[];let width=1,height=1,dpr=1,raf=0,inView=true,gl=null,program=null,buffers=null,locations=null,indexCount=0,planetWidth=0,planetTexture=null,textureReady=false;
+  const stars=[],bursts=[];let width=1,height=1,dpr=1,raf=0,lastFrame=0,inView=true,gl=null,program=null,buffers=null,locations=null,indexCount=0,planetWidth=0,planetTexture=null,textureReady=false;
 
   function sizeScene(){
     const rect=scene.getBoundingClientRect();if(rect.width<2||rect.height<2)return;
-    dpr=Math.min(window.devicePixelRatio||1,1.6);width=rect.width;height=rect.height;
+    dpr=Math.min(window.devicePixelRatio||1,1.25);width=rect.width;height=rect.height;
     starCanvas.width=Math.max(1,Math.round(width*dpr));starCanvas.height=Math.max(1,Math.round(height*dpr));
     starCanvas.style.width=`${width}px`;starCanvas.style.height=`${height}px`;starCtx.setTransform(dpr,0,0,dpr,0,0);
     stars.length=0;let seed=41827;const random=()=>{seed=(seed*1664525+1013904223)>>>0;return seed/4294967296};
@@ -497,7 +501,7 @@ function setupHero(){
       const vert=`attribute vec3 aPosition;attribute vec2 aUv;uniform float uYaw;uniform float uPitch;varying vec3 vNormal;varying vec2 vUv;void main(){float cy=cos(uYaw);float sy=sin(uYaw);vec3 p=vec3(aPosition.x*cy+aPosition.z*sy,aPosition.y,-aPosition.x*sy+aPosition.z*cy);float cp=cos(uPitch);float sp=sin(uPitch);p=vec3(p.x,p.y*cp-p.z*sp,p.y*sp+p.z*cp);vNormal=p;vUv=aUv;gl_Position=vec4(p.xy*0.94,p.z*0.22,1.0);}`;
       const frag=`precision mediump float;varying vec3 vNormal;varying vec2 vUv;uniform sampler2D uTexture;void main(){vec3 n=normalize(vNormal);vec3 light=normalize(vec3(-0.48,0.52,0.72));float diffuse=max(dot(n,light),0.0);vec3 surface=texture2D(uTexture,vUv).rgb;surface=clamp((surface-vec3(0.40))*1.20+vec3(0.31),vec3(0.025),vec3(1.0));float illumination=0.12+0.92*diffuse;float spec=pow(max(dot(reflect(-light,n),vec3(0.0,0.0,1.0)),0.0),42.0);float atmosphere=pow(1.0-max(n.z,0.0),3.1);vec3 color=surface*illumination+vec3(0.78,0.91,1.0)*spec*0.11+vec3(0.08,0.32,0.74)*atmosphere*0.30;color=pow(max(color,vec3(0.0)),vec3(1.05));gl_FragColor=vec4(color,1.0);}`;
       const vs=shader(gl.VERTEX_SHADER,vert),fs=shader(gl.FRAGMENT_SHADER,frag);program=gl.createProgram();gl.attachShader(program,vs);gl.attachShader(program,fs);gl.linkProgram(program);gl.deleteShader(vs);gl.deleteShader(fs);if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw new Error('program link failed');
-      const stacks=48,slices=96,vertices=[],indices=[];
+      const stacks=24,slices=48,vertices=[],indices=[];
       for(let i=0;i<=stacks;i++){const v=i/stacks,phi=v*Math.PI;for(let j=0;j<=slices;j++){const u=j/slices,theta=u*Math.PI*2;vertices.push(Math.sin(phi)*Math.cos(theta),Math.cos(phi),Math.sin(phi)*Math.sin(theta),u,v)}}
       for(let i=0;i<stacks;i++)for(let j=0;j<slices;j++){const a=i*(slices+1)+j,b=a+slices+1;indices.push(a,b,a+1,b,b+1,a+1)}
       const vb=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,vb);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(vertices),gl.STATIC_DRAW);const ib=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array(indices),gl.STATIC_DRAW);
@@ -509,7 +513,7 @@ function setupHero(){
     }catch{textureReady=false;body?.classList.remove('webgl-ready');gl=null}
   }
   function resizePlanet(){
-    if(!planetCanvas)return;const rect=planetCanvas.getBoundingClientRect();if(rect.width<2)return;const ratio=Math.min(window.devicePixelRatio||1,1.6);const px=Math.round(rect.width*ratio);if(px===planetWidth)return;planetWidth=px;planetCanvas.width=px;planetCanvas.height=px;if(gl)gl.viewport(0,0,px,px);
+    if(!planetCanvas)return;const rect=planetCanvas.getBoundingClientRect();if(rect.width<2)return;const ratio=Math.min(window.devicePixelRatio||1,1.25);const px=Math.round(rect.width*ratio);if(px===planetWidth)return;planetWidth=px;planetCanvas.width=px;planetCanvas.height=px;if(gl)gl.viewport(0,0,px,px);
   }
   function drawPlanet(time){
     if(!gl||!program||!buffers||!textureReady)return;gl.viewport(0,0,planetCanvas.width,planetCanvas.height);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);gl.useProgram(program);gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,planetTexture);gl.uniform1i(locations.texture,0);gl.bindBuffer(gl.ARRAY_BUFFER,buffers.vb);gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,buffers.ib);gl.enableVertexAttribArray(locations.position);gl.vertexAttribPointer(locations.position,3,gl.FLOAT,false,20,0);gl.enableVertexAttribArray(locations.uv);gl.vertexAttribPointer(locations.uv,2,gl.FLOAT,false,20,12);
@@ -522,8 +526,8 @@ function setupHero(){
     const current=performance.now();for(let i=bursts.length-1;i>=0;i--){const burst=bursts[i],age=current-burst.at;if(age>850){bursts.splice(i,1);continue}const radius=8+age*.11;starCtx.strokeStyle=`rgba(163,255,18,${1-age/850})`;starCtx.lineWidth=1.5;starCtx.beginPath();starCtx.arc(burst.x,burst.y,radius,0,Math.PI*2);starCtx.stroke();starCtx.beginPath();starCtx.arc(burst.x,burst.y,radius*.52,0,Math.PI*2);starCtx.stroke()}
     const shot=(time%12500)/12500;if(pulse&&shot<.1){const sx=width*(1.02-shot*7),sy=height*(.10+shot*1.8);const trail=starCtx.createLinearGradient(sx,sy,sx+105,sy-37);trail.addColorStop(0,'rgba(255,255,255,.85)');trail.addColorStop(1,'rgba(0,102,255,0)');starCtx.strokeStyle=trail;starCtx.lineWidth=1.3;starCtx.beginPath();starCtx.moveTo(sx,sy);starCtx.lineTo(sx+105,sy-37);starCtx.stroke()}
   }
-  function frame(time){raf=0;if(!inView)return;drawScene(time);drawPlanet(time);if(!state.motion)raf=requestAnimationFrame(frame)}
-  function syncMotion(){if(raf){cancelAnimationFrame(raf);raf=0}drawScene(0);drawPlanet(0);if(!state.motion&&inView)raf=requestAnimationFrame(frame)}
+  function frame(time){raf=0;if(!inView||document.hidden||state.motion)return;if(time-lastFrame>=32){lastFrame=time;drawScene(time);drawPlanet(time)}raf=requestAnimationFrame(frame)}
+  function syncMotion(){if(raf){cancelAnimationFrame(raf);raf=0}if(document.hidden||!inView)return;drawScene(0);drawPlanet(0);if(!state.motion)raf=requestAnimationFrame(frame)}
   createPlanet();sizeScene();
   const bounds=()=>scene.getBoundingClientRect();
   hero.addEventListener('pointermove',event=>{const rect=bounds();pointer.x=event.clientX-rect.left;pointer.y=event.clientY-rect.top;pointer.nx=(pointer.x/Math.max(rect.width,1)-.5)*2;pointer.ny=(pointer.y/Math.max(rect.height,1)-.5)*2;pointer.active=true;scene.classList.add('is-exploring');stage.style.setProperty('--px',`${pointer.nx*9}px`);stage.style.setProperty('--py',`${pointer.ny*8}px`);if(state.motion)drawScene(0)});
@@ -654,9 +658,11 @@ function dashboardNavMarkup(role,permissions,activeTab){
     [tx('النظام','System'),['permissions','pricing','audit','profile']]
   ];
   const available=new Map(items.map(item=>[item[0],item]));
+  const hasReviewWorkspace=location.pathname==='/team';
   return groups.map(([label,ids])=>{
     const buttons=ids.map(id=>available.get(id)).filter(Boolean).map(button).join('');
-    return buttons?`<div class="dashboard-nav-group"><span>${esc(label)}</span><div>${buttons}</div></div>`:'';
+    const reviews=hasReviewWorkspace&&ids.includes('crm')?`<a class="dash-tab" href="/reviews/moderation${state.lang==='en'?'?lang=en':''}"><span aria-hidden="true">☆</span>${tx('مراجعة التقييمات','Review moderation')}</a>`:'';
+    return buttons?`<div class="dashboard-nav-group"><span>${esc(label)}</span><div>${buttons}${reviews}</div></div>`:'';
   }).join('');
 }
 function renderDashboard(data,tab){
@@ -1183,7 +1189,22 @@ $('#year').textContent=new Date().getFullYear();
 $('#serviceSelect').addEventListener('change',updateCategoryOptions);
 $('#dashboardClose').addEventListener('click',()=>setDashboardOpen(false));
 $('#dashboardLogout').addEventListener('click',()=>{});
-renderServices();renderWork();applyLanguage();loadPublic();observeReveals();setupHero();setupAboutMark();initReferralIntelligence();
+renderServices();renderWork();applyLanguage();loadPublic();observeReveals();setupAboutMark();initReferralIntelligence();
+if (!new URLSearchParams(location.search).has('preview')) {
+  const startHero = () => {
+    if ('requestIdleCallback' in window) window.requestIdleCallback(setupHero, { timeout: 2500 });
+    else setTimeout(setupHero, 600);
+  };
+  const hero = $('#hero');
+  if (hero && 'IntersectionObserver' in window) {
+    const observer = new IntersectionObserver(([entry]) => {
+      if (!entry.isIntersecting) return;
+      observer.disconnect();
+      startHero();
+    });
+    observer.observe(hero);
+  } else startHero();
+}
 document.addEventListener('input',event=>{if(event.target===$('#templateSearch'))updateTemplateFilters();if(event.target.id==='studentSearch')$$('#studentList li').forEach(li=>li.hidden=!li.textContent.toLowerCase().includes(event.target.value.toLowerCase()));if(event.target.id==='demoPropertySearch'){const q=event.target.value.toLowerCase(),type=$('#demoPropertyType')?.value||'all';$$('.property-card').forEach(card=>card.hidden=!card.dataset.demoSearchItem.includes(q)||(type!=='all'&&card.dataset.property!==type))}});
 document.addEventListener('click',async event=>{
   if(event.target.closest('[data-close-template-order]')){closeTemplateOrder();return}

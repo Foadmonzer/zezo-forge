@@ -111,6 +111,7 @@ export async function createPostgresProjectRequest({
     phone: payload.phone, service: payload.service, category: payload.category,
     details: payload.details, budget: payload.budget, templateId: payload.templateId,
     templateAction: payload.templateAction, conversationId: payload.conversationId,
+    ...(payload.createConversation ? { createConversation: true } : {}),
     fileName: file?.filename || '', fileSize: file?.content?.length || 0,
     fileHash: file?.content ? digest(file.content) : ''
   }));
@@ -118,6 +119,12 @@ export async function createPostgresProjectRequest({
   const crmId = stableId('crm', requestId);
 
   return withPostgresScopedTransaction(async client => {
+    if (payload.createConversation) {
+      // Acquire compatible table locks in snapshot-writer order before locking
+      // the customer, so the new chat cannot deadlock a legacy snapshot write.
+      await client.query("SET LOCAL lock_timeout = '3500ms'");
+      await client.query(`LOCK TABLE user_accounts, project_requests, system_notifications, audit_entries, outbox_messages IN ROW EXCLUSIVE MODE`);
+    }
     const session = await client.query(`
       SELECT s.id AS session_id, u.id, u.email, u.username, u.role, u.active,
         u."fullName", u."passwordHash", u.data, u."createdAt"
@@ -216,6 +223,7 @@ export async function createPostgresProjectRequest({
 
     const status = acceptedQuote ? 'waiting_payment' : 'new';
     const referralCode = referral?.code || '';
+    const newConversationId = payload.createConversation && !conversation ? stableId('chat', requestId) : null;
     const lead = {
       id: requestId, createdAt, updatedAt: createdAt, language: payload.language,
       name: customer.name, email: customer.email, phone: payload.phone, clientId: customer.id,
@@ -238,7 +246,7 @@ export async function createPostgresProjectRequest({
       paidTotal: 0, commissionAmount: null, commissionRate: null, commissionStatus: referral ? 'pending_setup' : 'none',
       attachments: attachment ? [attachment] : [], refunded: false, isDuplicate, duplicateOfLeadId,
       trackingHash: digest(trackingToken), trackingExpires: Date.now() + trackingTtlMs,
-      conversationId: conversation?.id || null, source: conversation?.source || (referral ? 'referral' : 'website'),
+      conversationId: conversation?.id || newConversationId, source: conversation?.source || (referral ? 'referral' : 'website'),
       orderManagerUserId: conversation?.assignedUserId || '', crmLeadId: crmId,
       idempotencyHash, idempotencyPayloadHash: requestFingerprint
     };
@@ -252,7 +260,7 @@ export async function createPostgresProjectRequest({
     const crm = {
       id: crmId, name: customer.name, phone: payload.phone, email: customer.email,
       service: payload.service, category: payload.category, templateId: template?.id || '', templateName: serviceTitle,
-      conversationId: conversation?.id || null, details: payload.details, source: lead.source,
+      conversationId: lead.conversationId, details: payload.details, source: lead.source,
       referralUserId: referral?.id || null, referralCode: referral ? referralCode : '', referralLinkId: referral?.linkId || null,
       createdAt, updatedAt: createdAt, status: crmStatus, assignedUserId: conversation?.assignedUserId || '',
       followUpAt: '', orderIds: [requestId], notes: [],
@@ -286,7 +294,23 @@ export async function createPostgresProjectRequest({
     const nextCustomerData = { ...object(userRow.data), phone: payload.phone };
     await client.query('UPDATE user_accounts SET data = $2::jsonb, "updatedAt" = $3 WHERE id = $1', [customer.id, JSON.stringify(nextCustomerData), at]);
 
-    if (conversation) {
+    if (newConversationId) {
+      const chat = {
+        id: newConversationId, clientId: customer.id, leadId: requestId, department: 'orders',
+        templateId: template?.id || null, templateName: serviceTitle, templateService: payload.service,
+        templateCategory: payload.category, referralCode, referralLinkId: referral?.linkId || null,
+        referralUserId: referral?.id || null, source: lead.source, status: 'converted', createdAt, updatedAt: createdAt
+      };
+      await client.query(`
+        INSERT INTO conversations (id, "customerId", status, "templateId", source, data, "createdAt", "updatedAt")
+        VALUES ($1, $2, 'converted', $3, $4, $5::jsonb, $6, $6)
+      `, [chat.id, customer.id, chat.templateId, chat.source, JSON.stringify(chat), at]);
+      const message = { id: messageId, senderType: 'client', senderId: customer.id, text: payload.details.slice(0, 2000), createdAt, attachments: [] };
+      await client.query(`
+        INSERT INTO conversation_messages (id, "conversationId", "senderId", body, data, "createdAt")
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+      `, [message.id, chat.id, customer.id, message.text, JSON.stringify(message), at]);
+    } else if (conversation) {
       const clientMessage = {
         id: messageId, senderType: 'client', senderId: customer.id,
         text: `تم إنشاء الطلب الرسمي ${requestId} وربطه بهذه المحادثة.`, createdAt, attachments: []
