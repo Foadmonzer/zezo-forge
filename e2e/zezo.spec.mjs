@@ -820,8 +820,8 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
     await newCustomerPage.getByRole('button', { name: 'Submit request', exact: true }).click();
     const response = await submission;
     expect(response.status()).toBe(201);
-    const submitted = await response.json();
-    await expect(newCustomerPage).toHaveURL(new RegExp(`/account/orders/${submitted.id}\\?lang=en$`));
+    await expect(newCustomerPage).toHaveURL(/\/account\/orders\/lead_[a-f0-9]+\?lang=en$/);
+    const submittedId = new URL(newCustomerPage.url()).pathname.split('/').at(-1);
     await expect(newCustomerPage.getByRole('log')).toContainText(projectDetails);
     await expect(newCustomerPage.getByText('synthetic-request.pdf', { exact: true })).toBeVisible();
     const saved = await referralDb.query(`
@@ -829,7 +829,7 @@ test('customer, Order Manager, developer, marketer, and Owner complete a synthet
         p."customerId" AS request_customer
       FROM project_requests p JOIN conversations c ON c.id = p.data->>'conversationId'
       WHERE p.id = $1 AND c.data->>'leadId' = p.id
-    `, [submitted.id]);
+    `, [submittedId]);
     expect(saved.rows).toHaveLength(1);
     expect(saved.rows[0]).toMatchObject({ referrerId: marketer.id, templateId: 'web-copper-table', chat_customer: saved.rows[0].request_customer });
     const noAccess = await request.get(`/api/conversations/${saved.rows[0].conversation_id}`);
