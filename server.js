@@ -3972,7 +3972,7 @@ async function handleRequest(req, res) {
     if(cookies.length)headers['Set-Cookie']=cookies;
   }
   const types={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.svg':'image/svg+xml','.jpg':'image/jpeg','.png':'image/png'};
-  const file=join(PUBLIC_DIR,target.slice(1));
+  const file=target==='/index.html'?join(ROOT,'src','legacy','index.html'):join(PUBLIC_DIR,target.slice(1));
   try {
     const data=await readFile(file);
     const body=target==='/index.html'&&STAGING_MODE
