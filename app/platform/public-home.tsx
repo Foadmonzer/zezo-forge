@@ -19,7 +19,7 @@ export function PublicHome({ language }: { language: PublicLanguage }) {
           <span className="zpub-orbit" />
           <span className="zpub-orbit zpub-orbit-outer" />
           <div className="zpub-planet">
-            <Image src="/assets/zezo-planet-texture.jpg" alt="" fill sizes="(max-width: 550px) 230px, (max-width: 900px) 290px, 390px" loading="lazy" decoding="async" />
+            <Image src="/assets/zezo-planet-texture.jpg" alt="" fill sizes="(max-width: 550px) 230px, (max-width: 900px) 290px, 390px" loading="eager" fetchPriority="high" decoding="async" />
           </div>
           <span className="zpub-orbit-point"/>
         </div>
