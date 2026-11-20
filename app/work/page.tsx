@@ -1,6 +1,6 @@
 import Link from 'next/link';
 import { PlatformShell } from '../platform/shell';
-import { PublicBlock, PublicHero, PublicButton, PublicSectionTitle, ExampleTiles, PublicCallout } from '../platform/public-blocks';
+import { PublicArt, PublicBlock, PublicHero, PublicButton, PublicSectionTitle, ExampleTiles, PublicCallout } from '../platform/public-blocks';
 import { findPublicService, publicContentMetadata, publicHref, publicLanguage, publicReferral, publicServices, publicTemplates, startRequest, type PublicQuery } from '../platform/public-content';
 
 const title = { ar: 'أعمالنا ونماذجنا', en: 'Work and demos' };
@@ -28,11 +28,11 @@ export default async function WorkPage({ searchParams }: { searchParams: PublicQ
       actions={<PublicButton href={startRequest(language)} primary>{isAr ? 'ابدأ مشروعاً مشابهاً' : 'Start a similar project'}</PublicButton>} />
     <section className="zpub-section">
       <article className="zpub-live-work">
-        <div className="zpub-live-wordmark" aria-hidden="true">ZEZO<span>.</span></div>
+        <PublicArt scene="hero" lazy />
         <div>
           <p className="zpub-kicker">{isAr ? 'مشروع ZEZO المنشور' : 'Live ZEZO project'}</p>
           <h2>ZEZO Forge</h2>
-          <p>{isAr ? 'منصة تجمع مكان عرض الخدمات والقوالب مع مسار لطلب المشروع ومتابعته والتواصل مع الفريق.' : 'A platform that brings together our services and templates with a place to submit a project, follow progress, and talk with the team.'}</p>
+          <p>{isAr ? 'تصفّح الخدمات والقوالب، وأرسل طلب مشروع، ثم تابع تقدّمه وتواصل معنا من حسابك.' : 'Browse services and templates, submit a project request, and use your account to track progress and contact our team.'}</p>
           <PublicButton href={publicHref('/account', language)}>{isAr ? 'استكشف بوابة العميل' : 'Explore the client portal'}</PublicButton>
         </div>
       </article>
@@ -42,7 +42,7 @@ export default async function WorkPage({ searchParams }: { searchParams: PublicQ
         detail={isAr ? 'هذه أمثلة استعراضية للتجربة، وليست مشاريع عملاء.' : 'These are illustrative demos for trying ideas, separate from client projects.'} />
       <nav className="zpub-filter-links" aria-label={isAr ? 'تصفية الأعمال حسب الخدمة' : 'Filter work by service'}>
         <Link href={publicHref('/work', language)} className="zpub-button" aria-current={!service ? 'page' : undefined} prefetch={false}>{isAr ? 'كل النماذج' : 'All demos'}</Link>
-        {publicServices.map(item => <Link key={item.id} href={publicHref(`/work?service=${item.id}`, language)} className="zpub-button" aria-current={item.id === service?.id ? 'page' : undefined} prefetch={false}>{item.label[language]}</Link>)}
+        {publicServices.map(item => <Link key={item.id} href={publicHref(`/work?service=${item.id}`, language)} className="zpub-button" aria-current={item.id === service?.id ? 'page' : undefined} prefetch={false}>{item.title[language]}</Link>)}
       </nav>
       <ExampleTiles templates={examples} language={language} />
     </section>

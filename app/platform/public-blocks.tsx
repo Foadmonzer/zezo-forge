@@ -12,7 +12,7 @@ export function PublicHero({ title, detail, actions, children, label }: { title:
   return (
     <header className={`zpub-hero${children ? ' zpub-hero-split' : ''}`}>
       <div className="zpub-hero-copy">
-        {label && <p className="zpub-kicker">{label}</p>}
+        {label && <p className="zpub-kicker"><bdi>{label}</bdi></p>}
         <h1>{title}</h1>
         <p className="zpub-lede">{detail}</p>
         {actions && <div className="zpub-actions">{actions}</div>}
@@ -20,6 +20,18 @@ export function PublicHero({ title, detail, actions, children, label }: { title:
       {children}
     </header>
   );
+}
+
+const publicScenes = {
+  hero: { src: '/assets/zezo-idea-to-product.svg', height: 550 },
+  about: { src: '/assets/zezo-about-studio.svg', height: 560 },
+};
+
+export function PublicArt({ scene, lazy = false }: { scene: keyof typeof publicScenes; lazy?: boolean }) {
+  const { src, height } = publicScenes[scene];
+  return <figure className="zpub-scene" data-zezo-art={scene} aria-hidden="true">
+    <img src={src} width={760} height={height} alt="" loading={lazy ? 'lazy' : 'eager'} fetchPriority={lazy ? undefined : 'high'} decoding="async" />
+  </figure>;
 }
 
 export function PublicButton({ href, children, primary = false }: { href: string; children: ReactNode; primary?: boolean }) {
@@ -101,8 +113,8 @@ export function PublicCallout({ language, service }: { language: PublicLanguage;
   const isAr = language === 'ar';
   return (
     <section className="zpub-callout" aria-label={isAr ? 'ابدأ مع ZEZO' : 'Start with ZEZO'}>
-      <div><h2>{isAr ? 'ما الذي تريد بناءه؟' : 'What would you like to build?'}</h2>
-        <p>{isAr ? 'أرسل فكرتك وسنراجعها معك ضمن الطلب.' : 'Share your idea and we’ll review it with you in your request.'}</p></div>
+      <div><h2>{isAr ? 'ما المشروع الذي ترغب في تنفيذه؟' : 'What project would you like to bring to life?'}</h2>
+        <p>{isAr ? 'شاركنا فكرتك ومتطلبات مشروعك، وسنساعدك على تحويلها إلى حل رقمي متكامل.' : 'Tell us about your idea and what your project needs. We’ll help you turn it into a complete digital solution.'}</p></div>
       <PublicButton href={startRequest(language, service ? { service } : {})} primary>{isAr ? 'اطلب مشروعك' : 'Start a project'}</PublicButton>
     </section>
   );

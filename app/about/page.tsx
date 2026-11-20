@@ -1,13 +1,13 @@
 import { PlatformShell } from '../platform/shell';
-import { PublicBlock, PublicHero, PublicButton, PublicSectionTitle, ProcessSteps, PublicCallout } from '../platform/public-blocks';
+import { PublicArt, PublicBlock, PublicHero, PublicButton, PublicSectionTitle, ProcessSteps, PublicCallout } from '../platform/public-blocks';
 import { publicContentMetadata, publicHref, publicLanguage, publicReferral, startRequest, type PublicQuery } from '../platform/public-content';
 
 const title = { ar: 'عن ZEZO', en: 'About ZEZO' };
-const detail = { ar: 'ZEZO Digital Solutions & AI شركة تطوّر المواقع والتطبيقات والحلول الرقمية من الفكرة حتى التسليم.', en: 'ZEZO Digital Solutions & AI builds websites, apps, and digital solutions from idea through handover.' };
+const detail = { ar: 'نطوّر المواقع والتطبيقات وحلول الذكاء الاصطناعي، ونرافق مشروعك من الفكرة إلى التسليم.', en: 'We build websites, apps, and AI solutions, and support your project from the first idea to handover.' };
 
 const principles = [
-  { ar: ['الوضوح قبل التنفيذ', 'نعرف ما تريد تحقيقه ونوضح ما يشمله المشروع قبل العمل.'], en: ['Clarity before building', 'We understand what you want to achieve and explain the scope before work begins.'] },
-  { ar: ['الاختبار جزء من العمل', 'نراجع الرحلات الأساسية للعميل والمستخدم قبل تسليمها.'], en: ['Testing is part of the work', 'We review the main client and user journeys before handover.'] },
+  { ar: ['الوضوح قبل التنفيذ', 'نفهم هدفك ونوضّح نطاق المشروع قبل بدء العمل.'], en: ['A clear scope', 'We learn what you want to achieve and explain the scope before work begins.'] },
+  { ar: ['الاختبار قبل التسليم', 'نختبر الخطوات الأساسية التي يتّبعها المستخدم في الموقع أو التطبيق قبل تسليمه.'], en: ['Testing before handover', 'We test the main steps users take through the website or app before handover.'] },
   { ar: ['تواصل ومراجعة مستمران', 'تجد الطلب والتحديثات والملاحظات في حسابك لتعود إليها وقت الحاجة.'], en: ['Updates you can revisit', 'You can find requests, updates, and notes in your account whenever you need them.'] }
 ];
 
@@ -21,22 +21,22 @@ export default async function AboutPage({ searchParams }: { searchParams: Public
   const language = publicLanguage(query);
   const isAr = language === 'ar';
   return <PlatformShell language={language} incomingReferral={publicReferral(query)}><PublicBlock language={language}>
-    <PublicHero label="ZEZO DIGITAL SOLUTIONS & AI" title={title[language]} detail={detail[language]}
+    <PublicHero label="ZEZO Digital Solutions & AI" title={title[language]} detail={detail[language]}
       actions={<><PublicButton href={startRequest(language)} primary>{isAr ? 'اطلب مشروعك' : 'Start a project'}</PublicButton>
         <PublicButton href={publicHref('/contact', language)}>{isAr ? 'تواصل معنا' : 'Contact us'}</PublicButton></>}>
-      <div className="zpub-live-wordmark" aria-hidden="true">ZEZO<span>.</span></div>
+      <PublicArt scene="about" />
     </PublicHero>
-    <section className="zpub-section zpub-columns">
+    <section className="zpub-section zpub-columns zpub-about-notes">
       <div className="zpub-copy-panel"><h2>{isAr ? 'رسالتنا' : 'Our mission'}</h2>
-        <p>{isAr ? 'نساعد أصحاب المشاريع على تحويل احتياج عملي إلى تجربة رقمية واضحة، يستطيع عملاؤهم استخدامها ويستطيع فريقهم متابعتها.' : 'We help project owners turn a practical need into a clear digital experience their customers can use and their team can manage.'}</p>
+        <p>{isAr ? 'نساعدك على تحويل حاجة عملية إلى خدمة رقمية يسهل على عملائك استخدامها وعلى فريقك إدارتها.' : 'We help you turn a practical need into a digital service your customers can use and your team can manage.'}</p>
       </div>
       <div className="zpub-copy-panel"><h2>{isAr ? 'رؤيتنا' : 'Our vision'}</h2>
-        <p>{isAr ? 'أن يصبح بدء مشروع رقمي ومراجعته وتطويره أسهل عبر مراحل مفهومة ومتابعة مستمرة.' : 'Make it easier to start, review, and grow a digital project through clear stages and ongoing collaboration.'}</p>
+        <p>{isAr ? 'أن يسهل عليك بدء مشروعك الرقمي ومراجعته وتطويره، عبر مراحل واضحة وتواصل مستمر.' : 'Make digital projects easier to start, review, and develop through clear milestones and ongoing communication.'}</p>
       </div>
     </section>
     <section className="zpub-section">
       <PublicSectionTitle title={isAr ? 'كيف نعمل معك' : 'How we work with you'} />
-      <div className="zpub-principles">{principles.map(item => <article className="zpub-copy-panel" key={item.en[0]}><h3>{item[language][0]}</h3><p>{item[language][1]}</p></article>)}</div>
+      <div className="zpub-principles zpub-about-principles">{principles.map(item => <article className="zpub-copy-panel" key={item.en[0]}><h3>{item[language][0]}</h3><p>{item[language][1]}</p></article>)}</div>
     </section>
     <section className="zpub-section"><PublicSectionTitle title={isAr ? 'مراحل المشروع' : 'Project stages'} /><ProcessSteps language={language} /></section>
     <PublicCallout language={language} />

@@ -3,7 +3,7 @@ import { publicContentMetadata, publicLanguage, type PublicQuery } from '../plat
 import { PlatformShell, platformLink } from '../platform/shell';
 
 const title = { ar: 'تواصل معنا', en: 'Contact ZEZO' };
-const details = { ar: 'أرسل استفسارك لفريق ZEZO وتابع الرد من حسابك.', en: 'Contact the ZEZO team and follow the reply from your account.' };
+const details = { ar: 'أرسل استفسارك إلى فريق ZEZO وتابع الردود في حسابك.', en: 'Send the ZEZO team an enquiry and check your account for replies.' };
 const questions = [
   { ar: ['كيف أتابع الرد على استفساري؟', 'افتح قسم الرسائل في حساب العميل. ستجد المحادثة والردود هناك.'], en: ['How do I follow up on my enquiry?', 'Open Messages in your customer account to find the enquiry and any replies.'] },
   { ar: ['كيف أطلب عرض سعر؟', 'ابدأ من صفحة طلب مشروع واختر الخدمة أو القالب واذكر احتياجاتك. يراجع الفريق التفاصيل قبل تقديم العرض.'], en: ['How do I request a quote?', 'Start from the project request page, choose a service or template, and share your requirements. The team reviews the details before quoting.'] },
@@ -26,7 +26,7 @@ export default async function ContactPage({ searchParams }: { searchParams: Publ
         <ContactForm language={language} />
         <div className="zf-contact-side">
           <ContactChannels language={language} />
-          <section className="zf-feedback-box"><h2>{en ? 'Request a project' : 'اطلب مشروعاً'}</h2><a className="zf-button" href={platformLink('/request', language)}>{en ? 'Start a project request' : 'ابدأ طلب مشروع'}</a></section>
+          <section className="zf-feedback-box"><h2>{en ? 'Request a project' : 'طلب مشروع'}</h2><a className="zf-button" href={platformLink('/request', language)}>{en ? 'Start a project' : 'اطلب مشروعك'}</a></section>
         </div>
       </div>
       <section className="zf-feedback-box zf-contact-faq">

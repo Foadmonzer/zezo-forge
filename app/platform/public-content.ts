@@ -54,62 +54,62 @@ type Service = {
 export const publicServices: Service[] = [
   {
     id: 'web', label: copy('مواقع ومتاجر', 'Websites & stores'), title: copy('تطوير المواقع', 'Web development'),
-    summary: copy('واجهات واضحة تشرح عرضك وتساعد الزائر على الطلب أو الشراء بسهولة.', 'Clear interfaces that explain your offer and make it easy to enquire or buy.'),
-    outcome: copy('نبدأ بتحديد هدف الموقع ومسار الزائر، ثم نبني الصفحات والوظائف التي تخدم هذا الهدف على الهاتف والكمبيوتر.', 'We start with the site’s goal and the visitor’s journey, then build the pages and features that serve both on mobile and desktop.'),
+    summary: copy('مواقع ومتاجر تعرض منتجاتك أو خدماتك بوضوح، وتسهّل على الزائر الاستفسار أو الشراء.', 'Websites and stores that explain what you offer and make it easy to enquire or buy.'),
+    outcome: copy('نحدد هدف الموقع وما يحتاج إليه الزائر، ثم نبني الصفحات والوظائف المناسبة للهاتف والكمبيوتر.', 'We define the site’s goals and what visitors need, then build pages and features that work on phones and computers.'),
     categories: [
       { id: 'site', label: copy('موقع تعريفي أو صفحة هبوط', 'Business website or landing page') },
       { id: 'store', label: copy('متجر إلكتروني', 'E-commerce store') },
-      { id: 'care', label: copy('تحسين وصيانة صفحة', 'Page improvements') },
-      { id: 'audit', label: copy('تحليل مصغّر', 'Mini review') },
+      { id: 'care', label: copy('تحسين صفحة وصيانتها', 'Page improvements and maintenance') },
+      { id: 'audit', label: copy('مراجعة مصغّرة للموقع', 'Quick website review') },
       { id: 'maintenance', label: copy('صيانة شهرية', 'Monthly maintenance') }
     ],
-    features: [copy('هيكلة محتوى سهلة القراءة', 'Readable content structure'), copy('تصميم يستجيب لحجم الشاشة', 'Responsive layouts'), copy('نماذج وكتالوجات حسب النطاق', 'Forms and catalogs as scoped')],
+    features: [copy('محتوى منظّم وسهل القراءة', 'Clear, readable content'), copy('تصميم يتكيّف مع حجم الشاشة', 'Responsive layouts'), copy('نماذج وكتالوجات وفق نطاق المشروع', 'Forms and catalogs based on your project scope')],
     faq: [
       { question: copy('هل يمكن تطوير موقع قائم؟', 'Can you improve an existing site?'), answer: copy('نعم، شارك رابط الموقع والمشكلات التي تريد حلها لنراجع ما يمكن تحسينه ضمن بنيته الحالية.', 'Yes. Share the site URL and the problems you want to solve so we can review what can be improved within the existing setup.') },
-      { question: copy('كيف يُحدد السعر؟', 'How is the price set?'), answer: copy('تحدد الصفحة تفاصيل السعر الابتدائي إذا كان هناك قالب مختار. نراجع الوظائف والمحتوى المطلوبين قبل تقديم عرض مناسب.', 'A selected template has its own starting price. We review the required features and content before preparing a quote.') }
+      { question: copy('كيف يُحدَّد السعر؟', 'How do you determine the price?'), answer: copy('إذا كان للقالب سعر ابتدائي، ستجده في صفحته. نراجع الوظائف والمحتوى المطلوبين قبل تقديم عرض السعر.', 'When a template has a starting price, you’ll find it on its page. We review the required features and content before preparing your quote.') }
     ],
     example: 'web-copper-table'
   },
   {
-    id: 'apps', label: copy('ويب وموبايل', 'Web & mobile'), title: copy('تطوير التطبيقات', 'App development'),
-    summary: copy('تطبيقات ويب وموبايل تبدأ من احتياج المستخدم، مع مسار واضح للتوسع.', 'Web and mobile products that start from user needs and leave a clear path to grow.'),
-    outcome: copy('نرتب المهام الرئيسية ونحدد الشاشات والبيانات اللازمة، ثم نختبر الرحلة قبل التوسع في بقية الوظائف.', 'We map the key tasks, screens, and data, then test the journey before expanding the feature set.'),
+    id: 'apps', label: copy('تطبيقات الويب والهاتف', 'Web and mobile apps'), title: copy('تطوير التطبيقات', 'App development'),
+    summary: copy('نبني تطبيقات ويب وهاتف تلبي احتياجات المستخدمين ويمكن تطويرها مع توسّع المشروع.', 'We build web and mobile apps around user needs, with room to grow as your project evolves.'),
+    outcome: copy('نحدّد مهام المستخدمين والشاشات والبيانات اللازمة، ثم نختبر خطوات الاستخدام الأساسية قبل إضافة ميزات أخرى.', 'We map users’ tasks, screens, and data, then test the essential workflows before adding more features.'),
     categories: [
-      { id: 'mobile', label: copy('تطبيق موبايل', 'Mobile app') },
+      { id: 'mobile', label: copy('تطبيق للهاتف', 'Mobile app') },
       { id: 'webapp', label: copy('تطبيق ويب ولوحة تحكم', 'Web app and dashboard') },
       { id: 'prototype', label: copy('نموذج أولي للمنتج', 'Product prototype') }
     ],
-    features: [copy('مسارات استخدام قصيرة', 'Short user journeys'), copy('تكامل مع البيانات والأدوار حسب الحاجة', 'Data and role integrations as needed'), copy('اختبارات للرحلات الأساسية', 'Tests for key user journeys')],
+    features: [copy('خطوات استخدام بسيطة', 'Straightforward workflows'), copy('ربط البيانات وتحديد صلاحيات المستخدمين حسب الحاجة', 'Data integration and user permissions as needed'), copy('اختبار خطوات الاستخدام الأساسية', 'Tests for essential user workflows')],
     faq: [
       { question: copy('متى أختار تطبيق ويب؟', 'When should I choose a web app?'), answer: copy('تطبيق الويب يناسب الوصول من المتصفح دون تثبيت، ويمكن أن يكون البداية المناسبة إذا كانت الوظائف المطلوبة لا تعتمد على إمكانات الجهاز.', 'A web app is a good starting point when people need browser access and the features do not depend on device-specific capabilities.') },
-      { question: copy('هل أحتاج إلى كل الميزات من البداية؟', 'Do I need every feature in the first release?'), answer: copy('يمكن بدء المشروع بالرحلة الأساسية وتحديد الميزات اللاحقة أثناء مراجعة النطاق.', 'You can start with the key user journey and plan later features while reviewing the scope.') }
+      { question: copy('هل أحتاج إلى كل الميزات من البداية؟', 'Do I need every feature in the first release?'), answer: copy('يمكنك البدء بالوظائف الأساسية والتخطيط للميزات اللاحقة أثناء مراجعة نطاق المشروع.', 'You can start with the essential features and plan later additions when we review the scope.') }
     ],
     example: 'app-serveflow'
   },
   {
     id: 'ai', label: copy('مساعدات وأتمتة', 'Assistants & automation'), title: copy('حلول الذكاء الاصطناعي', 'AI solutions'),
-    summary: copy('مساعدات وأتمتة وتكاملات تساعد فريقك في المهام العملية المتكررة.', 'Assistants, automation, and integrations that help your team with repetitive work.'),
-    outcome: copy('نحدد المهمة ومصادر المعلومات ومتى يحتاج القرار إلى تدخل شخص، ثم نختبر النتائج على أمثلة مناسبة قبل الاستخدام.', 'We identify the task, information sources, and when a person needs to step in, then evaluate the results on suitable examples.'),
+    summary: copy('مساعدات ذكية وأتمتة وربط للأنظمة لتسهيل المهام المتكررة على فريقك.', 'AI assistants, automation, and integrations that make repetitive tasks easier for your team.'),
+    outcome: copy('نحدّد المهمة ومصادر المعلومات والحالات التي تتطلب مراجعة بشرية، ثم نختبر النتائج على أمثلة مناسبة قبل الاستخدام.', 'We identify the task, its information sources, and where human review is needed. Then we test the results before rollout.'),
     categories: [
       { id: 'assistant', label: copy('مساعد ذكي', 'AI assistant') },
-      { id: 'automation', label: copy('أتمتة سير عمل', 'Workflow automation') },
-      { id: 'integration', label: copy('تكامل نماذج وبيانات', 'Model and data integration') }
+      { id: 'automation', label: copy('أتمتة سير العمل', 'Workflow automation') },
+      { id: 'integration', label: copy('ربط النماذج والبيانات', 'Model and data integration') }
     ],
     features: [copy('مصادر معلومات معتمدة', 'Approved knowledge sources'), copy('خطوات مراجعة بشرية حسب الحاجة', 'Human review where needed'), copy('اختبار المخرجات قبل الدمج', 'Output evaluation before integration')],
     faq: [
-      { question: copy('هل يمكن ربط المساعد بموقع قائم؟', 'Can an assistant connect to an existing website?'), answer: copy('نراجع الموقع ومصادر المعلومات والصلاحيات أولاً، ثم نحدد طريقة الربط المتاحة.', 'We review the website, information sources, and permissions before proposing an integration.') },
+      { question: copy('هل يمكن ربط المساعد بموقع قائم؟', 'Can an assistant connect to an existing website?'), answer: copy('نراجع الموقع ومصادر المعلومات والصلاحيات أولًا، ثم نحدّد طريقة الربط المتاحة.', 'We review the website, information sources, and permissions before proposing an integration.') },
       { question: copy('ما المعلومات اللازمة للبدء؟', 'What do you need to get started?'), answer: copy('وصف المهمة المتكررة والمصادر المتاحة والنتيجة المطلوبة، مع أمثلة خالية من البيانات الخاصة.', 'Describe the recurring task, available sources, and desired outcome, with examples that do not contain private data.') }
     ],
     example: 'ai-helio-desk'
   },
   {
-    id: 'ideas', label: copy('تخطيط ونماذج أولية', 'Planning & prototypes'), title: copy('دعم المشاريع والأفكار', 'Project & idea support'),
-    summary: copy('نحوّل الفكرة إلى نطاق واضح وخطوات تنفيذ يمكن اختبارها.', 'Turn an early idea into a clear scope and actionable steps you can test.'),
-    outcome: copy('نحدد المشكلة والجمهور وما يستحق الاختبار أولاً، ونبني معك مساراً للاكتشاف أو نسخة أولية حسب احتياج المشروع.', 'We identify the problem, audience, and first assumptions to test, then shape discovery or a prototype around your needs.'),
+    id: 'ideas', label: copy('تخطيط ونماذج أولية', 'Planning and prototypes'), title: copy('دعم المشاريع والأفكار', 'Project and idea support'),
+    summary: copy('نحوّل فكرتك إلى نطاق واضح وخطوات تنفيذ يمكن اختبارها.', 'We turn your idea into a clear project scope and practical steps you can test.'),
+    outcome: copy('نحدّد المشكلة والجمهور وما نحتاج إلى اختباره أولًا، ثم نخطّط معك للمرحلة الأولى أو نبني نموذجًا أوليًّا حسب احتياجات المشروع.', 'We identify the problem, the audience, and what to test first. Then we plan the next stage with you or build a prototype that fits your needs.'),
     categories: [
-      { id: 'discovery', label: copy('جلسة اكتشاف وترتيب', 'Discovery and planning') },
+      { id: 'discovery', label: copy('جلسة لفهم الفكرة وترتيب الأولويات', 'Discovery and planning session') },
       { id: 'consulting', label: copy('استشارة تقنية', 'Technology consultation') },
-      { id: 'prototype-plan', label: copy('خارطة نموذج أولي', 'Prototype roadmap') },
+      { id: 'prototype-plan', label: copy('خطة لنموذج أولي', 'Prototype plan') },
       { id: 'startup', label: copy('برنامج الطلاب والمشاريع الناشئة', 'Student & startup program') }
     ],
     features: [copy('تحديد الأولويات', 'Priority setting'), copy('خريطة مراحل قابلة للمراجعة', 'A roadmap you can review'), copy('تصور أولي لاختبار الاتجاه', 'An early prototype to test direction')],
@@ -142,8 +142,8 @@ export type PublicTemplate = {
 export const publicTemplates = templateCatalog as PublicTemplate[];
 
 export const workSteps = [
-  { title: copy('نسمع فكرتك', 'Understand the brief'), detail: copy('شارك الهدف وما يحتاجه مستخدموك.', 'Tell us what you want to achieve and what your users need.') },
+  { title: copy('نفهم فكرتك', 'Understand your idea'), detail: copy('أخبرنا بهدفك وما يحتاج إليه مستخدموك.', 'Tell us what you want to achieve and what your users need.') },
   { title: copy('نحدد النطاق', 'Define the scope'), detail: copy('نراجع الأولويات ونوضح ما يشمله العرض.', 'We review priorities and clarify the scope of your quote.') },
-  { title: copy('نبني ونراجع', 'Build and review'), detail: copy('تتابع المسار وتراجع التقدم من حسابك.', 'Follow progress and review updates in your account.') },
+  { title: copy('نبني ونراجع', 'Build and review'), detail: copy('تابع تقدّم المشروع وراجع التحديثات من حسابك.', 'Follow the project and review updates in your account.') },
   { title: copy('نسلّم المشروع', 'Hand over the project'), detail: copy('نراجع التسليم معك ونوضح الخطوة التالية.', 'We review the handover with you and clarify the next step.') }
 ];

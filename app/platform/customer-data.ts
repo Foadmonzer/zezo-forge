@@ -25,19 +25,19 @@ export type Dashboard = { role: 'client'; user: Customer; profile: Profile; orde
 export type TemplateOption = { id: string; service: string; category: string; title: Record<Language, string> };
 
 export const services = [
-  { id: 'web', ar: 'المواقع والمتاجر', en: 'Websites and stores', categories: [
-    ['site', 'موقع إلكتروني', 'Website'], ['store', 'متجر إلكتروني', 'Online store'],
-    ['care', 'رعاية تقنية', 'Web care'], ['audit', 'مراجعة موقع', 'Website audit'], ['maintenance', 'صيانة', 'Maintenance'],
+  { id: 'web', ar: 'تطوير المواقع', en: 'Web development', categories: [
+    ['site', 'موقع تعريفي أو صفحة هبوط', 'Business website or landing page'], ['store', 'متجر إلكتروني', 'E-commerce store'],
+    ['care', 'تحسين صفحة وصيانتها', 'Page improvements and maintenance'], ['audit', 'مراجعة مصغّرة للموقع', 'Quick website review'], ['maintenance', 'صيانة شهرية', 'Monthly maintenance'],
   ] },
   { id: 'apps', ar: 'تطوير التطبيقات', en: 'App development', categories: [
-    ['mobile', 'تطبيق هاتف', 'Mobile app'], ['webapp', 'تطبيق ويب', 'Web app'], ['prototype', 'نموذج أولي', 'Prototype'],
+    ['mobile', 'تطبيق للهاتف', 'Mobile app'], ['webapp', 'تطبيق ويب ولوحة تحكم', 'Web app and dashboard'], ['prototype', 'نموذج أولي للمنتج', 'Product prototype'],
   ] },
-  { id: 'ai', ar: 'الذكاء الاصطناعي', en: 'Applied AI', categories: [
-    ['assistant', 'مساعد ذكي', 'AI assistant'], ['automation', 'أتمتة', 'Automation'], ['integration', 'ربط الأنظمة', 'Integration'],
+  { id: 'ai', ar: 'حلول الذكاء الاصطناعي', en: 'AI solutions', categories: [
+    ['assistant', 'مساعد ذكي', 'AI assistant'], ['automation', 'أتمتة سير العمل', 'Workflow automation'], ['integration', 'ربط النماذج والبيانات', 'Model and data integration'],
   ] },
-  { id: 'ideas', ar: 'الأفكار والمشاريع', en: 'Ideas and projects', categories: [
-    ['discovery', 'اكتشاف الفكرة', 'Discovery'], ['consulting', 'استشارة', 'Consulting'],
-    ['prototype-plan', 'خطة نموذج أولي', 'Prototype plan'], ['startup', 'مشروع ناشئ', 'Startup'],
+  { id: 'ideas', ar: 'دعم المشاريع والأفكار', en: 'Project and idea support', categories: [
+    ['discovery', 'جلسة لفهم الفكرة وترتيب الأولويات', 'Discovery and planning session'], ['consulting', 'استشارة تقنية', 'Technology consultation'],
+    ['prototype-plan', 'خطة لنموذج أولي', 'Prototype plan'], ['startup', 'برنامج الطلاب والمشاريع الناشئة', 'Student & startup program'],
   ] },
 ] as const;
 
