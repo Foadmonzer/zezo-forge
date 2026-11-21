@@ -26,3 +26,13 @@ This workspace belongs to ZEZO | Digital Solutions & AI. The owner sends the cli
 - Keep secrets out of files and outputs. Use example placeholders for required environment variables.
 - Get the owner's review before spending money, sending messages, publishing, deploying to a public audience, or making irreversible external changes. Prepare the concrete draft or build first.
 - Marketing supports sales of ZEZO's real services. Do not make recruiting other marketers the source of revenue or a condition of joining the company.
+
+<!-- BEGIN:nextjs-agent-rules -->
+
+## This is NOT the Next.js you know
+
+This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` (resolved from this file's directory; in monorepos the `next` package may not be visible from the repo root) before writing any code. Heed deprecation notices.
+
+This block is written and re-added by `next dev` — verify at `node_modules/next/dist/server/lib/generate-agent-files.js`. Removing it from a diff only re-creates the uncommitted change; committing it with your work keeps the tree clean.
+
+<!-- END:nextjs-agent-rules -->

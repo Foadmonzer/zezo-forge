@@ -1,17 +1,40 @@
 import { createServer } from 'node:http';
 import { createReadStream, readFileSync } from 'node:fs';
+import { Writable } from 'node:stream';
 import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
-import { extname, join, normalize, basename, isAbsolute, resolve } from 'node:path';
+import { extname, join, normalize, basename, dirname, isAbsolute, resolve } from 'node:path';
 import { randomBytes, scryptSync, timingSafeEqual, createHash, createHmac } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { templateCatalog, templateById } from './public/template-catalog.js';
 import { buildWhatsAppUrl, normalizeWhatsAppNumber } from './public/whatsapp.js';
+import { consumeRateLimitBucket, currentPostgresClient, deleteRateLimitBucket, postgresConfigured, queryPostgres, withPostgresReadTransaction, withPostgresScopedTransaction, withPostgresTransaction } from './src/server/postgres-runtime.js';
+import { createStagingSession, isStagingSessionValid, STAGING_ACCESS_COOKIE, STAGING_SESSION_TTL_SECONDS, stagingPasswordMatches } from './src/server/staging-auth.js';
+import { capturePaymentStoreBaseline, deleteReferralTrackingForVisitor, loadNormalizedStore, persistNormalizedStore } from './src/server/postgres-store.js';
+import { loadPublicRuntimeSnapshot, loadPublicTrackRecord } from './src/server/public-read-repository.js';
+import { claimGuestConversations, findLoginAccount, loadClientDashboardData, loadConversationAssignees, loadConversationViews, loadCrmRecordsForViewer, loadCrmRelatedRows, loadEmployeeDashboardData, loadOrderManagerOrders, loadReferralEventsForUsers, loadSessionAccount, storeLoginSessionAndAudit } from './src/server/core-read-repository.js';
+import { changePostgresPassword, enablePostgresMfa, logoutPostgresSession, setupPostgresMfa } from './src/server/postgres-auth-repository.js';
+import { getRequestPublicSiteOrigin } from './src/public-site-origin.js';
+import { acceptPostgresQuote, createPostgresConversation, createPostgresConversationMessage, createPostgresQuote } from './src/server/postgres-conversation-repository.js';
+import { listPublishedProjectReviews, listProjectReviewsForModeration, loadCustomerProjectReview, moderateProjectReview, submitProjectReview } from './src/server/postgres-project-review-repository.js';
+import { approvalEmail, mailWithFooter, teamInvitationEmail, verificationEmail } from './src/server/transactional-email.js';
+import { postgresOutboxSettings } from './src/server/outbox-worker.js';
+import { ResendMailError, sendWithResend } from './src/server/resend-mail.js';
+import { createPostgresWithdrawalRequest } from './src/server/postgres-withdrawal-repository.js';
+import { createPostgresEmployeeInvitation, revokePostgresEmployeeInvitation, reissuePostgresEmployeeInvitation } from './src/server/postgres-invitation-repository.js';
+import { activatePostgresEmployeeInvitation } from './src/server/postgres-activation-repository.js';
+import { createPostgresClientRegistration, verifyPostgresClientEmail } from './src/server/postgres-client-registration-repository.js';
+import { capturePostgresReferralAttribution, deletePostgresReferralAnalyticsByVisitor, getPostgresReferralAttribution, recordPostgresReferralEvent } from './src/server/postgres-referral-repository.js';
+import { createPostgresProjectRequest } from './src/server/postgres-project-request-repository.js';
+import { updatePostgresEmployeePermissions } from './src/server/postgres-permission-repository.js';
+import { completePostgresPasswordResetEmail, consumePostgresPasswordReset, issuePostgresPasswordReset } from './src/server/postgres-password-recovery-repository.js';
+import { createPasswordResetUrl, passwordRecoveryEmailReady, passwordRecoveryFailureCode, passwordRecoveryMinimumResponseMs, sendPasswordRecoveryEmail, verifyPasswordRecoveryTransport } from './src/server/password-recovery-mailer.js';
+import { canUseDevelopmentManagerRoute, developmentAssignmentAllowed, developmentDeveloperView, developmentManagerIdentity, developmentManagerRole, developmentProjectAccessible, developmentProjectView, developmentStage, developmentTechnicalStages } from './src/server/development-management.js';
+import { loadDevelopmentManagement, saveDevelopmentEvents, saveDevelopmentMessage, saveDevelopmentProfile, saveDevelopmentProject, scopedDevelopmentProjectSql } from './src/server/development-management-repository.js';
 
-const ROOT = fileURLToPath(new URL('.', import.meta.url));
+const ROOT = dirname(fileURLToPath(import.meta.url));
 const STAGING_MODE = process.env.ZEZO_STAGING === 'true';
 const STAGING_ACCESS_PASSWORD = STAGING_MODE ? String(process.env.ZEZO_STAGING_ACCESS_PASSWORD || '') : '';
 if (STAGING_MODE && STAGING_ACCESS_PASSWORD.length < 16) throw new Error('ZEZO staging requires a temporary access password of at least 16 characters.');
-const STAGING_ACCESS_PASSWORD_HASH = STAGING_MODE ? createHash('sha256').update(STAGING_ACCESS_PASSWORD).digest() : null;
 if (!STAGING_MODE) try {
   const envText = readFileSync(join(ROOT, '.env'), 'utf8');
   for (const line of envText.split(/\r?\n/)) {
@@ -27,12 +50,14 @@ const PUBLIC_DIR = join(ROOT, 'public');
 const PORT = Number(process.env.PORT || 4173);
 const MAX_BODY = 6 * 1024 * 1024;
 const SESSION_TTL = 8 * 60 * 60 * 1000;
-const roles = ['admin', 'marketing_manager', 'hr_manager', 'order_manager', 'developer', 'marketer'];
+const REFERRAL_ATTRIBUTION_COOKIE = 'zezo_referral_attribution';
+const REFERRAL_ATTRIBUTION_TTL_SECONDS = 30 * 24 * 60 * 60;
+const roles = ['admin', 'marketing_manager', 'hr_manager', 'order_manager', 'developer', 'marketer', developmentManagerRole];
 const allRoles = [...roles, 'client'];
 const employeeRoles = ['marketer', 'developer'];
 const inviteableEmployeeRoles = ['marketer', 'developer', 'order_manager'];
 const managementRoles = ['admin', 'marketing_manager', 'hr_manager', 'order_manager'];
-const accountTypes = { employee:employeeRoles, management:managementRoles, client:['client'] };
+const accountTypes = { employee:employeeRoles, management:[...managementRoles, developmentManagerRole], client:['client'] };
 const permissionDefinitions = {
   'conversations.read': ['assigned','department','all'],
   'conversations.reply': ['assigned','department','all'],
@@ -81,13 +106,14 @@ const defaultStore = () => ({
 let store;
 let persistQueue = Promise.resolve();
 const sessions = new Map();
-const stagingSessions = new Map();
 const stagingLoginAttempts = new Map();
 const loginAttempts = new Map();
 const leadAttempts = new Map();
 const quoteAttempts = new Map();
 const clientRegistrationAttempts = new Map();
 const passwordResetAttempts = new Map();
+const developerMfaSetupAttempts = new Map();
+const developerMfaEnableAttempts = new Map();
 const conversationAttempts = new Map();
 
 const now = () => new Date().toISOString();
@@ -95,6 +121,7 @@ const hash = value => createHash('sha256').update(String(value)).digest('hex');
 const token = (bytes = 32) => randomBytes(bytes).toString('base64url');
 const id = prefix => `${prefix}_${randomBytes(9).toString('hex')}`;
 const clean = (v, max = 300) => String(v ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, max);
+const cleanConversationMessage = value => String(value ?? '').replace(/\r\n?/g, '\n').replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, ' ').trim().slice(0, 2000);
 function invitationStatus(user){
   if(user?.active)return user.inviteStatus==='accepted'?'accepted':'active';
   if(user?.inviteApprovalStatus==='pending_approval')return 'pending_approval';
@@ -108,6 +135,10 @@ function setProjectStage(lead, stage, actor, note='', clientNote='') {
   if(lead.projectStage===stage&&!note&&!clientNote)return false;
   const at=now();lead.projectStage=stage;lead.projectHistory??=[];
   lead.projectHistory.push({stage,at,by:actor?.username||'system',note:clean(note,500),clientNote:clean(clientNote,500)});
+  if (actor?.role !== developmentManagerRole && (lead.developmentReview || stage === 'waiting_developer_acceptance')) {
+    lead.developmentReview ??= {};
+    lead.developmentReview.version = Number(lead.developmentReview.version || 0) + 1;
+  }
   if(stage==='in_progress'&&!lead.projectStartedAt)lead.projectStartedAt=at;
   if(stage==='delivered'&&!lead.projectDeliveredAt)lead.projectDeliveredAt=at;
   if(stage==='completed')lead.projectCompletedAt=at;
@@ -115,8 +146,6 @@ function setProjectStage(lead, stage, actor, note='', clientNote='') {
   return true;
 }
 const publicUser = u => ({ id: u.id, name: u.name, username: u.username, email: u.email || '', phone: u.phone || '', instagram:u.instagram||'', socialLinks:u.socialLinks||'', telegramUsername:u.telegramUsername||'', role: u.role, active: u.active, accountDisabled:Boolean(u.accountDisabledAt), accountProvisioned:Boolean(u.passwordHash), mustChangePassword:Boolean(u.mustChangePassword), mfaEnabled:Boolean(u.mfaEnabledAt), referralCode: referralEnabled(u) ? (u.currentReferralCode||u.referralCode) : undefined, inviteApprovalStatus:u.inviteApprovalStatus||'', inviteStatus:invitationStatus(u), inviteExpiresAt:u.inviteExpiresAt||null, createdAt: u.createdAt });
-function canSetUpFirstAdmin() { return process.env.ZEZO_DISABLE_ADMIN_SETUP !== 'true' && (STAGING_MODE || process.env.NODE_ENV !== 'production'); }
-function firstAdminSetupAvailable() { return canSetUpFirstAdmin() && !store.users.some(u=>u.role==='admin'&&u.active); }
 const money = n => Math.round(Number(n) * 100) / 100;
 const cents = n => Math.round((Number(n)||0) * 100);
 const fromCents = n => Number((Number(n||0)/100).toFixed(2));
@@ -217,22 +246,64 @@ function referralIntelligenceFor(user=null) {
   const events=store.referralEvents.filter(event=>allowedIds.has(event.userId)).map(event=>({id:event.id,userId:event.userId,employeeName:visibleUsers.find(row=>row.id===event.userId)?.name||'',code:event.code,linkId:event.linkId,month:event.month,type:event.type,createdAt:event.createdAt,resourceId:event.resourceId,leadId:event.leadId,followupId:event.followupId,reversed:Boolean(event.reversedAt)}));
   const links=store.referralLinks.filter(link=>allowedIds.has(link.userId)).map(link=>({id:link.id,userId:link.userId,employeeName:visibleUsers.find(row=>row.id===link.userId)?.name||'',code:link.code,month:link.month,kind:link.kind,createdAt:link.createdAt,current:visibleUsers.find(row=>row.id===link.userId)?.currentReferralLinkId===link.id}));
   const orders=store.leads.filter(lead=>lead.referralUserId&&allowedIds.has(lead.referralUserId)).map(lead=>({id:lead.id,userId:lead.referralUserId,code:lead.referralCode||'',linkId:lead.referralLinkId||null,createdAt:lead.createdAt,service:lead.service,category:lead.category,status:lead.status,isDuplicate:Boolean(lead.isDuplicate),qualified:Boolean(lead.status==='completed'&&!lead.isDuplicate&&!lead.refunded&&Number(lead.contractAmount)>0&&Number(lead.paidTotal)>=Number(lead.contractAmount)&&Boolean(lead.everFullyPaid||lead.fullyPaidAt)),paid:isOwner?Number(lead.paidTotal||0):undefined,amount:isOwner?Number(lead.contractAmount||0):undefined}));
-  return {retentionDays:90,events,links,orders,employees:visibleUsers.map(row=>({id:row.id,name:row.name,role:row.role,rank:row.rank||'rookie',commissionRate:currentRankRate(row),currentReferralCode:row.currentReferralCode||row.referralCode||''}))};
+  const clients=store.users.filter(row=>row.role==='client'&&allowedIds.has(row.referralUserId)).map(row=>({id:row.id,userId:row.referralUserId,name:row.name||'',createdAt:row.createdAt||'',referralBoundAt:row.referralBoundAt||'',requests:store.leads.filter(lead=>lead.clientId===row.id&&lead.referralUserId===row.referralUserId).map(lead=>({id:lead.id,status:lead.status,createdAt:lead.createdAt}))}));
+  return {retentionDays:90,events,links,orders,clients,employees:visibleUsers.map(row=>({id:row.id,name:row.name,role:row.role,rank:row.rank||'rookie',commissionRate:currentRankRate(row),currentReferralCode:row.currentReferralCode||row.referralCode||''}))};
 }
 function referralIntelligenceForViewer(user){
   const data=referralIntelligenceFor(user);if(!['hr_manager','marketing_manager'].includes(user?.role))return data;
   const allowedIds=new Set(store.users.filter(row=>referralEnabled(row)&&hasPermission(user,'employees.read',{ownerId:row.id,department:row.department||roleDepartment(row.role)})).map(row=>row.id));
-  return {...data,employees:data.employees.filter(row=>allowedIds.has(row.id)),links:data.links.filter(row=>allowedIds.has(row.userId)),orders:data.orders.filter(row=>allowedIds.has(row.userId)),events:data.events.filter(row=>allowedIds.has(row.userId))};
+  const events=data.events.filter(row=>allowedIds.has(row.userId)).map(row=>user.role==='hr_manager'&&row.type==='client_signup'?{...row,resourceId:''}:row);
+  return {...data,employees:data.employees.filter(row=>allowedIds.has(row.id)),links:data.links.filter(row=>allowedIds.has(row.userId)),orders:data.orders.filter(row=>allowedIds.has(row.userId)),clients:user.role==='hr_manager'?[]:data.clients.filter(row=>allowedIds.has(row.userId)),events};
 }
 function referralMetricsFor(userId) {
   const events=store.referralEvents.filter(event=>event.userId===userId&&!event.reversedAt);
   const orders=store.leads.filter(lead=>lead.referralUserId===userId&&!lead.isDuplicate&&!lead.duplicateOfLeadId);
   const currentCode=store.users.find(row=>row.id===userId)?.currentReferralCode;
   const types=type=>events.filter(event=>event.type===type).length;
-  return {visits:new Set(events.filter(event=>event.type==='visit').map(event=>event.visitorHash).filter(Boolean)).size,serviceViews:types('service_view'),templateViews:types('template_view'),whatsappClicks:types('whatsapp_click'),inquiries:types('inquiry_confirmed'),requests:orders.length,quoteAcceptances:types('quote_accepted'),sales:new Set(events.filter(event=>event.type==='qualified_sale'&&event.leadId).map(event=>event.leadId)).size,currentCode};
+  return {signups:types('client_signup'),visits:new Set(events.filter(event=>event.type==='visit').map(event=>event.visitorHash).filter(Boolean)).size,serviceViews:types('service_view'),templateViews:types('template_view'),whatsappClicks:types('whatsapp_click'),inquiries:types('inquiry_confirmed'),requests:orders.length,quoteAcceptances:types('quote_accepted'),sales:new Set(events.filter(event=>event.type==='qualified_sale'&&event.leadId).map(event=>event.leadId)).size,currentCode};
 }
 
+async function loadPostgresStore(client) {
+  const nextStore = await loadNormalizedStore(client, defaultStore);
+  store = nextStore;
+
+  sessions.clear();
+  const sessionResult = await client.query('SELECT id, "userId", "expiresAt" FROM auth_sessions WHERE "expiresAt" > NOW()');
+  for (const row of sessionResult.rows) sessions.set(row.id, { userId: row.userId, expires: new Date(row.expiresAt).getTime() });
+}
+
+async function withPostgresReadStoreSnapshot(work) {
+  const snapshot = await withPostgresReadTransaction(client => loadNormalizedStore(client, defaultStore));
+  const previousStore = store;
+  store = { ...defaultStore(), ...snapshot };
+  try {
+    return work();
+  } finally {
+    store = previousStore;
+  }
+}
+
+async function persistPostgresStore(client) {
+  await persistNormalizedStore(client, store);
+
+  const activeSessions = [...sessions.entries()].filter(([, session]) => session.expires > Date.now());
+  await client.query('DELETE FROM auth_sessions WHERE NOT (id = ANY($1::text[]))', [activeSessions.map(([sessionId]) => sessionId)]);
+  for (const [sessionId, session] of activeSessions) {
+    await client.query(
+      'INSERT INTO auth_sessions (id, "userId", "expiresAt", data) VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT (id) DO UPDATE SET "userId" = EXCLUDED."userId", "expiresAt" = EXCLUDED."expiresAt", data = EXCLUDED.data',
+      [sessionId, session.userId, new Date(session.expires), '{}']
+    );
+  }
+}
+
+const sessionKey = sessionId => createHash('sha256').update(String(sessionId || '')).digest('hex');
+
 async function persist() {
+  if (postgresConfigured()) {
+    const client = currentPostgresClient();
+    if (client) return persistPostgresStore(client);
+    return withPostgresTransaction(async transactionClient => persistPostgresStore(transactionClient));
+  }
   const snapshot = JSON.stringify(store, null, 2);
   persistQueue = persistQueue.then(async () => {
     const tmp = `${DB_FILE}.tmp`;
@@ -248,6 +319,18 @@ async function persist() {
   await persistQueue;
 }
 async function init() {
+  if (postgresConfigured()) {
+    return withPostgresTransaction(async client => {
+      await loadPostgresStore(client);
+      const firstAdminAvailable = await initStore();
+      await persistPostgresStore(client);
+      return firstAdminAvailable;
+    });
+  }
+  return initStore();
+}
+
+async function initStore() {
   let migratedSetupFields = false;
   let migratedTemplateAvailability = false;
   let migratedTemplatePricing = false;
@@ -256,11 +339,13 @@ async function init() {
   let migratedClientData = false;
   let migratedNotifications = false;
   let migratedCrm = false;
-  await mkdir(UPLOAD_DIR, { recursive: true });
-  try { store = JSON.parse(await readFile(DB_FILE, 'utf8')); }
-  catch (e) {
-    if (e.code !== 'ENOENT') throw e;
-    store = defaultStore();
+  if (!postgresConfigured()) await mkdir(UPLOAD_DIR, { recursive: true });
+  if (!store) {
+    try { store = JSON.parse(await readFile(DB_FILE, 'utf8')); }
+    catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+      store = defaultStore();
+    }
   }
   store.users ??= []; store.leads ??= []; store.conversations ??= []; store.audit ??= []; if(!Array.isArray(store.notifications)){store.notifications=[];migratedNotifications=true;} store.payments ??= []; store.campaigns ??= [];
   if(!Array.isArray(store.crmLeads)){store.crmLeads=[];migratedCrm=true;}
@@ -290,8 +375,6 @@ async function init() {
   if ('setupHash' in store) { delete store.setupHash; migratedSetupFields = true; }
   if ('setupExpires' in store) { delete store.setupExpires; migratedSetupFields = true; }
   if (store.settings.commissionPercent == null) store.settings.commissionPercent = 15;
-  let recoveredMail=false;
-  for (const item of store.mailQueue) if (item.state === 'sending') { item.state = 'retry'; recoveredMail=true; }
   for (const user of store.users) {
     if (user.role === 'orders_manager' || user.role === 'documentation_officer') { user.role='hr_manager'; migratedSetupFields=true; }
     if (referralEnabled(user)) {
@@ -362,9 +445,9 @@ async function init() {
   const financeMigrated=ledgerSizeBefore!==store.financeLedger.length;
   const rankRequestsCreated = syncAllRankRequests();
   for(const lead of store.leads){const linked=(store.crmLeads||[]).some(row=>row.orderIds?.includes(lead.id)||row.id===lead.crmLeadId);ensureCrmCaseForOrder(lead);if(!linked)migratedCrm=true;}
-  if(recoveredMail || migratedSetupFields || migratedWithdrawals || migratedTemplateAvailability || migratedTemplatePricing || migratedPermissionData || migratedClientData || migratedNotifications || migratedCrm || referralLinksCreated || referralDataCleaned || rankRequestsCreated.length || financeMigrated || store.users.some(referralEnabled)) await persist();
+  if(postgresConfigured() || migratedSetupFields || migratedWithdrawals || migratedTemplateAvailability || migratedTemplatePricing || migratedPermissionData || migratedClientData || migratedNotifications || migratedCrm || referralLinksCreated || referralDataCleaned || rankRequestsCreated.length || financeMigrated || store.users.some(referralEnabled)) await persist();
   for (const request of rankRequestsCreated) await queueRankRequestMail(request);
-  return firstAdminSetupAvailable();
+  return false;
 }
 function audit(actor, action, target, detail = '') {
   const entry={ id: id('evt'), at: now(), actor: actor ? actor.username : 'system', actorId:actor?.id||'', role: actor?.role || 'system', action, target, detail: clean(detail, 180) };
@@ -372,7 +455,7 @@ function audit(actor, action, target, detail = '') {
   store.audit = store.audit.slice(0, 500);
   emitAuditNotifications(entry,actor);
 }
-const notificationAllowedTabs={admin:['overview','requests','finance','referrals','ranks','withdrawals','team','marketing','crm','pricing','audit','conversations','permissions'],marketing_manager:['marketing','referrals','crm','conversations'],hr_manager:['people','referrals','conversations','orders'],order_manager:['conversations','orders'],marketer:['referral'],developer:['development','referral'],client:['orders','conversations']};
+const notificationAllowedTabs={admin:['overview','requests','finance','referrals','ranks','withdrawals','team','marketing','crm','pricing','audit','conversations','permissions'],marketing_manager:['marketing','referrals','crm','conversations'],hr_manager:['people','referrals','conversations','orders'],order_manager:['conversations','orders'],marketer:['referral'],developer:['development','referral'],client:['orders','conversations'],[developmentManagerRole]:['technical-requests']};
 function createNotification(userId,eventKey,{type='update',importance='normal',titleAr,titleEn,descriptionAr='',descriptionEn='',tab='',targetId='',targetKind=''}={}){
   if(!userId||!eventKey||!titleAr||!titleEn)return null;
   store.notifications??=[];
@@ -505,6 +588,26 @@ function notifyCurrentCommissions(lead){
   if(Number(lead.developerCommissionAmount||0)>0&&lead.developerUserId){const status=lead.developerCommissionStatus||'pending',amount=money(lead.developerCommissionAmount),key=`commission:${lead.id}:developer:${status}:${amount}`;notifyUser(lead.developerUserId,key,{type:'commission',importance:status==='confirmed'?'high':'normal',titleAr:status==='confirmed'?'استحقاق تنفيذ المشروع متاح':'تحدّث استحقاق تنفيذ المشروع',titleEn:status==='confirmed'?'Project execution entitlement is available':'Project execution entitlement updated',descriptionAr:'هذا الاستحقاق منفصل عن عمولة التسويق ويظهر في محفظة التنفيذ.',descriptionEn:'This entitlement is separate from marketing commission and appears in your execution wallet.'},{tab:'development',targetId:lead.id,targetKind:'lead'});}
 }
 function safeNotification(row){return {id:row.id,type:row.type,importance:row.importance,titleAr:row.titleAr,titleEn:row.titleEn,descriptionAr:row.descriptionAr,descriptionEn:row.descriptionEn,createdAt:row.createdAt,readAt:row.readAt||'',target:{tab:row.target?.tab||'',id:row.target?.id||'',kind:row.target?.kind||''}};}
+function canReadNotification(user, row) {
+  if (row.userId !== user.id) return false;
+  if (user.role !== developmentManagerRole) return true;
+  return row.eventKey?.startsWith('development-manager:') && developmentProjectAccessible(store.leads.find(lead => lead.id === row.target?.id), user.id);
+}
+function developmentNotificationScope(user, params) {
+  if (user.role !== developmentManagerRole) return 'TRUE';
+  const stages = `$${params.push(developmentTechnicalStages)}`;
+  return `(system_notifications.data->>'eventKey' LIKE 'development-manager:%' AND EXISTS (
+    SELECT 1 FROM project_requests project
+    WHERE project.id = system_notifications.data->'target'->>'id'
+      AND ${scopedDevelopmentProjectSql('project', 'system_notifications."userId"', stages)}
+  ))`;
+}
+async function countUnreadPostgresNotifications(client, user) {
+  const params = [user.id];
+  const scope = developmentNotificationScope(user, params);
+  const unread = await client.query(`SELECT COUNT(*)::int AS count FROM system_notifications WHERE "userId" = $1 AND "readAt" IS NULL AND ${scope}`, params);
+  return Number(unread.rows[0]?.count || 0);
+}
 function ownerDecisionsFor(){
   const decisions=[];
   for(const request of store.rankRequests.filter(row=>row.status==='pending')){const user=store.users.find(row=>row.id===request.userId);decisions.push({id:request.id,type:'rank',titleAr:`ترقية ${user?.name||'مسوّق'}`,titleEn:`Promote ${user?.name||'marketer'}`,descriptionAr:`${marketerRankTitles[request.targetRank]} · ${request.salesAtRequest}/${request.threshold} مبيعات مؤهلة`,descriptionEn:`${marketerRankTitles[request.targetRank]} · ${request.salesAtRequest}/${request.threshold} qualified sales`,createdAt:request.createdAt,target:{tab:'ranks',id:request.id,kind:'rank_request'}});}
@@ -662,26 +765,64 @@ function referralForRequest(req, body={}){
   const resolved=code?referralLinkForCode(code):null;
   return resolved?{...resolved,code,link:resolved.link}:null;
 }
+async function resolvePostgresReferralForConversation(clientUser){
+  const userId=clean(clientUser?.referralUserId,80),code=clean(clientUser?.referralCode||clientUser?.currentReferralCode,40),linkId=clean(clientUser?.referralLinkId,80);
+  if(!userId||!code)return null;
+  const found=await queryPostgres(`
+    SELECT u.id AS "userId", $2::text AS code,
+      (SELECT l.id FROM referral_links l WHERE l."userId"=u.id AND l.code=$2
+       ORDER BY (l.id=$3) DESC, l.active DESC, l."createdAt" DESC LIMIT 1) AS "linkId"
+    FROM user_accounts u
+    WHERE u.id=$1 AND u.active=TRUE AND u.role=ANY($4::text[])
+      AND (EXISTS (SELECT 1 FROM referral_links l WHERE l."userId"=u.id AND l.code=$2)
+        OR u.data->>'referralCode'=$2 OR u.data->>'currentReferralCode'=$2)
+    LIMIT 1
+  `,[userId,code,linkId,['marketer','developer']]);
+  const row=found.rows[0];
+  return row?{userId:row.userId,code:row.code,linkId:row.linkId||null}:null;
+}
+function referralForAuthenticatedClient(clientUser){
+  const userId=clean(clientUser?.referralUserId,80),code=clean(clientUser?.referralCode||clientUser?.currentReferralCode,40);
+  if(!userId||!code)return null;
+  const referrer=store.users.find(user=>user.id===userId&&user.active&&['marketer','developer'].includes(user.role));
+  if(!referrer)return null;
+  const resolved=referralLinkForCode(code);
+  if(resolved&&resolved.user.id!==userId)return null;
+  if(!resolved&&referrer.referralCode!==code&&referrer.currentReferralCode!==code)return null;
+  return {userId,code,linkId:clientUser.referralLinkId||resolved?.link?.id||null};
+}
 function bindClientReferral(user, attribution){
   if(user.referralUserId||!attribution?.user?.id)return false;
   if(attribution.user.id===user.id||normalizeEmail(attribution.user.email)===normalizeEmail(user.email))return false;
   user.referralUserId=attribution.user.id;user.referralCode=attribution.code||attribution.user.currentReferralCode||attribution.user.referralCode;
   user.referralLinkId=attribution.link?.id||null;user.referralBoundAt=now();return true;
 }
-const emailReady = () => !STAGING_MODE && Boolean(process.env.RESEND_API_KEY && process.env.ZEZO_FROM_EMAIL);
+function emailReady() {
+  if (STAGING_MODE) return false;
+  if (postgresConfigured()) return Boolean(postgresOutboxSettings());
+  return process.env.ZEZO_ENABLE_EMAIL_DELIVERY === 'true' && Boolean(process.env.RESEND_API_KEY && process.env.ZEZO_FROM_EMAIL);
+}
 const adminEmailReady = () => !STAGING_MODE && Boolean(process.env.ZEZO_NOTIFICATION_EMAIL);
+function emailReadyForRecipient(email) {
+  const testRecipient = normalizeEmail(process.env.ZEZO_EMAIL_TEST_RECIPIENT);
+  return emailReady() && (!testRecipient || normalizeEmail(email) === testRecipient);
+}
 function requestIsSecure(req) {
   if (req.socket?.encrypted) return true;
-  return STAGING_MODE && String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() === 'https';
+  const trustedProxy = process.env.NETLIFY === 'true' || process.env.ZEZO_TRUST_PROXY === 'true';
+  return trustedProxy && String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() === 'https';
 }
 function siteBase(req) {
-  const configured = STAGING_MODE ? '' : String(process.env.ZEZO_PUBLIC_URL || '').trim().replace(/\/$/, '');
-  if (configured && /^https?:\/\/[a-z0-9.-]+(?::\d+)?$/i.test(configured)) return configured;
   const host = String(req.headers.host || 'localhost').toLowerCase();
-  return `${requestIsSecure(req) ? 'https' : 'http'}://${/^[a-z0-9.-]+(?::\d+)?$/.test(host) ? host : 'localhost'}`;
+  const requestOrigin = `${requestIsSecure(req) ? 'https' : 'http'}://${/^[a-z0-9.-]+(?::\d+)?$/.test(host) ? host : 'localhost'}`;
+  const origin = getRequestPublicSiteOrigin(process.env, { isStaging: STAGING_MODE, requestOrigin });
+  if (!origin) throw new Error('Staging public URL is not configured.');
+  return origin;
 }
 async function processMailQueue() {
-  if (STAGING_MODE || !emailReady() || store.mailQueue.some(item => item.state === 'sending')) return;
+  // PostgreSQL is drained by the standalone or scheduled worker after commit.
+  if (STAGING_MODE || postgresConfigured() || !emailReady()) return 0;
+  if (store.mailQueue.some(item => item.state === 'sending')) return 0;
   for (const item of [...store.mailQueue].reverse()) {
     if (!['pending','retry'].includes(item.state) || item.attempts >= 5) continue;
     const recipient = item.recipientType === 'admin' ? process.env.ZEZO_NOTIFICATION_EMAIL : item.to;
@@ -689,28 +830,41 @@ async function processMailQueue() {
     item.state = 'sending'; item.attempts += 1; item.lastAttemptAt = now();
     await persist();
     try {
-      const response = await fetch('https://api.resend.com/emails', {
-        method: 'POST', signal: AbortSignal.timeout(12000),
-        headers: { 'Authorization': `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Idempotency-Key': item.id },
-        body: JSON.stringify({ from: process.env.ZEZO_FROM_EMAIL, to: recipient, subject: item.subject, text: item.text })
+      const result = await sendWithResend({
+        to: recipient, subject: item.subject, text: item.text, html: item.html, idempotencyKey: item.id
       });
-      const result = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(result.message || `Email provider returned ${response.status}`);
-      item.state = 'sent'; item.sentAt = now(); item.providerId = clean(result.id, 120); item.lastError = '';
+      item.state = 'sent'; item.sentAt = now(); item.providerId = result.id; item.lastError = '';
     } catch (error) {
       item.state = item.attempts >= 5 ? 'failed' : 'retry';
-      item.lastError = clean(error.message, 220);
+      item.lastError = error instanceof ResendMailError ? error.message : 'Email send failed.';
     }
     await persist();
   }
+  return undefined;
 }
-async function queueMail({ to = '', recipientType = 'direct', subject, text, kind }) {
+async function queueMail({ to = '', recipientType = 'direct', subject, text, kind, eventKey = '', expiresAt, persistImmediately = true }) {
   const safeText=String(text??'').replace(/\r\n?/g,'\n').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g,'').trim().slice(0,6000);
-  const item = { id: id('mail'), createdAt: now(), kind: clean(kind, 50), to: clean(to, 150), recipientType, subject: clean(subject, 180), text: safeText, state: 'pending', attempts: 0, lastError: '' };
+  const mailId = eventKey ? `mail_${hash(eventKey).slice(0, 40)}` : id('mail');
+  const prior = eventKey ? store.mailQueue.find(row => row.id === mailId) : null;
+  if (prior) return prior;
+  const item = { id: mailId, createdAt: now(), kind: clean(kind, 50), to: clean(to, 150), recipientType, subject: clean(subject, 180), text: safeText, state: 'pending', attempts: 0, lastError: '', ...(expiresAt ? { expiresAt } : {}) };
   store.mailQueue.unshift(item); store.mailQueue = store.mailQueue.slice(0, 1000);
-  await persist();
-  void processMailQueue();
+  if (persistImmediately) await persist();
+  // PostgreSQL deployments use the separately supervised durable worker; do not
+  // send inside the request transaction or rely on a serverless timer.
+  if (!postgresConfigured()) void processMailQueue();
   return item;
+}
+async function queueProjectWorkspaceMail(req, lead, { eventKey, kind, approved, staff = false }) {
+  const recipientId = staff ? lead.developerUserId : lead.clientId;
+  const expectedRole = staff ? 'developer' : 'client';
+  const account = store.users.find(user => user.id === recipientId && user.role === expectedRole && user.active && !user.accountDisabledAt);
+  if (!account?.email || !emailReadyForRecipient(account.email)) return;
+  const language = staff ? account.language : lead.language || account.language;
+  await queueMail({
+    to: account.email, kind, eventKey: `${eventKey}:${recipientId}`,
+    ...approvalEmail({ siteBase: siteBase(req), language, approved, staff })
+  });
 }
 function fallbackQuote(brief) {
   const text=String(brief||'').toLowerCase();
@@ -753,10 +907,7 @@ function cookieValue(req, key) {
 }
 function stagingAuthorized(req) {
   if (!STAGING_MODE) return true;
-  const sessionId = cookieValue(req, 'zezo_staging_access');
-  const session = stagingSessions.get(sessionId);
-  if (!session || session.expiresAt <= Date.now()) { if (sessionId) stagingSessions.delete(sessionId); return false; }
-  return true;
+  return isStagingSessionValid(cookieValue(req, STAGING_ACCESS_COOKIE));
 }
 function stagingLoginPage(message = '') {
   return '<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow,noarchive"><title>دخول بيئة اختبار ZEZO</title><style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#05070a;color:#edf3ff;font-family:Segoe UI,Tahoma,Arial,sans-serif;padding:24px}.card{width:min(100%,430px);padding:34px;border:1px solid #233149;background:linear-gradient(145deg,#0d1521,#080b10);box-shadow:0 24px 80px #0009}.brand{color:#a3ff12;font-size:12px;letter-spacing:.2em;font-weight:800}.planet{color:#0066ff}.eyebrow{margin:28px 0 8px;color:#91a1b8;font-size:12px;letter-spacing:.08em}.card h1{margin:0 0 10px;font-size:28px}.card p{margin:0 0 24px;color:#9ba9bb;line-height:1.8;font-size:14px}label{display:block;font-size:13px;margin-bottom:9px}input{width:100%;height:48px;border:1px solid #31415a;background:#05070a;color:#fff;padding:0 14px;font-size:16px;direction:ltr;text-align:left}input:focus{outline:2px solid #0066ff;border-color:transparent}button{width:100%;margin-top:16px;height:48px;border:0;background:#a3ff12;color:#071006;font-weight:800;font-size:14px;cursor:pointer}button:hover{filter:brightness(1.06)}.error{padding:10px 12px;margin:0 0 16px;border:1px solid #743d43;color:#ffb5bb;background:#35151a;font-size:13px}.foot{margin-top:22px!important;margin-bottom:0!important;font-size:11px!important;color:#728099!important}</style><main class="card"><div class="brand">ZEZO<span class="planet">.</span> / STAGING</div><div class="eyebrow">PRIVATE TEST ENVIRONMENT</div><h1>دخول بيئة الاختبار</h1><p>أدخل كلمة المرور التي ظهرت في نافذة تشغيل ZEZO على جهازك.</p>' + (message ? '<div class="error" role="alert">' + message + '</div>' : '') + '<form method="post" action="/__staging/login"><label for="password">كلمة مرور المعاينة</label><input id="password" name="password" type="password" autocomplete="current-password" maxlength="200" required autofocus><button type="submit">دخول آمن ↗</button></form><p class="foot">بيانات تجريبية مستقلة. لا تستخدم بيانات حقيقية.</p></main></html>';
@@ -764,8 +915,9 @@ function stagingLoginPage(message = '') {
 const cookie = (key, value, maxAge, req) => `${key}=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAge}; HttpOnly; SameSite=Lax${requestIsSecure(req) ? '; Secure' : ''}`;
 function sessionUser(req) {
   const sid = cookieValue(req, 'zezo_session');
-  const session = sessions.get(sid);
-  if (!session || session.expires < Date.now()) { if (sid) sessions.delete(sid); return null; }
+  const key = sessionKey(sid);
+  const session = sessions.get(key);
+  if (!session || session.expires < Date.now()) { if (sid) sessions.delete(key); return null; }
   const user = store.users.find(u => u.id === session.userId && u.active);
   return user ? { user, sid } : null;
 }
@@ -775,22 +927,991 @@ function requireAuth(req, res, allowed = allRoles) {
   const route = new URL(req.url, 'http://localhost').pathname;
   if (auth.user.mustChangePassword && !['/api/auth/password','/api/auth/logout'].includes(route)) { json(res, 428, { error:'غيّر كلمة المرور المؤقتة أولاً / Change the temporary password first', mustChangePassword:true }); return null; }
   if (sensitiveManagementRole(auth.user.role) && !auth.user.mfaEnabledAt && !['/api/auth/mfa/setup','/api/auth/mfa/enable','/api/auth/password','/api/auth/logout'].includes(route)) { json(res, 428, { error:'أكمل إعداد التحقق بخطوتين قبل استخدام مساحة الإدارة / Complete two-step verification setup before using the management workspace', mfaSetupRequired:true }); return null; }
-  if (!allowed.includes(auth.user.role)) { json(res, 403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }); return null; }
+  if (!allowed.includes(auth.user.role) || (auth.user.role === developmentManagerRole && !canUseDevelopmentManagerRoute(route))) { json(res, 403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }); return null; }
   return auth;
 }
-async function bodyBuffer(req) {
+async function directPostgresSessionUser(req) {
+  const sid = cookieValue(req, 'zezo_session');
+  if (!sid) return null;
+  const session = await loadSessionAccount(sessionKey(sid));
+  return session ? { user: session.user, sid } : null;
+}
+function directRequireAuth(req, res, user, allowed = allRoles) {
+  if (!user) { json(res, 401, { error: 'سجّل الدخول للمتابعة / Please sign in to continue' }, responseSecurityHeaders()); return false; }
+  const route = new URL(req.url, 'http://localhost').pathname;
+  if (user.mustChangePassword && !['/api/auth/password','/api/auth/logout'].includes(route)) {
+    json(res, 428, { error: 'غيّر كلمة المرور المؤقتة أولاً / Change the temporary password first', mustChangePassword: true }, responseSecurityHeaders()); return false;
+  }
+  if (sensitiveManagementRole(user.role) && !user.mfaEnabledAt && !['/api/auth/mfa/setup','/api/auth/mfa/enable','/api/auth/password','/api/auth/logout'].includes(route)) {
+    json(res, 428, { error: 'أكمل إعداد التحقق بخطوتين قبل استخدام مساحة الإدارة / Complete two-step verification setup before using the management workspace', mfaSetupRequired: true }, responseSecurityHeaders()); return false;
+  }
+  if (!allowed.includes(user.role) || (user.role === developmentManagerRole && !canUseDevelopmentManagerRoute(route))) { json(res, 403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }, responseSecurityHeaders()); return false; }
+  return true;
+}
+function directCrmAggregate(records, events, { from = '', to = '', service = '' } = {}) {
+  let selectedEvents = events;
+  if (service) selectedEvents = selectedEvents.filter(event =>
+    (['service_view', 'whatsapp_click'].includes(event.type) && event.resourceId === service) ||
+    (event.type === 'template_view' && templateById.get(event.resourceId)?.service === service)
+  );
+  const count = status => records.filter(row => row.status === status).length;
+  const sales = new Set(records.filter(row => row.status === 'completed_sale').flatMap(row => row.orderIds || []));
+  const requests = new Set(records.flatMap(row => row.orderIds || []));
+  const services = {};
+  for (const record of records) if (record.service) services[record.service] = (services[record.service] || 0) + 1;
+  const responseMinutes = records.map(row => {
+    const first = (row.history || []).find(item => item.kind === 'status_changed' && ['contacted', 'interested', 'follow_up'].includes(item.status));
+    return first ? Math.max(0, (Date.parse(first.at) - Date.parse(row.createdAt)) / 60000) : null;
+  }).filter(Number.isFinite);
+  const distinctVisits = new Set(selectedEvents.filter(event => service ? ['service_view', 'template_view', 'whatsapp_click'].includes(event.type) : event.type === 'visit').map(event => event.visitorHash).filter(Boolean));
+  const typeCount = type => selectedEvents.filter(event => event.type === type).length;
+  const fromTime = from ? Date.parse(`${from}T00:00:00.000Z`) : -Infinity;
+  const toTime = to ? Date.parse(`${to}T23:59:59.999Z`) : Infinity;
+  return {
+    total: records.length, visits: distinctVisits.size, serviceViews: typeCount('service_view'), templateViews: typeCount('template_view'),
+    whatsappClicks: typeCount('whatsapp_click'), confirmedEnquiries: records.filter(row => row.status !== 'duplicate' && !row.mergedInto).length,
+    newEnquiries: count('new_enquiry'), awaitingContact: records.filter(row => ['awaiting_contact', 'new_enquiry'].includes(row.status)).length,
+    followUps: records.filter(row => row.status === 'follow_up' && row.followUpAt).length,
+    quotes: records.filter(row => ['quote_pending', 'quote_sent', 'quote_accepted'].includes(row.status)).length,
+    quoteAcceptances: typeCount('quote_accepted'), orders: requests.size, sales: sales.size,
+    conversionRate: requests.size ? Math.round(sales.size / requests.size * 1000) / 10 : 0,
+    averageFirstResponseMinutes: responseMinutes.length ? Math.round(responseMinutes.reduce((sum, value) => sum + value, 0) / responseMinutes.length) : null,
+    topServices: Object.entries(services).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([serviceName, total]) => ({ service: serviceName, count: total })),
+    duplicates: records.filter(row => row.duplicateCandidates?.length || row.status === 'duplicate').length,
+    overdueFollowUps: records.filter(row => row.followUpAt && Date.parse(row.followUpAt) < Date.now() && !['completed_sale', 'cancelled', 'not_interested', 'duplicate'].includes(row.status)).length
+  };
+}
+async function loadNotificationDeadlineSnapshot(client) {
+  const asObject = value => value && typeof value === 'object' ? value : {};
+  const asIso = value => {
+    if (!value) return '';
+    const parsed = value instanceof Date ? value : new Date(value);
+    return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : String(value);
+  };
+
+  const userRows = (await client.query(`
+    SELECT id, email, username, role, active, "fullName", data, "createdAt"
+    FROM user_accounts
+    WHERE active = TRUE AND role <> 'client'
+  `)).rows;
+  const users = userRows.map(row => ({
+    ...asObject(row.data), id: row.id, email: row.email || '', username: row.username || '',
+    role: row.role, active: row.active, name: row.fullName || row.data?.name || '',
+    createdAt: asIso(row.createdAt)
+  }));
+
+  const leadRows = (await client.query(`
+    SELECT id, status, "developerId", data, "createdAt", "updatedAt"
+    FROM project_requests
+    WHERE "developerId" IS NOT NULL OR data ? 'developerUserId' OR data ? 'developerDueDate'
+  `)).rows;
+  const leads = new Map(leadRows.map(row => {
+    const data = asObject(row.data);
+    return [row.id, {
+      ...data, id: row.id, status: row.status || data.status || 'new',
+      developerUserId: row.developerId || data.developerUserId || null,
+      createdAt: asIso(row.createdAt), updatedAt: asIso(row.updatedAt)
+    }];
+  }));
+  const projectRows = (await client.query(`
+    SELECT p."requestId", p."developerId", p."dueAt", p.data,
+      r.status AS "requestStatus", r.data AS "requestData",
+      r."createdAt" AS "requestCreatedAt", r."updatedAt" AS "requestUpdatedAt"
+    FROM projects p
+    LEFT JOIN project_requests r ON r.id = p."requestId"
+    WHERE p."developerId" IS NOT NULL OR p."dueAt" IS NOT NULL
+  `)).rows;
+  for (const row of projectRows) {
+    const projectData = asObject(row.data);
+    const requestData = asObject(row.requestData);
+    const lead = leads.get(row.requestId) || {
+      ...requestData, id: row.requestId, status: row.requestStatus || requestData.status || 'new',
+      createdAt: asIso(row.requestCreatedAt), updatedAt: asIso(row.requestUpdatedAt)
+    };
+    if (row.developerId) lead.developerUserId = row.developerId;
+    if (row.dueAt) lead.developerDueDate = asIso(row.dueAt);
+    for (const key of ['developerDueDate', 'developerUpdatedAt']) {
+      if (projectData[key] !== undefined && !lead[key]) lead[key] = projectData[key];
+    }
+    leads.set(row.requestId, lead);
+  }
+
+  const crmRows = (await client.query(`
+    SELECT id, status, data, "createdAt", "updatedAt"
+    FROM crm_records
+    WHERE status IN ('new_enquiry', 'awaiting_contact')
+      OR NULLIF(data->>'followUpAt', '') IS NOT NULL
+  `)).rows;
+  const crmLeads = crmRows.map(row => ({
+    ...asObject(row.data), id: row.id, status: row.status || row.data?.status || 'new_enquiry',
+    createdAt: asIso(row.createdAt), updatedAt: asIso(row.updatedAt)
+  }));
+
+  const recipientIds = [...new Set(users.map(user => user.id).filter(Boolean))];
+  const notificationRows = recipientIds.length
+    ? (await client.query(`
+        SELECT id, "userId", type, "readAt", data, "createdAt"
+        FROM system_notifications
+        WHERE "userId" = ANY($1::text[]) AND type = 'deadline'
+      `, [recipientIds])).rows
+    : [];
+  const notifications = notificationRows.map(row => ({
+    ...asObject(row.data), id: row.id, userId: row.userId, type: row.type || row.data?.type,
+    readAt: row.readAt ? asIso(row.readAt) : '', createdAt: asIso(row.createdAt)
+  }));
+
+  return { ...defaultStore(), users, leads: [...leads.values()], crmLeads, notifications };
+}
+
+async function handlePostgresCoreRead(req, res, path) {
+  if (!stagingAuthorized(req)) return false;
+  const security = responseSecurityHeaders();
+  if (req.method === 'GET' && path === '/api/auth/session') {
+    const auth = await directPostgresSessionUser(req);
+    json(res, 200, auth ? { authenticated: true, user: publicUser(auth.user) } : { authenticated: false }, security);
+    return true;
+  }
+
+  if (req.method === 'POST' && path === '/api/auth/verify-email') {
+    const body = await jsonBody(req);
+    const verificationToken = typeof body.token === 'string' ? body.token : '';
+    const ip = req.socket?.remoteAddress || 'unknown';
+    if (!await consumeRateLimitBucket('client-email-verification', ip, 16, 15 * 60_000)) {
+      json(res, 429, { error: 'محاولات تأكيد كثيرة. حاول لاحقاً / Too many verification attempts. Try again later.' }, security);
+      return true;
+    }
+    const at = now();
+    const sessionId = token();
+    const user = /^[a-zA-Z0-9_-]{43}$/.test(verificationToken) ? await verifyPostgresClientEmail({
+      verificationHash: hash(verificationToken), sessionHash: sessionKey(sessionId),
+      sessionExpiresAt: new Date(Date.now() + SESSION_TTL), auditId: id('evt'), at
+    }) : null;
+    if (!user) {
+      json(res, 400, { error: 'رابط تأكيد البريد غير صالح أو منتهي / Verification link is invalid or expired' }, security);
+      return true;
+    }
+    json(res, 200, { user: publicUser(user) }, { ...security, 'Set-Cookie': cookie('zezo_session', sessionId, SESSION_TTL / 1000, req) });
+    return true;
+  }
+
+  if (req.method === 'POST' && path === '/api/auth/forgot-password') {
+    const body = await jsonBody(req);
+    const email = normalizeEmail(body.email);
+    const ip = req.socket?.remoteAddress || 'unknown';
+    if (!await consumeRateLimitBucket('password-reset-ip', ip, 8, 60 * 60_000) ||
+        (email && !await consumeRateLimitBucket('password-reset-email', hash(email), 4, 60 * 60_000))) {
+      json(res, 429, { error: 'محاولات كثيرة لاستعادة كلمة المرور. حاول لاحقاً / Too many password reset attempts. Try again later.' }, security);
+      return true;
+    }
+    if (!passwordRecoveryEmailReady()) {
+      json(res, 503, { error: 'استعادة كلمة المرور عبر البريد غير مفعّلة حالياً. تواصل مع خدمة العملاء لاستعادة الحساب / Email password recovery is not configured yet. Contact ZEZO support to recover your account.' }, security);
+      return true;
+    }
+    const respondAfter = performance.now() + passwordRecoveryMinimumResponseMs();
+    const testRecipient = String(process.env.ZEZO_EMAIL_TEST_RECIPIENT || '').trim().toLowerCase();
+    if (email && (!testRecipient || email === testRecipient)) {
+      const rawToken = token(32);
+      const resetUrl = createPasswordResetUrl(rawToken);
+      const at = now();
+      const mailId = id('mail');
+      const issued = await issuePostgresPasswordReset({
+        email, resetHash: hash(rawToken), expiresAt: Date.now() + 60 * 60_000, at,
+        outboxMessage: {
+          id: mailId, recipientType: 'direct', kind: 'account_password_reset',
+          state: 'sending', attempts: 1, createdAt: at, updatedAt: at
+        }
+      });
+      if (issued.kind === 'queued') {
+        let accepted = false;
+        let providerId = '';
+        try {
+          // Await provider acceptance in this request. The raw reset token is
+          // only in memory and must never enter a background job payload.
+          const receipt = await sendPasswordRecoveryEmail({ to: email, resetUrl, language: body.lang === 'en' ? 'en' : 'ar', idempotencyKey: mailId });
+          providerId = receipt?.id || '';
+          accepted = true;
+        } catch (error) {
+          const failureCode = passwordRecoveryFailureCode(error);
+          await completePostgresPasswordResetEmail({ id: mailId, state: 'uncertain', failureCode, at: now() }).catch(() => false);
+          // Log only a coarse error category. Never log address, message, URL, or token.
+          console.warn('Password recovery provider did not confirm acceptance:', failureCode);
+        }
+        if (accepted && !await completePostgresPasswordResetEmail({ id: mailId, state: 'sent', providerId, at: now() }).catch(() => false)) {
+          // An acceptance without a recorded receipt is still ambiguous. Do
+          // not regenerate or resend a one-time link from a background task.
+          console.warn('Password recovery acceptance receipt could not be stored.');
+        }
+      } else {
+        // SMTP verifies the connection without sending. Resend waits for the
+        // same response deadline as a known account instead of sending a probe.
+        try { await verifyPasswordRecoveryTransport(); }
+        catch (error) { console.warn('Password recovery provider verification failed:', passwordRecoveryFailureCode(error)); }
+      }
+    }
+    const remaining = respondAfter - performance.now();
+    if (remaining > 0) await new Promise(resolve => setTimeout(resolve, remaining));
+    json(res, 202, { ok: true, message: 'إذا كان البريد مرتبطاً بحساب نشط وتمكن النظام من إرسال الرسالة، فستصلك تعليمات الاستعادة. لا تؤكد هذه الصفحة وصول الرسالة / If this email belongs to an active account and the system can send the message, recovery instructions will arrive. This page does not confirm delivery.' }, security);
+    return true;
+  }
+
+  if (req.method === 'POST' && path === '/api/auth/reset-password') {
+    const body = await jsonBody(req);
+    const rawToken = String(body.token || '').slice(0, 200);
+    if (!validPassword(String(body.password || ''))) {
+      json(res, 400, { error: 'كلمة المرور يجب أن تكون 12 خانة على الأقل / Password must contain at least 12 characters' }, security);
+      return true;
+    }
+    const at = now();
+    const result = await consumePostgresPasswordReset({
+      resetHash: hash(rawToken), credential: passwordRecord(String(body.password)), auditId: id('evt'), at
+    });
+    if (result.kind !== 'reset') {
+      json(res, 400, { error: 'رابط إعادة التعيين غير صالح أو منتهي / Reset link is invalid or expired' }, security);
+      return true;
+    }
+    // Password recovery revokes every existing session and deliberately does
+    // not mint a replacement session, so it cannot bypass MFA for staff.
+    json(res, 200, { ok: true, user: publicUser(result.user) }, { ...security, 'Set-Cookie': cookie('zezo_session', '', 0, req) });
+    return true;
+  }
+
+  if (req.method === 'POST' && path === '/api/client/register') {
+    const body = await jsonBody(req);
+    const ip = req.socket?.remoteAddress || 'unknown';
+    if (!await consumeRateLimitBucket('client-registration', ip, 8, 60 * 60_000)) {
+      json(res, 429, { error: 'محاولات تسجيل كثيرة. حاول لاحقاً / Too many registration attempts. Try again later.' }, security);
+      return true;
+    }
+    const name = clean(body.name, 100);
+    const email = normalizeEmail(body.email);
+    const password = String(body.password || '');
+    if (name.length < 2 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !validPassword(password) || String(body.confirmPassword || '') !== password) {
+      json(res, 400, { error: 'أكمل الاسم والبريد، وتأكد من تطابق كلمتي المرور (12 خانة على الأقل) / Enter your name and email, and make sure both passwords match (12+ characters).' }, security);
+      return true;
+    }
+
+    const createdAt = now();
+    const deliveryReady = emailReadyForRecipient(email);
+    const verificationToken = deliveryReady ? token(32) : '';
+    const verificationRequired = Boolean(verificationToken);
+    const credential = passwordRecord(password);
+    const language = body.lang === 'en' ? 'en' : 'ar';
+    const referralCookieValue = cookieValue(req, REFERRAL_ATTRIBUTION_COOKIE);
+    const referralVisitorHash = /^[A-Za-z0-9_-]{40,64}$/.test(referralCookieValue) ? hash(referralCookieValue) : '';
+    const isStudent = body.student === 'true' || body.student === true;
+    const user = {
+      id: id('usr'), name, username: email, email, phone: '', instagram: '', socialLinks: '', telegramUsername: '',
+      role: 'client', active: !verificationRequired, student: isStudent, language,
+      university: isStudent ? clean(body.university, 120) : '',
+      emailVerified: false, createdAt, ...credential
+    };
+    if (verificationRequired) {
+      user.emailVerificationHash = hash(verificationToken);
+      user.emailVerificationExpires = Date.now() + 24 * 60 * 60_000;
+    }
+    const verifyUrl = verificationRequired ? `${siteBase(req)}/?verifyEmail=${encodeURIComponent(verificationToken)}` : '';
+    const dedupeKey = `client-verification:${user.id}`;
+    const mailId = `mail_${hash(dedupeKey).slice(0, 32)}`;
+    const outboxMessage = verificationRequired ? {
+      id: mailId,
+      recipient: email,
+      data: {
+        id: mailId, to: email, recipientType: 'direct', kind: 'client_email_verification', dedupeKey,
+        ...verificationEmail({ name, verifyUrl, language }),
+        expiresAt: new Date(user.emailVerificationExpires).toISOString(),
+        state: 'pending', attempts: 0, lastError: '', createdAt, updatedAt: createdAt
+      }
+    } : null;
+    const sessionId = verificationRequired ? '' : token();
+    const result = await createPostgresClientRegistration({
+      user, referralVisitorHash, auditId: id('evt'), at: createdAt,
+      verificationRequired,
+      sessionHash: sessionId ? sessionKey(sessionId) : '',
+      sessionExpiresAt: sessionId ? new Date(Date.now() + SESSION_TTL) : null,
+      outboxMessage
+    });
+    if (result.kind === 'duplicate') {
+      json(res, 409, { error: 'يوجد حساب بهذا البريد. سجّل الدخول بدلاً من إنشاء حساب جديد / An account already exists for this email. Please sign in.' }, security);
+      return true;
+    }
+    if (verificationRequired) {
+      json(res, 201, { verificationRequired: true, emailQueued: true }, {
+        ...security, 'Set-Cookie': cookie(REFERRAL_ATTRIBUTION_COOKIE, '', 0, req)
+      });
+      return true;
+    }
+    json(res, 201, { user: publicUser(result.user), verificationRequired: false, emailConfigured: false }, {
+      ...security, 'Set-Cookie': [
+        cookie('zezo_session', sessionId, SESSION_TTL / 1000, req),
+        cookie(REFERRAL_ATTRIBUTION_COOKIE, '', 0, req)
+      ]
+    });
+    return true;
+  }
+
+  if (req.method === 'POST' && path === '/api/admin/invite') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, ['admin', 'hr_manager'])) return true;
+    const body = await jsonBody(req);
+    const name = clean(body.name, 80);
+    const username = clean(body.username, 40).toLowerCase();
+    const email = normalizeEmail(body.email);
+    const role = clean(body.role, 40);
+    if (role === developmentManagerRole && auth.user.role !== 'admin') {
+      json(res, 403, { error: 'تعيين مسؤول المبرمجين متاح للمالك فقط / Only the Owner can grant the Development Manager role' }, security);
+      return true;
+    }
+    if (!roles.includes(role) || (role === 'admin' && auth.user.role !== 'admin') || name.length < 2 ||
+        !/^[a-z0-9._-]{3,40}$/.test(username) || !/^\S+@\S+\.\S+$/.test(email)) {
+      json(res, 400, { error: 'بيانات الموظف غير مكتملة أو الدور غير مسموح / Invalid employee details or role' }, security);
+      return true;
+    }
+
+    const createdAt = now();
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
+    const activation = token(32);
+    const user = {
+      id: id('usr'), name, username, email, phone: '', instagram: '', socialLinks: clean(body.socialLinks, 800),
+      telegramUsername: '', role, department: roleDepartment(role), permissionOverrides: {}, active: false,
+      createdAt, invitationId: '', inviteCreatedBy: auth.user.id, inviteCreatedByName: auth.user.name,
+      inviteStatus: 'pending', inviteExpiresAt: expiresAt, inviteApprovalStatus: 'approved',
+      activationHash: hash(activation), activationExpires: Date.parse(expiresAt)
+    };
+    if (referralEnabled(user)) {
+      user.referralCode = `Z${randomBytes(16).toString('hex').toUpperCase()}`;
+      user.rank = 'rookie';
+      user.activeCommissionRate = 15;
+      user.teamLeaderTermsPending = false;
+    }
+    const invitation = { id: `invitation_${user.id}`, expiresAt };
+    user.invitationId = invitation.id;
+
+    const authorize = inviter => {
+      if (role === 'admin' && (!inviter.mfaEnabledAt || !validTotp(inviter.mfaSecret, body.ownerMfaCode))) {
+        return { status: 403, error: 'إنشاء دعوة مالك يحتاج تحققاً إضافياً من تطبيق المصادقة / Creating an Owner invitation requires fresh authenticator verification' };
+      }
+      if (inviter.role === 'hr_manager' && !hasPermission(inviter, 'team.invite', { department: 'people' })) {
+        return { status: 403, error: 'لا تملك تفويض إنشاء دعوات / You are not delegated to create invitations' };
+      }
+      if (inviter.role === 'hr_manager' && !(['marketer', 'developer'].includes(role) || (role === 'order_manager' && effectivePermission(inviter, 'team.invite') === 'all'))) {
+        return { status: 403, error: 'مسؤول الموظفين لا يعيّن إلا الأدوار المفوضة له صراحة / HR cannot invite roles beyond its explicit delegation' };
+      }
+      return null;
+    };
+    const origin = siteBase(req);
+    const activationUrl = `${origin}/activate?token=${encodeURIComponent(activation)}`;
+    const mailId = id('mail');
+    const outboxMessage = {
+      id: mailId, recipient: email,
+      data: {
+        id: mailId, to: email, recipientType: 'direct', kind: 'team_invitation',
+        ...teamInvitationEmail({ activationUrl, teamUrl: `${origin}/team` }), expiresAt,
+        state: 'pending', attempts: 0, lastError: '', createdAt, updatedAt: createdAt
+      }
+    };
+    const result = await createPostgresEmployeeInvitation({
+      sessionHash: sessionKey(auth.sid), inviterId: auth.user.id, user, invitation,
+      auditId: id('evt'), outboxMessage,
+      authorize: inviter => {
+        const problem = authorize(inviter);
+        return problem || null;
+      }
+    });
+    if (result.kind === 'unauthenticated') {
+      json(res, 401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' }, security);
+      return true;
+    }
+    if (result.kind === 'forbidden') {
+      json(res, result.status || 403, { error: result.error || 'لا تملك الصلاحية لهذه الدعوة / Not permitted to create this invitation' }, security);
+      return true;
+    }
+    if (result.kind === 'duplicate') {
+      json(res, 409, { error: 'اسم المستخدم أو البريد مستخدم بالفعل. افحص قائمة الدعوات قبل إنشاء دعوة أخرى / Username or email is already in use. Check the invitation list before creating another.' }, security);
+      return true;
+    }
+    json(res, 201, { user: publicUser(result.user), activationToken: activation, approvalRequired: false, expiresInHours: 24, emailQueued: emailReady() }, security);
+    return true;
+  }
+  if (req.method === 'POST' && path === '/api/auth/login') {
+    const body = await jsonBody(req);
+    const username = clean(body.username, 150).toLowerCase();
+    const key = `${req.socket.remoteAddress || 'unknown'}:${username}`;
+    if (!await consumeRateLimitBucket('login', key, 8, 15 * 60_000)) {
+      json(res, 429, { error: 'محاولات كثيرة. جرّب بعد 15 دقيقة / Too many attempts; try again in 15 minutes' }, security); return true;
+    }
+    const user = await findLoginAccount(username);
+    if (!user || !passwordMatches(String(body.password || ''), user) || !accountTypes[body.accountType]?.includes(user.role)) {
+      json(res, 401, { error: 'اسم المستخدم أو كلمة المرور غير صحيحة لهذا النوع من الدخول / Incorrect username or password for this sign-in type' }, security); return true;
+    }
+    if (user.role !== 'client' && user.mfaEnabledAt && !validTotp(user.mfaSecret, body.mfaCode)) {
+      json(res, 401, { error: 'أدخل رمز تطبيق المصادقة الحالي / Enter the current authenticator code', mfaRequired: true }, security); return true;
+    }
+    const sid = token(), at = now(), expiresAt = new Date(Date.now() + SESSION_TTL);
+    await storeLoginSessionAndAudit({ sessionHash: sessionKey(sid), user, expiresAt, auditId: id('evt'), at });
+    loginAttempts.delete(key);
+    await deleteRateLimitBucket('login', key);
+    json(res, 200, { user: publicUser(user) }, { ...security, 'Set-Cookie': cookie('zezo_session', sid, SESSION_TTL / 1000, req) });
+    return true;
+  }
+
+  if (req.method === 'POST' && path === '/api/auth/password') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, allRoles)) return true;
+    const body = await jsonBody(req);
+    if (!validPassword(body.newPassword)) {
+      json(res, 400, { error: 'كلمة المرور الجديدة يجب أن تكون 12 خانة على الأقل / New password must be at least 12 characters' }, security);
+      return true;
+    }
+    const result = await changePostgresPassword({
+      sessionHash: sessionKey(auth.sid), userId: auth.user.id,
+      currentPassword: body.currentPassword, newPassword: body.newPassword,
+      verifyPassword: passwordMatches, createPasswordRecord: passwordRecord,
+      auditId: id('evt'), at: now()
+    });
+    if (result.kind === 'unauthenticated') json(res, 401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' }, security);
+    else if (result.kind === 'invalid_current_password') json(res, 401, { error: 'كلمة المرور الحالية غير صحيحة / Current password is incorrect' }, security);
+    else json(res, 200, { ok: true }, security);
+    return true;
+  }
+
+  if (['GET', 'POST'].includes(req.method) && path === '/api/auth/mfa/setup') {
+    const auth = await directPostgresSessionUser(req);
+    const developerSetup = req.method === 'POST';
+    if (!directRequireAuth(req, res, auth?.user, developerSetup ? ['developer'] : mandatoryMfaRoles)) return true;
+    let currentPassword;
+    if (developerSetup) {
+      if (!await consumeRateLimitBucket('developer-mfa-setup', auth.user.id, 8, 15 * 60_000)) {
+        json(res, 429, { error: 'جرّب مجدداً بعد 15 دقيقة / Try again in 15 minutes' }, security); return true;
+      }
+      const body = await jsonBody(req);
+      currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword.slice(0, 201) : '';
+    }
+    const result = await setupPostgresMfa({
+      sessionHash: sessionKey(auth.sid), userId: auth.user.id, proposedSecret: base32Encode(randomBytes(20)),
+      currentPassword, verifyPassword: developerSetup ? passwordMatches : undefined
+    });
+    if (result.kind === 'unauthenticated') json(res, 401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' }, security);
+    else if (result.kind === 'invalid_current_password') json(res, 401, { error: 'كلمة المرور الحالية غير صحيحة / Current password is incorrect' }, security);
+    else if (result.kind === 'already_enabled') json(res, 409, { error: 'التحقق بخطوتين مفعّل مسبقاً / Two-step verification is already enabled' }, security);
+    else {
+      const issuer = 'ZEZO Forge';
+      const label = encodeURIComponent(`${issuer}:${auth.user.username}`);
+      const otpAuthUri = `otpauth://totp/${label}?secret=${result.secret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
+      json(res, 200, { secret: result.secret, otpAuthUri }, security);
+    }
+    return true;
+  }
+
+  if (req.method === 'POST' && path === '/api/auth/mfa/enable') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, mfaEnrollmentRoles)) return true;
+    if (auth.user.role === 'developer' && !await consumeRateLimitBucket('developer-mfa-enable', auth.user.id, 8, 15 * 60_000)) {
+      json(res, 429, { error: 'جرّب مجدداً بعد 15 دقيقة / Try again in 15 minutes' }, security); return true;
+    }
+    const body = await jsonBody(req);
+    const result = await enablePostgresMfa({
+      sessionHash: sessionKey(auth.sid), userId: auth.user.id, code: body.code,
+      verifyTotp: validTotp, auditId: id('evt'), at: now()
+    });
+    if (result.kind === 'unauthenticated') json(res, 401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' }, security);
+    else if (result.kind === 'already_enabled') json(res, 409, { error: 'التحقق بخطوتين مفعّل مسبقاً / Two-step verification is already enabled' }, security);
+    else if (result.kind === 'invalid_code') json(res, 400, { error: 'رمز التحقق غير صحيح؛ افحص الساعة والرمز الحالي / Invalid code; check the device clock and current code' }, security);
+    else json(res, 200, { ok: true, user: publicUser(result.user) }, security);
+    return true;
+  }
+
+  if (req.method === 'POST' && path === '/api/auth/logout') {
+    const sid = cookieValue(req, 'zezo_session');
+    if (sid) await logoutPostgresSession({ sessionHash: sessionKey(sid), auditId: id('evt'), at: now() });
+    json(res, 200, { ok: true }, { ...security, 'Set-Cookie': cookie('zezo_session', '', 0, req) });
+    return true;
+  }
+
+  // The header polls this endpoint every 30 seconds. Keep it out of the legacy
+  // whole-store rewrite and the company-wide advisory lock. Deadline reminders
+  // are generated from only their source tables and saved idempotently.
+  if (req.method === 'GET' && path === '/api/notifications') {
+    const auth = await directPostgresSessionUser(req);
+    if (!auth) {
+      json(res, 401, { error: 'سجّل الدخول للمتابعة / Please sign in to continue' }, security);
+      return true;
+    }
+    if (auth.user.mustChangePassword || (sensitiveManagementRole(auth.user.role) && !auth.user.mfaEnabledAt)) {
+      directRequireAuth(req, res, auth.user, allRoles);
+      return true;
+    }
+    if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const type = clean(url.searchParams.get('type'), 32);
+    const status = clean(url.searchParams.get('status'), 12);
+    const from = clean(url.searchParams.get('from'), 10);
+    const to = clean(url.searchParams.get('to'), 10);
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 50));
+    const notificationTypes = ['project','inquiry','withdrawal','rank','sale','commission','quote','payment','team','deadline','finance','referral','update'];
+    if ((type && !notificationTypes.includes(type)) || (status && !['all','read','unread'].includes(status)) ||
+        (from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) || (to && !/^\d{4}-\d{2}-\d{2}$/.test(to))) {
+      json(res, 400, { error: 'فلاتر الإشعارات غير صالحة / Invalid notification filters' }, security);
+      return true;
+    }
+    const result = await withPostgresScopedTransaction(async client => {
+      let generated = [];
+      if (auth.user.role !== developmentManagerRole) {
+        const snapshot = await loadNotificationDeadlineSnapshot(client);
+        const beforeIds = new Set(snapshot.notifications.map(row => row.id));
+        const previousStore = store;
+        try {
+          store = snapshot;
+          emitDeadlineNotifications();
+          generated = store.notifications.filter(row => !beforeIds.has(row.id));
+        } finally {
+          store = previousStore;
+        }
+      }
+
+      if (generated.length) {
+        // Use a per-recipient deterministic primary key instead of locking the
+        // whole notifications table. Concurrent polls can now race safely: the
+        // unique id deduplicates the same event without serializing unrelated writes.
+        for (const row of generated) {
+          if (!row.eventKey) continue;
+          const notificationId = `ntf_${hash(`${row.userId}:${row.eventKey}`).slice(0, 40)}`;
+          await client.query(`
+            INSERT INTO system_notifications (id, "userId", type, "readAt", data, "createdAt")
+            SELECT $1, $2, $3, $4, $5::jsonb, $6
+            WHERE NOT EXISTS (
+              SELECT 1 FROM system_notifications existing
+              WHERE existing."userId" = $2 AND existing.data->>'eventKey' = $7
+            )
+            ON CONFLICT (id) DO NOTHING
+          `, [notificationId, row.userId, row.type || null, row.readAt ? new Date(row.readAt) : null, JSON.stringify(row), new Date(row.createdAt), row.eventKey]);
+        }
+      }
+
+      const values = [auth.user.id];
+      const conditions = ['"userId" = $1', developmentNotificationScope(auth.user, values)];
+      const addFilter = (condition, value) => { values.push(value); conditions.push(condition.replace('?', `$${values.length}`)); };
+      if (type) addFilter('type = ?', type);
+      if (status === 'read') conditions.push('"readAt" IS NOT NULL');
+      if (status === 'unread') conditions.push('"readAt" IS NULL');
+      if (from) addFilter('"createdAt" >= ?', new Date(`${from}T00:00:00.000Z`));
+      if (to) addFilter('"createdAt" <= ?', new Date(`${to}T23:59:59.999Z`));
+      const unreadCount = await countUnreadPostgresNotifications(client, auth.user);
+      values.push(limit);
+      const rows = await client.query(`
+        SELECT id, type, "readAt", data, "createdAt"
+        FROM system_notifications
+        WHERE ${conditions.join(' AND ')}
+        ORDER BY "createdAt" DESC
+        LIMIT $${values.length}
+      `, values);
+      const notifications = rows.rows.map(row => safeNotification({
+        ...(row.data && typeof row.data === 'object' ? row.data : {}),
+        id: row.id, type: row.type || row.data?.type || '',
+        readAt: row.readAt ? new Date(row.readAt).toISOString() : '',
+        createdAt: new Date(row.createdAt).toISOString()
+      }));
+      return { notifications, unreadCount };
+    });
+    json(res, 200, { ...result, authenticated: true, emailReady: emailReady() && adminEmailReady() }, security);
+    return true;
+  }
+
+  const notificationRead = req.method === 'PATCH' && /^\/api\/notifications\/[^/]+$/.test(path);
+  if (notificationRead) {
+    const auth = await directPostgresSessionUser(req);
+    if (!auth) { json(res, 401, { error: 'سجّل الدخول للمتابعة / Please sign in to continue' }, security); return true; }
+    if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
+    const notificationId = clean(path.split('/').at(-1), 100);
+    const result = await withPostgresScopedTransaction(async client => {
+      const params = [notificationId, auth.user.id];
+      const scope = developmentNotificationScope(auth.user, params);
+      const selected = await client.query(`SELECT id, "userId", type, "readAt", data, "createdAt" FROM system_notifications WHERE id = $1 AND "userId" = $2 AND ${scope} FOR UPDATE OF system_notifications`, params);
+      if (!selected.rowCount) return null;
+      let row = selected.rows[0];
+      if (!row.readAt) {
+        const at = new Date();
+        const updated = await client.query(`
+          UPDATE system_notifications
+          SET "readAt" = $3, data = jsonb_set(data, '{readAt}', to_jsonb($3::text), TRUE)
+          WHERE id = $1 AND "userId" = $2
+          RETURNING id, "userId", type, "readAt", data, "createdAt"
+        `, [notificationId, auth.user.id, at]);
+        row = updated.rows[0];
+      }
+      return {
+        notification: safeNotification({ ...(row.data || {}), id: row.id, type: row.type || row.data?.type || '', readAt: row.readAt ? new Date(row.readAt).toISOString() : '', createdAt: new Date(row.createdAt).toISOString() }),
+        unreadCount: await countUnreadPostgresNotifications(client, auth.user)
+      };
+    });
+    if (!result) { json(res, 404, { error: 'الإشعار غير موجود / Notification not found' }, security); return true; }
+    json(res, 200, result, security);
+    return true;
+  }
+
+  if (req.method === 'POST' && path === '/api/notifications/read-all') {
+    const auth = await directPostgresSessionUser(req);
+    if (!auth) { json(res, 401, { error: 'سجّل الدخول للمتابعة / Please sign in to continue' }, security); return true; }
+    if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
+    const params = [auth.user.id];
+    const scope = developmentNotificationScope(auth.user, params);
+    await withPostgresScopedTransaction(client => client.query(`
+      UPDATE system_notifications
+      SET "readAt" = NOW(), data = jsonb_set(data, '{readAt}', to_jsonb(NOW()::text), TRUE)
+      WHERE "userId" = $1 AND "readAt" IS NULL AND ${scope}
+    `, params));
+    json(res, 200, { ok: true, unreadCount: 0 }, security);
+    return true;
+  }
+
+  if (req.method === 'GET' && path === '/api/admin/finance') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, ['admin'])) return true;
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const report = await withPostgresReadStoreSnapshot(() => financeTreasuryFor(Object.fromEntries(url.searchParams)));
+    json(res, 200, report, security);
+    return true;
+  }
+
+  if (req.method === 'GET' && path === '/api/referral-intelligence') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, ['admin','hr_manager','marketing_manager','marketer','developer'])) return true;
+    const user = auth.user;
+    const canViewTeam = user.role === 'admin' || (user.role === 'hr_manager' && hasPermission(user, 'employees.read', { department: 'people' })) || (user.role === 'marketing_manager' && hasPermission(user, 'employees.read', { department: 'marketing' }));
+    if (['hr_manager','marketing_manager'].includes(user.role) && !canViewTeam) {
+      json(res, 403, { error: 'إحصاءات الفريق تحتاج صلاحية مشاهدة الموظفين / Team analytics require employee-view permission' }, security);
+      return true;
+    }
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const requestedUser = clean(url.searchParams.get('employee'), 80);
+    if (requestedUser && !canViewTeam && requestedUser !== user.id) {
+      json(res, 403, { error: 'لا يمكنك عرض موظف آخر / You cannot view another employee' }, security);
+      return true;
+    }
+    const from = clean(url.searchParams.get('from'), 10);
+    const to = clean(url.searchParams.get('to'), 10);
+    const status = clean(url.searchParams.get('status'), 20);
+    if ((from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) || (to && !/^\d{4}-\d{2}-\d{2}$/.test(to)) ||
+        (status && !['new','review','proposal','active','waiting_payment','completed','cancelled'].includes(status))) {
+      json(res, 400, { error: 'الفلاتر غير صالحة / Invalid filters' }, security);
+      return true;
+    }
+    const report = await withPostgresReadStoreSnapshot(() => {
+      const intel = referralIntelligenceForViewer(user);
+      const allowedIds = new Set(intel.employees.map(row => row.id));
+      const employee = requestedUser && allowedIds.has(requestedUser) ? requestedUser : '';
+      const start = from ? Date.parse(`${from}T00:00:00.000Z`) : -Infinity;
+      const end = to ? Date.parse(`${to}T23:59:59.999Z`) : Infinity;
+      const matchingOrders = intel.orders.filter(order => (!employee || order.userId === employee) && (!status || order.status === status));
+      const matchingOrderById = new Map(matchingOrders.map(order => [order.id, order]));
+      const orders = matchingOrders.filter(order => Date.parse(order.createdAt) >= start && Date.parse(order.createdAt) <= end);
+      const events = store.referralEvents.filter(event => allowedIds.has(event.userId) && (!employee || event.userId === employee) &&
+        Date.parse(event.createdAt) >= start && Date.parse(event.createdAt) <= end && (!status || (event.leadId && matchingOrderById.has(event.leadId))))
+        .map(event => ({ id: event.id, userId: event.userId, employeeName: intel.employees.find(row => row.id === event.userId)?.name || '', code: event.code,
+          linkId: event.linkId, month: event.month, type: event.type, createdAt: event.createdAt, resourceId: event.resourceId, leadId: event.leadId,
+          followupId: event.followupId, reversed: Boolean(event.reversedAt), status: event.leadId ? matchingOrderById.get(event.leadId)?.status || '' : '',
+          visitorHash: event.type === 'visit' ? event.visitorHash : null }));
+      events.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+      const active = events.filter(event => !event.reversed);
+      const counts = type => active.filter(event => event.type === type).length;
+      const visitors = new Set(active.filter(event => event.type === 'visit').map(event => event.visitorHash).filter(Boolean)).size;
+      const linkStats = intel.links.filter(link => !employee || link.userId === employee).map(link => {
+        const subset = active.filter(event => event.linkId === link.id);
+        const count = type => subset.filter(event => event.type === type).length;
+        return { ...link, visits: new Set(subset.filter(event => event.type === 'visit').map(event => event.visitorHash).filter(Boolean)).size,
+          serviceViews: count('service_view'), templateViews: count('template_view'), whatsappClicks: count('whatsapp_click'), inquiries: count('inquiry_confirmed'),
+          requests: new Set(orders.filter(order => order.linkId === link.id).map(order => order.id)).size,
+          sales: new Set(subset.filter(event => event.type === 'qualified_sale' && event.leadId).map(event => event.leadId)).size };
+      });
+      for (const event of events) delete event.visitorHash;
+      const summary = { visits: visitors, serviceViews: counts('service_view'), templateViews: counts('template_view'), whatsappClicks: counts('whatsapp_click'),
+        inquiries: counts('inquiry_confirmed'), requests: new Set(orders.map(order => order.id)).size, quoteAcceptances: counts('quote_accepted'),
+        payments: counts('payment_received'), sales: new Set(active.filter(event => event.type === 'qualified_sale' && event.leadId).map(event => event.leadId)).size,
+        orders: orders.length };
+      const rate = (numerator, denominator) => denominator ? Math.round(numerator / denominator * 1000) / 10 : 0;
+      summary.conversionRates = { visitToRequest: rate(summary.requests, summary.visits), requestToSale: rate(summary.sales, summary.requests), whatsappToInquiry: rate(summary.inquiries, summary.whatsappClicks) };
+      return { retentionDays: 90, filters: { from, to, employee, status }, summary, employees: intel.employees.filter(row => !employee || row.id === employee),
+        links: linkStats, orders: orders.slice(0, 500), events: events.filter(event => event.type !== 'visit').slice(0, 500) };
+    });
+    json(res, 200, report, security);
+    return true;
+  }
+
+  if (req.method === 'GET' && path === '/api/crm/export') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, ['admin','marketing_manager','hr_manager','marketer'])) return true;
+    if (auth.user.role === 'marketing_manager' && !permissionEnabled(auth.user, 'orders.manage')) {
+      json(res, 403, { error: 'لا تملك صلاحية تصدير سجلات العملاء / You cannot export CRM records' }, security);
+      return true;
+    }
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const input = {
+      from: clean(url.searchParams.get('from'), 10), to: clean(url.searchParams.get('to'), 10),
+      status: clean(url.searchParams.get('status'), 32), employee: clean(url.searchParams.get('employee'), 80),
+      service: clean(url.searchParams.get('service'), 60),
+      search: ['admin','marketing_manager'].includes(auth.user.role) ? clean(url.searchParams.get('q'), 120).toLowerCase() : ''
+    };
+    if ((input.from && !/^\d{4}-\d{2}-\d{2}$/.test(input.from)) || (input.to && !/^\d{4}-\d{2}-\d{2}$/.test(input.to)) ||
+        (input.status && !crmStatuses.includes(input.status)) || (input.service && !Object.hasOwn(serviceCategories, input.service))) {
+      json(res, 400, { error: 'فلاتر CRM غير صالحة / Invalid CRM filters' }, security);
+      return true;
+    }
+    const csv = await withPostgresReadStoreSnapshot(() => {
+      const records = store.crmLeads || [];
+      const scope = auth.user.role === 'marketer' ? records.filter(row => row.referralUserId === auth.user.id)
+        : auth.user.role === 'marketing_manager' ? records.filter(row => crmAccess(auth.user, row)) : records;
+      const fromTime = input.from ? Date.parse(`${input.from}T00:00:00.000Z`) : -Infinity;
+      const toTime = input.to ? Date.parse(`${input.to}T23:59:59.999Z`) : Infinity;
+      const filtered = scope.filter(row => Date.parse(row.createdAt) >= fromTime && Date.parse(row.createdAt) <= toTime &&
+        (!input.status || row.status === input.status) && (!input.employee || ['admin','marketing_manager','hr_manager'].includes(auth.user.role) && (row.referralUserId === input.employee || row.assignedUserId === input.employee)) &&
+        (!input.service || row.service === input.service) && (!input.search || [row.name,row.phone,row.email,row.service,row.details,row.referralCode].some(value => String(value || '').toLowerCase().includes(input.search))));
+      const rows = ['hr_manager','marketer'].includes(auth.user.role)
+        ? [['metric','value'], ...Object.entries(crmAggregate(filtered, { from: input.from, to: input.to, service: input.service }))]
+        : [['id','createdAt','name','phone','email','service','status','source','referrer','referralCode','assignedTo','followUpAt','orderIds'],
+          ...filtered.map(row => [row.id,row.createdAt,row.name,row.phone,row.email,row.service,row.status,row.source,
+            store.users.find(user => user.id === row.referralUserId)?.name || '',row.referralCode,
+            store.users.find(user => user.id === row.assignedUserId)?.name || '',row.followUpAt,(row.orderIds || []).join('|')])];
+      return rows.map(row => row.map(value => {
+        let text = String(value ?? '');
+        if (/^[=+@-]/.test(text)) text = `'${text}`;
+        return `"${text.replace(/"/g, '""')}"`;
+      }).join(',')).join('\r\n');
+    });
+    res.writeHead(200, { ...security, 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="zezo-crm.csv"', 'Cache-Control': 'no-store' });
+    res.end(`\uFEFF${csv}`);
+    return true;
+  }
+
+  const directConversationMutation = /^\/api\/conversations\/([^/]+)\/(quote|accept-quote)$/.exec(path);
+  if (req.method === 'POST' && directConversationMutation) {
+    const [, conversationId, action] = directConversationMutation;
+    const auth = await directPostgresSessionUser(req);
+    if (action === 'quote') {
+      if (!directRequireAuth(req, res, auth?.user, ['admin', 'order_manager', 'hr_manager', 'marketing_manager'])) return true;
+      const body = await jsonBody(req);
+      const amount = Number(body.amount);
+      const scope = clean(body.scope, 1600);
+      const included = clean(body.included, 1200);
+      const exclusions = clean(body.exclusions, 1200);
+      if (!Number.isFinite(amount) || amount < 0 || amount > 10000000 || scope.length < 8) {
+        json(res, 400, { error: 'أدخل مبلغاً ووصف نطاق واضحين للعرض / Enter a valid amount and clear quote scope' }, security); return true;
+      }
+      const quote = { id: id('quote'), amount: money(amount), currency: 'ILS', scope, included, exclusions, createdBy: auth.user.id, acceptedAt: null };
+      const message = `${auth.user.name} · عرض سعر أولي: ${quote.amount} ₪\n${scope}${included ? `\n${included}` : ''}${exclusions ? `\nغير مشمول: ${exclusions}` : ''}\nالسعر لا يعتمد إلا بعد قبولك.`;
+      const result = await createPostgresQuote({
+        conversationId, actor: auth.user, quote, message, auditId: id('evt'), messageId: id('msg'), notificationId: id('ntf'),
+        at: now(), permissionScope: effectivePermission(auth.user, 'conversations.read'),
+        emailSiteBase: emailReady() ? siteBase(req) : '',
+        authorize: conversation => conversationAccess(auth.user, conversation, 'conversations.read') &&
+          requirePermission(auth, res, 'quotes.draft', { assigneeId: conversation.assignedUserId || '', ownerId: conversation.clientId || '', department: conversation.department || 'orders' })
+      });
+      if (result.kind === 'missing') json(res, 404, { error: 'المحادثة غير موجودة / Conversation not found' }, security);
+      else if (result.kind === 'forbidden') { if (!res.headersSent) json(res, 403, { error: 'لا تملك صلاحية إعداد عرض السعر لهذه المحادثة / Not permitted to quote this conversation' }, security); }
+      else json(res, 201, { conversation: result.conversation }, security);
+      return true;
+    }
+
+    const rawGuest = guestSessionValue(req);
+    const guestHash = rawGuest ? hash(rawGuest) : '';
+    const actor = auth?.user || { id: '', role: 'guest' };
+    if (auth && !directRequireAuth(req, res, auth.user, allRoles)) return true;
+    if (!['client', 'guest'].includes(actor.role)) {
+      json(res, 403, { error: 'قبول عرض السعر متاح للعميل فقط / Only the customer can accept a quote' }, security); return true;
+    }
+    const result = await acceptPostgresQuote({
+      conversationId, actor, guestHash, quoteMessage: 'تم قبول عرض السعر.', auditId: id('evt'), messageId: id('msg'), at: now(),
+      permissionScope: effectivePermission(actor, 'conversations.read'),
+      adminEmailSiteBase: adminEmailReady() && emailReadyForRecipient(process.env.ZEZO_NOTIFICATION_EMAIL) ? siteBase(req) : '',
+      authorize: conversation => {
+        if (actor.role === 'client') return conversation.clientId === actor.id || Boolean(guestHash && conversation.guestSessionHash === guestHash);
+        if (actor.role === 'guest') return Boolean(guestHash && conversation.guestSessionHash === guestHash);
+        return conversationAccess(actor, conversation, 'conversations.read');
+      }
+    });
+    if (result.kind === 'missing' || result.kind === 'forbidden') json(res, 404, { error: 'المحادثة غير موجودة / Conversation not found' }, security);
+    else if (result.kind === 'no_pending_quote') json(res, 409, { error: 'لا يوجد عرض سعر ينتظر القبول / No quote is awaiting acceptance' }, security);
+    else json(res, 200, { ok: true, conversation: result.conversation }, security);
+    return true;
+  }
+
+  if (req.method === 'GET' && path === '/api/dashboard') {
+    const auth = await directPostgresSessionUser(req);
+    if (!auth) {
+      json(res, 401, { error: 'سجّل الدخول للمتابعة / Please sign in to continue' }, security);
+      return true;
+    }
+    if (auth.user.role === developmentManagerRole) {
+      if (!directRequireAuth(req, res, auth.user, [developmentManagerRole])) return true;
+      json(res, 200, { role: developmentManagerRole, user: developmentManagerIdentity(auth.user) }, security);
+      return true;
+    }
+    if (auth.user.role === 'client') {
+      if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
+      const guest = guestSessionValue(req);
+      if (guest) await claimGuestConversations(auth.user.id, hash(guest), now());
+      const [clientData, conversations] = await Promise.all([
+        loadClientDashboardData(auth.user.id),
+        loadConversationViews(auth.user)
+      ]);
+      const orders = clientData.leads.map(lead => safeClientOrder(lead, clientData.payments));
+      json(res, 200, {
+        role: 'client', user: publicUser(auth.user), profile: clientProfile(auth.user), orders, conversations,
+        mailConfigured: emailReady()
+      }, security);
+      return true;
+    }
+    if (['marketer', 'developer'].includes(auth?.user.role)) {
+      if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
+      const user = auth.user;
+      const [data, conversations] = await Promise.all([
+        loadEmployeeDashboardData(user.id),
+        user.role === 'developer' && permissionEnabled(user, 'conversations.read')
+          ? loadConversationViews(user, { permissionScope: effectivePermission(user, 'conversations.read'), department: user.department || roleDepartment(user.role), includeMessages: false })
+          : []
+      ]);
+      // dashboardFor is a synchronous, read-only serializer for these two roles.
+      // Swap in the scoped snapshot only during that synchronous call so another
+      // request can never observe or mutate this temporary view.
+      const previousStore = store;
+      try {
+        store = { ...defaultStore(), ...data, users: [user] };
+        const dashboard = dashboardFor(user);
+        if (user.role === 'developer') dashboard.conversations = conversations;
+        dashboard.referredClients = data.referredClients || [];
+        dashboard.referralMetrics = { ...(dashboard.referralMetrics || {}), signups: dashboard.referredClients.length };
+        json(res, 200, dashboard, security);
+      } finally {
+        store = previousStore;
+      }
+      return true;
+    }
+    if (auth?.user.role === 'order_manager') {
+      if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
+      const user = auth.user;
+      const [orders, conversations, staffUsers] = await Promise.all([
+        loadOrderManagerOrders(user.id, effectivePermission(user, 'orders.manage'), user.department || roleDepartment(user.role)),
+        loadConversationViews(user, { permissionScope: effectivePermission(user, 'conversations.read'), department: user.department || roleDepartment(user.role) }),
+        hasPermission(user, 'conversations.assign', { department: 'orders' }) ? loadConversationAssignees() : Promise.resolve([])
+      ]);
+      const output = {
+        role: user.role, user: publicUser(user),
+        currentPermissions: Object.fromEntries(Object.keys(permissionDefinitions).map(key => [key, effectivePermission(user, key)])),
+        orders: permissionEnabled(user, 'orders.manage') ? orders.filter(lead => hasPermission(user, 'orders.manage', { assigneeId: lead.orderManagerUserId || '', ownerId: lead.clientId || '', department: 'orders' })).map(lead => safeOrderLead(lead, true)) : [],
+        conversations: conversations.filter(conversation => conversationAccess(user, conversation, 'conversations.read')),
+        conversationAssignees: staffUsers.filter(row => row.active && !row.accountDisabledAt && row.role !== 'admin' && hasPermission(row, 'conversations.read', { assigneeId: row.id, department: 'orders' })).map(row => ({ id: row.id, name: row.name, role: row.role, active: true }))
+      };
+      json(res, 200, output, security);
+      return true;
+    }
+    if (['admin', 'hr_manager', 'marketing_manager'].includes(auth?.user.role)) {
+      if (!directRequireAuth(req, res, auth.user, allRoles)) return true;
+      // Until each management panel has a dedicated repository, take a consistent
+      // read-only snapshot. This skips both the global advisory lock and the legacy
+      // full-store rewrite; dashboardFor remains the role-specific serializer.
+      const snapshot = await withPostgresReadTransaction(client => loadNormalizedStore(client, defaultStore));
+      const previousStore = store;
+      try {
+        store = { ...defaultStore(), ...snapshot };
+        json(res, 200, dashboardFor(auth.user), security);
+      } finally {
+        store = previousStore;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  if (req.method === 'GET' && path === '/api/conversations') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, allRoles)) return true;
+    const guest = auth.user.role === 'client' ? guestSessionValue(req) : '';
+    if (guest) await claimGuestConversations(auth.user.id, hash(guest), now());
+    const scope = effectivePermission(auth.user, 'conversations.read');
+    const summary = new URL(req.url, 'http://localhost').searchParams.get('summary') === '1';
+    const conversations = await loadConversationViews(auth.user, { permissionScope: scope, department: auth.user.department || roleDepartment(auth.user.role), includeMessages: !summary });
+    json(res, 200, { conversations }, security);
+    return true;
+  }
+
+  const singleConversation = req.method === 'GET' && /^\/api\/conversations\/[^/]+$/.test(path);
+  if (singleConversation) {
+    const auth = await directPostgresSessionUser(req);
+    const guest = guestSessionValue(req);
+    let user = auth?.user;
+    if (user && !directRequireAuth(req, res, user, allRoles)) return true;
+    if (user?.role === 'client' && guest) await claimGuestConversations(user.id, hash(guest), now());
+    if (!user && guest) user = { id: '', role: 'guest' };
+    if (!user) { json(res, 404, { error: 'المحادثة غير موجودة / Conversation not found' }, security); return true; }
+    const conversationId = path.split('/').at(-1);
+    const rows = await loadConversationViews(user, {
+      conversationId, guestHash: guest ? hash(guest) : '',
+      permissionScope: user.role === 'admin' ? 'all' : effectivePermission(user, 'conversations.read'),
+      department: user.department || roleDepartment(user.role)
+    });
+    if (!rows.length) { json(res, 404, { error: 'المحادثة غير موجودة / Conversation not found' }, security); return true; }
+    json(res, 200, { conversation: rows[0] }, security);
+    return true;
+  }
+
+  if (req.method === 'GET' && path === '/api/crm') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, ['admin', 'marketing_manager', 'hr_manager', 'marketer', 'developer'])) return true;
+    const user = auth.user;
+    const from = clean(new URL(req.url, `http://localhost:${PORT}`).searchParams.get('from'), 10);
+    const to = clean(new URL(req.url, `http://localhost:${PORT}`).searchParams.get('to'), 10);
+    const status = clean(new URL(req.url, `http://localhost:${PORT}`).searchParams.get('status'), 32);
+    const employee = clean(new URL(req.url, `http://localhost:${PORT}`).searchParams.get('employee'), 80);
+    const service = clean(new URL(req.url, `http://localhost:${PORT}`).searchParams.get('service'), 60);
+    const search = clean(new URL(req.url, `http://localhost:${PORT}`).searchParams.get('q'), 120).toLowerCase();
+    if (user.role === 'admin' || user.role === 'marketing_manager') {
+      const permissionScope = effectivePermission(user, 'orders.manage');
+      if (user.role !== 'admin' && !permissionDefinitions['orders.manage']?.includes(permissionScope)) {
+        json(res, 403, { error: 'لا تملك صلاحية إدارة سجلات العملاء / You cannot manage CRM records' }, security); return true;
+      }
+      if ((from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) || (to && !/^\d{4}-\d{2}-\d{2}$/.test(to)) || (status && !crmStatuses.includes(status)) || (service && !Object.hasOwn(serviceCategories, service))) {
+        json(res, 400, { error: 'فلاتر CRM غير صالحة / Invalid CRM filters' }, security); return true;
+      }
+    }
+    const filters = (user.role === 'admin' || user.role === 'marketing_manager') ? { from, to, status, employee, service, search } : {};
+    const scope = effectivePermission(user, 'orders.manage');
+    const records = await loadCrmRecordsForViewer({ user, scope, filters });
+    const referralUsers = [...new Set(records.map(row => row.referralUserId).filter(Boolean))];
+    const events = await loadReferralEventsForUsers(referralUsers, (user.role === 'admin' || user.role === 'marketing_manager') ? { from, to } : {});
+    if (user.role === 'hr_manager' || user.role === 'marketer' || user.role === 'developer') {
+      json(res, 200, { scope: user.role === 'hr_manager' ? 'aggregate' : 'own_referrals', summary: directCrmAggregate(records, events) }, security);
+      return true;
+    }
+    const related = await loadCrmRelatedRows(records);
+    const items = records.map(record => ({
+      ...record,
+      orders: (record.orderIds || []).map(id => related.orders.get(id)).filter(Boolean).map(order => ({
+        id: order.id, status: order.status, service: order.service, category: order.category, createdAt: order.createdAt,
+        contractAmount: order.contractAmount, paidTotal: order.paidTotal, quoteAccepted: Boolean(order.quoteAcceptedAt),
+        referralUserId: order.referralUserId || null, referralName: related.users.get(order.referralUserId)?.name || '',
+        referralCode: order.referralCode || '', isDuplicate: Boolean(order.isDuplicate)
+      })),
+      assignedName: related.users.get(record.assignedUserId)?.name || '',
+      referrerName: related.users.get(record.referralUserId)?.name || '',
+      whatsappUrl: !STAGING_MODE && isE164Phone(record.phone) ? `https://wa.me/${record.phone.replace(/\D/g, '')}` : ''
+    }));
+    json(res, 200, { scope: 'team', summary: directCrmAggregate(records, events, { from, to, service }), filtered: records.length, items: items.slice(0, 500), filters: { from, to, status, employee, service, q: search } }, security);
+    return true;
+  }
+  return false;
+}
+async function bodyBuffer(req, max = MAX_BODY) {
   const declared = Number(req.headers['content-length'] || 0);
-  if (declared > MAX_BODY) throw Object.assign(new Error('حجم الطلب أكبر من المسموح (6MB)'), { status: 413 });
+  const sizeError = () => Object.assign(new Error(max === MAX_BODY ? 'حجم الطلب أكبر من المسموح (6MB)' : 'حجم الطلب أكبر من المسموح / Request is too large'), { status: 413 });
+  if (declared > max) throw sizeError();
   const chunks = []; let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > MAX_BODY) throw Object.assign(new Error('حجم الطلب أكبر من المسموح (6MB)'), { status: 413 });
+    if (size > max) throw sizeError();
     chunks.push(chunk);
   }
   return Buffer.concat(chunks);
 }
-async function jsonBody(req) {
-  const buf = await bodyBuffer(req);
+async function jsonBody(req, max) {
+  const buf = await bodyBuffer(req, max);
   if (!buf.length) return {};
   try { return JSON.parse(buf.toString('utf8')); }
   catch { throw Object.assign(new Error('صيغة البيانات غير صالحة / Invalid request data'), { status: 400 }); }
@@ -841,14 +1962,17 @@ function validTotp(secret,code){
   if(!secret||!/^\d{6}$/.test(String(code||'')))return false;const current=Math.floor(Date.now()/30_000),candidate=Buffer.from(String(code));
   for(let drift=-1;drift<=1;drift++){const expected=Buffer.from(totpCode(secret,current+drift));if(candidate.length===expected.length&&timingSafeEqual(candidate,expected))return true;}return false;
 }
-const sensitiveManagementRole=role=>['admin','marketing_manager','hr_manager','order_manager'].includes(role);
+const mandatoryMfaRoles = ['admin', 'marketing_manager', 'hr_manager', 'order_manager', developmentManagerRole];
+const mfaEnrollmentRoles = [...mandatoryMfaRoles, 'developer'];
+const sensitiveManagementRole = role => mandatoryMfaRoles.includes(role);
 function effectivePermission(user,key){
   if(user?.role==='admin')return 'all';
+  if(user?.role===developmentManagerRole)return 'none';
   const value=user?.permissionOverrides&&Object.hasOwn(user.permissionOverrides,key)?user.permissionOverrides[key]:defaultRolePermissions[user?.role]?.[key];
   if(value===true)return 'all';if(value===false||value==null)return 'none';return String(value);
 }
 function permissionEnabled(user,key){return user?.role==='admin'||Boolean(permissionDefinitions[key]?.includes(effectivePermission(user,key)));}
-function roleDepartment(role){return role==='order_manager'?'orders':role==='hr_manager'?'people':role==='marketing_manager'||role==='marketer'?'marketing':role==='developer'?'development':'';}
+function roleDepartment(role){return role==='order_manager'?'orders':role==='hr_manager'?'people':role==='marketing_manager'||role==='marketer'?'marketing':role==='developer'||role===developmentManagerRole?'development':'';}
 function hasPermission(user,key,resource={}){
   if(user?.role==='admin')return true;
   const scope=effectivePermission(user,key);if(!permissionDefinitions[key]?.includes(scope))return false;
@@ -868,6 +1992,9 @@ function conversationAccess(user,conversation,permission='conversations.read'){
   if(user.role==='client')return conversation.clientId===user.id;
   return hasPermission(user,permission,{assigneeId:conversation.assignedUserId||'',ownerId:conversation.clientId||'',department:conversation.department||'orders'});
 }
+function canReceiveConversationNotification(user,resource){
+  return user?.role==='admin'||hasPermission(user,'conversations.read',resource);
+}
 function conversationAssigneesFor(user){
   if(!user||!hasPermission(user,'conversations.assign',{department:'orders'}))return [];
   return store.users.filter(row=>row.active&&!row.accountDisabledAt&&row.role!=='admin'&&hasPermission(row,'conversations.read',{assigneeId:row.id,department:'orders'})).map(row=>({id:row.id,name:row.name,role:row.role,active:true}));
@@ -884,7 +2011,7 @@ function customerCanSeeConversation(req,auth,conversation){
   const guest=guestSessionValue(req);return Boolean(guest&&conversation.guestSessionHash===hash(guest));
 }
 function appendConversationMessage(conversation,{senderType,senderId='',text='',attachment=null}){
-  const message={id:id('msg'),senderType,senderId:senderId||null,text:clean(text,2000),createdAt:now(),attachments:attachment?[attachment]:[]};
+  const message={id:id('msg'),senderType,senderId:senderId||null,text:cleanConversationMessage(text),createdAt:now(),attachments:attachment?[attachment]:[]};
   conversation.messages??=[];conversation.messages.push(message);conversation.updatedAt=message.createdAt;return message;
 }
 function notifyConversation(conversation,kind,actor=null){
@@ -895,30 +2022,79 @@ function notifyConversation(conversation,kind,actor=null){
 }
 function validPassword(value) { return typeof value === 'string' && value.length >= 12 && value.length <= 200; }
 function validTemporaryPassword(value) { return typeof value === 'string' && value.length >= 9 && value.length <= 200; }
-function rateAllowed(key) {
+const rateLimitNames = new Map([
+  [stagingLoginAttempts, 'staging-login'], [loginAttempts, 'login'], [leadAttempts, 'public-enquiry'],
+  [quoteAttempts, 'quote'], [clientRegistrationAttempts, 'client-registration'], [passwordResetAttempts, 'password-reset'],
+  [conversationAttempts, 'conversation'], [developerMfaSetupAttempts, 'developer-mfa-setup'], [developerMfaEnableAttempts, 'developer-mfa-enable']
+]);
+async function postgresRateAllowed(bucket, key, max, windowMs) {
+  const client = currentPostgresClient();
+  if (!client) return null;
+  const digest = hash(`zezo-rate:${bucket}:${key}`);
+  const result = await client.query(
+    'INSERT INTO rate_limit_buckets (key, count, "windowStartedAt", "expiresAt", "updatedAt") VALUES ($1, 1, NOW(), NOW() + ($2 * INTERVAL \'1 millisecond\'), NOW()) ON CONFLICT (key) DO UPDATE SET count = CASE WHEN rate_limit_buckets."expiresAt" <= NOW() THEN 1 ELSE rate_limit_buckets.count + 1 END, "windowStartedAt" = CASE WHEN rate_limit_buckets."expiresAt" <= NOW() THEN NOW() ELSE rate_limit_buckets."windowStartedAt" END, "expiresAt" = CASE WHEN rate_limit_buckets."expiresAt" <= NOW() THEN NOW() + ($2 * INTERVAL \'1 millisecond\') ELSE rate_limit_buckets."expiresAt" END, "updatedAt" = NOW() RETURNING count',
+    [digest, windowMs]
+  );
+  return Number(result.rows[0]?.count || 0) <= max;
+}
+async function clearRateLimit(bucket, key) {
+  const client = currentPostgresClient();
+  if (client) await client.query('DELETE FROM rate_limit_buckets WHERE key = $1', [hash(`zezo-rate:${bucket}:${key}`)]);
+}
+async function rateAllowed(key) {
+  const shared = await postgresRateAllowed('login', key, 8, 15 * 60_000);
+  if (shared !== null) return shared;
   const item = loginAttempts.get(key);
   if (!item || item.until < Date.now()) { loginAttempts.set(key, { count: 1, until: Date.now() + 15 * 60_000 }); return true; }
   item.count += 1; return item.count <= 8;
 }
-function rateAllowedFor(map,key,max,windowMs) {
+async function rateAllowedFor(map,key,max,windowMs) {
+  const shared = await postgresRateAllowed(rateLimitNames.get(map) || 'shared', key, max, windowMs);
+  if (shared !== null) return shared;
   const item=map.get(key);
   if(!item||item.until<Date.now()){map.set(key,{count:1,until:Date.now()+windowMs});return true;}
   item.count+=1;return item.count<=max;
 }
-function publicRateAllowed(key) {
+async function publicRateAllowed(key) {
+  const shared = await postgresRateAllowed('public-enquiry', key, 8, 60 * 60_000);
+  if (shared !== null) return shared;
   const item = leadAttempts.get(key);
   if (!item || item.until < Date.now()) { leadAttempts.set(key, { count: 1, until: Date.now() + 60 * 60_000 }); return true; }
   item.count += 1; return item.count <= 8;
 }
-function saveUpload(file) {
+async function saveUpload(file, ownerId = null) {
   if (!file) return Promise.resolve(null);
   const ext = extname(file.filename).toLowerCase();
   const allowed = { '.pdf': ['application/pdf', '%PDF-'], '.png': ['image/png', '\x89PNG'], '.jpg': ['image/jpeg', '\xff\xd8\xff'], '.jpeg': ['image/jpeg', '\xff\xd8\xff'], '.webp': ['image/webp', 'RIFF'] };
   const rule = allowed[ext];
   const prefix = rule ? file.content.subarray(0, Buffer.byteLength(rule[1])).toString('binary') : '';
   if (!rule || file.content.length > 4 * 1024 * 1024 || prefix !== rule[1]) return Promise.reject(Object.assign(new Error('الملف غير مدعوم أو يتجاوز 4MB / Unsupported file or over 4MB'), { status: 400 }));
+  if (postgresConfigured()) {
+    const attachmentId = `att_${randomBytes(18).toString('hex')}`;
+    const persistAttachment = async client => client.query(
+      'INSERT INTO stored_attachments (id, "ownerId", "fileName", "contentType", "sizeBytes", content) VALUES ($1, $2, $3, $4, $5, $6)',
+      [attachmentId, ownerId || null, clean(file.filename, 120), rule[0], file.content.length, file.content]
+    );
+    const client = currentPostgresClient();
+    if (client) await persistAttachment(client);
+    else await withPostgresTransaction(persistAttachment);
+    return { storedName: attachmentId, attachmentId, storage: 'postgres', originalName: clean(file.filename, 120), type: rule[0], size: file.content.length };
+  }
   const storedName = `${randomBytes(18).toString('hex')}${ext}`;
   return writeFile(join(UPLOAD_DIR, storedName), file.content, { flag: 'wx', mode: 0o600 }).then(() => ({ storedName, originalName: clean(file.filename, 120), type: rule[0], size: file.content.length }));
+}
+async function serveUpload(res, file, headers) {
+  if (postgresConfigured()) {
+    const client = currentPostgresClient();
+    if (!client) throw new Error('Protected attachment access requires an active PostgreSQL request transaction.');
+    const result = await client.query('SELECT "fileName", "contentType", "sizeBytes", content FROM stored_attachments WHERE id = $1', [file.attachmentId || file.storedName]);
+    if (!result.rowCount) return json(res, 404, { error: 'الملف غير موجود / File not found' }, headers);
+    const row = result.rows[0];
+    res.writeHead(200, { ...headers, 'Content-Type': row.contentType, 'Content-Length': row.sizeBytes, 'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(row.fileName)}`, 'Cache-Control': 'private, no-store' });
+    return res.end(row.content);
+  }
+  res.writeHead(200, { ...headers, 'Content-Type': file.type, 'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(file.originalName)}`, 'Cache-Control': 'private, no-store' });
+  return createReadStream(join(UPLOAD_DIR, file.storedName)).pipe(res);
 }
 function normalizedDetails(value) { return clean(value, 3000).toLowerCase().replace(/\s+/g, ' '); }
 function findDuplicateLead(candidate) {
@@ -969,8 +2145,8 @@ function syncAllRankRequests() {
   for (const user of store.users) { const request = syncRankRequest(user); if (request) created.push(request); }
   return created;
 }
-async function queueRankRequestMail(request) {
-  await queueMail({ recipientType:'admin', kind:'rank_promotion_requested', subject:`طلب ترقية مسوّق — ${request.name}`, text:`بلغ المسوّق ${request.name} مستوى ${marketerRankTitles[request.targetRank]}\nالرتبة الحالية: ${marketerRankTitles[request.fromRank]}\nالمبيعات المؤهلة مدى الحياة: ${request.salesAtRequest}\nالحد المطلوب: ${request.threshold}\nراجع الطلب واتخذ قرار الموافقة أو الرفض من لوحة ZEZO.` });
+async function queueRankRequestMail(request, { persistImmediately = true } = {}) {
+  await queueMail({ recipientType:'admin', kind:'rank_promotion_requested', subject:`طلب ترقية مسوّق — ${request.name}`, text:`بلغ المسوّق ${request.name} مستوى ${marketerRankTitles[request.targetRank]}\nالرتبة الحالية: ${marketerRankTitles[request.fromRank]}\nالمبيعات المؤهلة مدى الحياة: ${request.salesAtRequest}\nالحد المطلوب: ${request.threshold}\nراجع الطلب واتخذ قرار الموافقة أو الرفض من لوحة ZEZO.`, persistImmediately });
 }
 function safeLead(lead, revealContact = false) {
   return {
@@ -1029,7 +2205,7 @@ function safeDeveloperProject(lead) {
     attachments:(lead.attachments||[]).map(a=>({name:a.originalName,size:a.size})),
     developerAttachments:(lead.developerAttachments||[]).map(a=>({name:a.originalName,size:a.size})) };
 }
-function safeClientOrder(lead){
+function safeClientOrder(lead,paymentRows=store.payments){
   const canSeeDeliverables=lead.developerReviewStatus==='approved'&&['ready_delivery','waiting_client_review','delivered','completed'].includes(lead.projectStage||'');
   return {
     id:lead.id,createdAt:lead.createdAt,language:lead.language||'ar',name:lead.name,email:lead.email,phone:lead.clientWhatsappPhone||lead.phone||'',
@@ -1039,7 +2215,7 @@ function safeClientOrder(lead){
     templateId:lead.templateId||'',templateName:lead.templateName||'',templateAction:lead.templateAction||'',
     paymentStatus:Number(lead.paidTotal||0)<=0?'unpaid':Number(lead.paidTotal||0)<Number(lead.contractAmount||0)?'partial':'collected',
     paidTotal:Number(lead.paidTotal||0),balanceDue:money(Math.max(0,Number(lead.contractAmount||0)-Number(lead.paidTotal||0))),
-    payments:store.payments.filter(payment=>payment.leadId===lead.id).map(payment=>({id:payment.id,at:payment.at||payment.createdAt,kind:payment.kind,amount:Number(payment.amount||0)})),
+    payments:paymentRows.filter(payment=>payment.leadId===lead.id).map(payment=>({id:payment.id,at:payment.at||payment.createdAt,kind:payment.kind,amount:Number(payment.amount||0)})),
     history:(lead.statusHistory||[{status:lead.status,at:lead.createdAt,note:''}]).map(item=>({status:item.status,at:item.at,note:item.note||''})),
     files:[...(lead.attachments||[]).map(a=>({name:a.originalName,size:a.size,kind:'customer_upload'})),...(canSeeDeliverables?(lead.developerAttachments||[]).map((a,index)=>({name:a.originalName,size:a.size,kind:'deliverable',index})):[])],
     canAcceptQuote:lead.status==='proposal'&&Number.isFinite(Number(lead.contractAmount))&&Number(lead.contractAmount)>=0&&!lead.quoteAcceptedAt
@@ -1074,24 +2250,43 @@ function updateDeveloperCommission(lead) {
 }
 function outstandingDeveloperCommission(lead){return money(Math.max(0,Number(lead.developerCommissionAmount||0)-Number(lead.developerCommissionPaidAmount||0)));}
 function developerCommissionDebt(userId){return money(store.leads.filter(lead=>lead.developerUserId===userId).reduce((sum,lead)=>sum+Number(lead.developerCommissionDebtRemaining||0),0));}
+const activeWithdrawalStatuses=new Set(['pending','under_review','approved','awaiting_transfer','requested']);
+function reservedCommissionAmount(lead,kind){
+  const outstanding=kind==='developer'?outstandingDeveloperCommission(lead):outstandingCommission(lead);
+  let reserved=0;
+  for(const withdrawal of store.withdrawals){
+    if(!activeWithdrawalStatuses.has(withdrawal.status))continue;
+    const matching=(withdrawal.commissionItems||[]).filter(item=>item.leadId===lead.id&&item.kind===kind);
+    if(!matching.length)continue;
+    // Legacy active requests may not have per-commission amounts. Reserve the
+    // whole matching commission conservatively until that request is resolved.
+    if(matching.some(item=>!Number.isFinite(Number(item.amount))||Number(item.amount)<=0))reserved+=outstanding;
+    else reserved+=matching.reduce((sum,item)=>sum+Number(item.amount),0);
+  }
+  return money(Math.min(outstanding,reserved));
+}
+function availableOutstandingCommission(lead,kind){
+  const outstanding=kind==='developer'?outstandingDeveloperCommission(lead):outstandingCommission(lead);
+  return money(Math.max(0,outstanding-reservedCommissionAmount(lead,kind)));
+}
 function walletFor(userId){
   const referrals=store.leads.filter(lead=>lead.referralUserId===userId),projects=store.leads.filter(lead=>lead.developerUserId===userId);
   const refPending=money(referrals.filter(lead=>lead.commissionStatus==='pending').reduce((sum,lead)=>sum+outstandingCommission(lead),0));
   const devPending=money(projects.filter(lead=>lead.developerCommissionStatus==='pending').reduce((sum,lead)=>sum+outstandingDeveloperCommission(lead),0));
-  const refGross=money(referrals.filter(lead=>lead.commissionStatus==='confirmed'&&!lead.withdrawalId).reduce((sum,lead)=>sum+outstandingCommission(lead),0));
-  const devGross=money(projects.filter(lead=>lead.developerCommissionStatus==='confirmed'&&!lead.developerWithdrawalId).reduce((sum,lead)=>sum+outstandingDeveloperCommission(lead),0));
+  const refGross=money(referrals.filter(lead=>lead.commissionStatus==='confirmed').reduce((sum,lead)=>sum+availableOutstandingCommission(lead,'referral'),0));
+  const devGross=money(projects.filter(lead=>lead.developerCommissionStatus==='confirmed').reduce((sum,lead)=>sum+availableOutstandingCommission(lead,'developer'),0));
   const refDebt=outstandingCommissionDebt(userId),devDebt=developerCommissionDebt(userId),debt=money(refDebt+devDebt);
-  const activeWithdrawalStatuses=['pending','under_review','approved','awaiting_transfer','requested'];
-  const requested=money(store.withdrawals.filter(item=>item.userId===userId&&activeWithdrawalStatuses.includes(item.status)).reduce((sum,item)=>sum+Number(item.amount||0),0));
+  const requested=money(store.withdrawals.filter(item=>item.userId===userId&&activeWithdrawalStatuses.has(item.status)).reduce((sum,item)=>sum+Number(item.amount||0),0));
   const paid=money(store.withdrawals.filter(item=>item.userId===userId&&item.status==='paid').reduce((sum,item)=>sum+Number(item.amount||0),0));
   const refPaid=money(store.withdrawals.filter(item=>item.userId===userId&&item.status==='paid').reduce((sum,item)=>sum+Number(item.referralAmount||0),0));
   const devPaid=money(store.withdrawals.filter(item=>item.userId===userId&&item.status==='paid').reduce((sum,item)=>sum+Number(item.developerAmount||0),0));
   return {pending:money(refPending+devPending),confirmed:money(Math.max(0,refGross+devGross-debt)),requested,paid,debt,
-    referral:{pending:refPending,available:money(Math.max(0,refGross-refDebt)),reserved:money(store.withdrawals.filter(item=>item.userId===userId&&activeWithdrawalStatuses.includes(item.status)).reduce((sum,item)=>sum+Number(item.referralAmount||0),0)),paid:refPaid},
-    developer:{pending:devPending,available:money(Math.max(0,devGross-devDebt)),reserved:money(store.withdrawals.filter(item=>item.userId===userId&&activeWithdrawalStatuses.includes(item.status)).reduce((sum,item)=>sum+Number(item.developerAmount||0),0)),paid:devPaid},
+    referral:{pending:refPending,available:money(Math.max(0,refGross-refDebt)),reserved:money(store.withdrawals.filter(item=>item.userId===userId&&activeWithdrawalStatuses.has(item.status)).reduce((sum,item)=>sum+Number(item.referralAmount||0),0)),paid:refPaid},
+    developer:{pending:devPending,available:money(Math.max(0,devGross-devDebt)),reserved:money(store.withdrawals.filter(item=>item.userId===userId&&activeWithdrawalStatuses.has(item.status)).reduce((sum,item)=>sum+Number(item.developerAmount||0),0)),paid:devPaid},
     ledger:store.financeLedger.filter(row=>row.employeeId===userId&&row.type.startsWith('commission_')).slice(0,80).map(row=>({id:row.id,postedAt:row.postedAt,leadId:row.leadId,type:row.type,commissionKind:row.commissionKind,amount:fromCents(row.amountCents),currency:row.currency,status:row.statusSnapshot}))};
 }
 function dashboardFor(user) {
+  if (user.role === developmentManagerRole) return { role: developmentManagerRole, user: developmentManagerIdentity(user) };
   const allLeads = store.leads;
   if (user.role === 'admin') return {
     role: user.role, user: publicUser(user), currentPermissions:Object.fromEntries(Object.keys(permissionDefinitions).map(key=>[key,effectivePermission(user,key)])), summary: { leads: allLeads.length, open: allLeads.filter(l => !['completed','cancelled'].includes(l.status)).length, paid: money(allLeads.reduce((n,l) => n + l.paidTotal, 0)), employees: store.users.filter(u=>roles.includes(u.role)&&u.role!=='admin').length, commissionPending: money(allLeads.reduce((n,l)=>n+Number(l.commissionAmount||0)+Number(l.developerCommissionAmount||0),0)), visits: new Set(store.referralEvents.filter(event=>event.type==='visit'&&!event.reversedAt).map(event=>event.visitorHash).filter(Boolean)).size, withdrawals: store.withdrawals.filter(w=>['pending','under_review','approved','awaiting_transfer'].includes(w.status)).length },
@@ -1125,19 +2320,23 @@ function dashboardFor(user) {
     team:canViewEmployees?store.users.filter(u=>roles.includes(u.role)&&u.role!=='admin'&&hasPermission(user,'employees.read',{ownerId:u.id,department:u.department||roleDepartment(u.role)})).map(publicUser):[],leads:permissionEnabled(user,'orders.manage')?allLeads.filter(l=>hasPermission(user,'orders.manage',{assigneeId:l.orderManagerUserId||'',ownerId:l.clientId||'',department:'orders'})).map(l=>safeOrderLead(l,true)):[],conversations:store.conversations.filter(item=>conversationAccess(user,item,'conversations.read')).map(item=>safeConversation(item,false)),conversationAssignees:conversationAssigneesFor(user),campaigns:store.campaigns
   };}
   if(user.role==='order_manager')return {role:user.role,user:publicUser(user),currentPermissions:Object.fromEntries(Object.keys(permissionDefinitions).map(key=>[key,effectivePermission(user,key)])),orders:permissionEnabled(user,'orders.manage')?allLeads.filter(l=>hasPermission(user,'orders.manage',{assigneeId:l.orderManagerUserId||'',ownerId:l.clientId||'',department:'orders'})).map(l=>safeOrderLead(l,true)):[],conversations:store.conversations.filter(item=>conversationAccess(user,item,'conversations.read')).map(item=>safeConversation(item,false)),conversationAssignees:conversationAssigneesFor(user)};
-  if(user.role==='client')return {role:'client',user:publicUser(user),profile:clientProfile(user),orders:allLeads.filter(lead=>lead.clientId===user.id).map(safeClientOrder),conversations:store.conversations.filter(item=>item.clientId===user.id).map(item=>safeConversation(item,false)),mailConfigured:emailReady()};
+  if(user.role==='client')return {role:'client',user:publicUser(user),profile:clientProfile(user),orders:allLeads.filter(lead=>lead.clientId===user.id).map(lead=>safeClientOrder(lead)),conversations:store.conversations.filter(item=>item.clientId===user.id).map(item=>safeConversation(item,false)),mailConfigured:emailReady()};
   const referrals = allLeads.filter(l => l.referralUserId === user.id);
   const wallet=walletFor(user.id);
   const referralMetrics=referralMetricsFor(user.id);
   const currentWithdrawalMonth=referralMonth(new Date());
   const common={role:user.role,user:publicUser(user),crmSummary:crmSummaryFor(user),referralLink:`/?ref=${encodeURIComponent(user.currentReferralCode||user.referralCode)}`,rank:marketerRankSummary(user),referralMetrics,referralLinks:store.referralLinks.filter(link=>link.userId===user.id).map(link=>({id:link.id,code:link.code,month:link.month,kind:link.kind,createdAt:link.createdAt,current:link.id===user.currentReferralLinkId})),referralIntelligence:referralIntelligenceFor(user),payoutHandle:user.payoutHandle||'',wallet,summary:{...wallet,visits:referralMetrics.visits,leads:referrals.length,withdrawalAlreadyUsed:store.withdrawals.some(w=>w.userId===user.id&&w.month===currentWithdrawalMonth)},commissionTerms:{baseRate:currentRankRate(user),holdDays:Number(store.settings.commissionHoldDays??14)},withdrawals:store.withdrawals.filter(w=>w.userId===user.id).map(withdrawalForMarketer),
     leads:referrals.map(l=>({id:l.id,createdAt:l.createdAt,service:l.service,status:l.status,commissionAmount:l.commissionAmount,commissionStatus:l.commissionStatus,withdrawalId:l.withdrawalId||null}))};
-  if(user.role==='developer')common.projects=allLeads.filter(l=>l.developerUserId===user.id).map(safeDeveloperProject);
+  if (user.role === 'developer') {
+    common.projects=allLeads.filter(l=>l.developerUserId===user.id).map(safeDeveloperProject);
+    common.currentPermissions=Object.fromEntries(Object.keys(permissionDefinitions).map(key=>[key,effectivePermission(user,key)]));
+    common.conversations=store.conversations.filter(conversation=>conversationAccess(user,conversation)).map(conversation=>safeConversation(conversation,false));
+  }
   return common;
 }
 function withdrawalForMarketer(w) { return { id:w.id, createdAt:w.createdAt, amount:w.amount, referralAmount:w.referralAmount||0, developerAmount:w.developerAmount||0, method:w.method, status:w.status, updatedAt:w.updatedAt || null, transferReference:w.status === 'paid' ? w.transferReference : undefined }; }
-function availableCommissionLeads(userId) { return store.leads.filter(l=>l.referralUserId===userId&&l.commissionStatus==='confirmed'&&!l.withdrawalId&&outstandingCommission(l)>0); }
-function availableDeveloperCommissionLeads(userId) { return store.leads.filter(l=>l.developerUserId===userId&&l.developerCommissionStatus==='confirmed'&&!l.developerWithdrawalId&&outstandingDeveloperCommission(l)>0); }
+function availableCommissionLeads(userId) { return store.leads.filter(l=>l.referralUserId===userId&&l.commissionStatus==='confirmed'&&availableOutstandingCommission(l,'referral')>0); }
+function availableDeveloperCommissionLeads(userId) { return store.leads.filter(l=>l.developerUserId===userId&&l.developerCommissionStatus==='confirmed'&&availableOutstandingCommission(l,'developer')>0); }
 function updateCommission(lead) {
   if (!lead.contractAmount || !lead.referralUserId || lead.status === 'proposal' || lead.status === 'review' || lead.status === 'new') {
     lead.commissionAmount = null; lead.commissionDebtRemaining = 0; lead.commissionStatus = lead.referralUserId ? 'pending_setup' : 'none'; return;
@@ -1168,8 +2367,12 @@ function updateCommission(lead) {
 }
 function outstandingCommission(lead) { return money(Math.max(0, Number(lead.commissionAmount || 0) - Number(lead.commissionPaidAmount || 0))); }
 function outstandingCommissionDebt(userId) { return money(store.leads.filter(l=>l.referralUserId===userId).reduce((sum,l)=>sum+Number(l.commissionDebtRemaining||0),0)); }
-function cancelWithdrawalForLead(lead, actor = null) {
+function cancelWithdrawalForLead(lead, actor = null, { persistMailImmediately = true } = {}) {
   const withdrawalIds=new Set([lead.withdrawalId,lead.developerWithdrawalId].filter(Boolean));
+  for(const withdrawal of store.withdrawals){
+    if(!activeWithdrawalStatuses.has(withdrawal.status))continue;
+    if((withdrawal.commissionItems||[]).some(item=>item.leadId===lead.id&&(item.kind==='developer'?lead.developerUserId===withdrawal.userId:lead.referralUserId===withdrawal.userId)))withdrawalIds.add(withdrawal.id);
+  }
   for(const withdrawalId of withdrawalIds){
     const withdrawal=store.withdrawals.find(w=>w.id===withdrawalId);if(!withdrawal||!['pending','under_review','approved','awaiting_transfer','requested'].includes(withdrawal.status))continue;
     const priorStatus=withdrawal.status;withdrawal.status='rejected';withdrawal.updatedAt=now();withdrawal.note='Released because a related project was refunded or cancelled.';
@@ -1177,26 +2380,1060 @@ function cancelWithdrawalForLead(lead, actor = null) {
     for(const item of withdrawal.commissionItems||[]){const reserved=store.leads.find(l=>l.id===item.leadId);if(!reserved)continue;if(item.kind==='developer'&&reserved.developerWithdrawalId===withdrawal.id)delete reserved.developerWithdrawalId;if(item.kind!=='developer'&&reserved.withdrawalId===withdrawal.id)delete reserved.withdrawalId;}
     audit(actor,'withdrawal_cancelled',withdrawal.id,'Related project was refunded or cancelled');
     appendFinanceEntry({idempotencyKey:`withdrawal:${withdrawal.id}:released`,type:'withdrawal_released',employeeId:withdrawal.userId,withdrawalId:withdrawal.id,amountCents:cents(withdrawal.amount),statusSnapshot:'rejected',actor:actor?.username||'system',note:'Related project refunded or cancelled'});
-    if(withdrawal.email)void queueMail({to:withdrawal.email,kind:'withdrawal_cancelled',subject:'تحديث طلب السحب لدى ZEZO',text:`مرحباً ${withdrawal.name}، أُلغي طلب السحب رقم ${withdrawal.id} بعد تعديل مالي على أحد المشاريع المرتبطة به. راجع رصيدك وقدم طلباً جديداً عند توفر الرصيد.`});
+    if(withdrawal.email)void queueMail({to:withdrawal.email,kind:'withdrawal_cancelled',subject:'تحديث طلب السحب لدى ZEZO',text:`مرحباً ${withdrawal.name}، أُلغي طلب السحب رقم ${withdrawal.id} بعد تعديل مالي على أحد المشاريع المرتبطة به. راجع رصيدك وقدم طلباً جديداً عند توفر الرصيد.`,persistImmediately:persistMailImmediately});
+  }
+}
+
+async function handlePostgresEmployeeActivation(req, res, path) {
+  if (req.method !== 'POST' || path !== '/api/auth/activate' || !stagingAuthorized(req)) return false;
+  const security = { ...responseSecurityHeaders(), 'Cache-Control': 'no-store' };
+  const respond = (status, body, headers = security) => { json(res, status, body, headers); return true; };
+  let body;
+  try {
+    body = await jsonBody(req);
+  } catch {
+    return respond(400, { error: 'تعذر قراءة بيانات التفعيل. حدّث الصفحة وحاول مجدداً / Could not read the activation form. Refresh and try again.' });
+  }
+
+  const activationToken = String(body.token || '');
+  const password = String(body.password || '');
+  if (activationToken.length < 20 || activationToken.length > 128) {
+    return respond(400, { error: 'رابط التفعيل غير صالح أو منتهي أو سبق استخدامه. اطلب رابطاً جديداً من إدارة ZEZO / This activation link is invalid, expired, or already used. Ask ZEZO management for a new link.' });
+  }
+  if (!validPassword(password)) {
+    return respond(400, { error: 'كلمة المرور يجب أن تتكون من 12 خانة على الأقل / Password must be at least 12 characters.' });
+  }
+  const ip = req.socket?.remoteAddress || 'unknown';
+  let rateAllowed;
+  try {
+    rateAllowed = await consumeRateLimitBucket('employee-activation', ip, 20, 15 * 60_000);
+  } catch (error) {
+    const code = typeof error?.code === 'string' ? error.code.slice(0, 16) : 'unknown';
+    const name = error instanceof Error ? error.name.slice(0, 40) : 'unknown';
+    console.error('ZEZO employee activation rate limiter failed', { code, name });
+    return respond(503, { error: 'تعذر التحقق من الطلب مؤقتاً. لم نغيّر حالة الدعوة؛ أعد المحاولة بعد قليل / We could not verify the request temporarily. The invitation was not changed; please retry shortly.' });
+  }
+  if (!rateAllowed) {
+    return respond(429, { error: 'محاولات تفعيل كثيرة. انتظر 15 دقيقة ثم حاول مجدداً / Too many activation attempts. Wait 15 minutes and try again.' }, { ...security, 'Retry-After': '900' });
+  }
+
+  const sid = token();
+  let result;
+  try {
+    result = await activatePostgresEmployeeInvitation({
+      activationHash: hash(activationToken),
+      credential: passwordRecord(password),
+      sessionHash: sessionKey(sid),
+      sessionExpiresAt: new Date(Date.now() + SESSION_TTL),
+      auditId: id('evt'),
+      at: now()
+    });
+  } catch (error) {
+    const code = typeof error?.code === 'string' ? error.code.slice(0, 16) : 'unknown';
+    const name = error instanceof Error ? error.name.slice(0, 40) : 'unknown';
+    console.error('ZEZO employee activation transaction failed', { code, name });
+    return respond(503, { error: 'تعذر حفظ التفعيل بسبب مشكلة مؤقتة في قاعدة البيانات. لم نعرض تفاصيل سرية؛ أعد المحاولة بعد قليل، وإن استمرت المشكلة اطلب من الإدارة إصدار رابط جديد / Activation could not be saved because of a temporary database issue. Please retry shortly; if it continues, ask management for a new link.' });
+  }
+
+  if (result.kind === 'expired') {
+    return respond(410, { error: 'انتهت صلاحية الدعوة. اطلب من الإدارة إصدار رابط جديد / This invitation has expired. Ask management to issue a new link.' });
+  }
+  if (result.kind === 'awaiting_approval') {
+    return respond(409, { error: 'الدعوة ما زالت تنتظر موافقة الإدارة / This invitation is still waiting for management approval.' });
+  }
+  if (result.kind === 'already_active') {
+    return respond(409, { error: 'الحساب مفعّل بالفعل. انتقل إلى مساحة الفريق وسجّل الدخول / This account is already active. Open the team workspace and sign in.' });
+  }
+  if (result.kind !== 'activated') {
+    return respond(400, { error: 'رابط التفعيل غير صالح أو منتهي أو سبق استخدامه. اطلب رابطاً جديداً من إدارة ZEZO / This activation link is invalid, expired, or already used. Ask ZEZO management for a new link.' });
+  }
+
+  return respond(200, { ok: true, user: publicUser(result.user) }, {
+    ...security,
+    'Set-Cookie': cookie('zezo_session', sid, SESSION_TTL / 1000, req)
+  });
+}
+
+async function handlePostgresProjectRequest(req, res, path) {
+  if (req.method !== 'POST' || path !== '/api/leads') return false;
+  if (!stagingAuthorized(req)) return false;
+  const security = responseSecurityHeaders();
+  const respond = (status, body, headers = security) => { json(res, status, body, headers); return true; };
+  const auth = await directPostgresSessionUser(req);
+  if (!auth) return respond(401, { error: 'سجّل الدخول بحساب العميل لإرسال طلب رسمي / Sign in with a client account to submit an official request' });
+  if (!directRequireAuth(req, res, auth.user, ['client'])) return true;
+  const ip = req.socket?.remoteAddress || 'unknown';
+  if (!await consumeRateLimitBucket('public-enquiry', ip, 8, 60 * 60_000)) {
+    return respond(429, { error: 'وصلنا الحد المؤقت للطلبات من هذا الاتصال. حاول لاحقاً / Too many enquiries from this connection. Please try again later.' });
+  }
+
+  let body = {}, file = null;
+  if ((req.headers['content-type'] || '').toLowerCase().startsWith('multipart/form-data')) {
+    const parsed = parseMultipart(await bodyBuffer(req), req.headers['content-type']);
+    body = parsed.fields; file = parsed.file;
+  } else body = await jsonBody(req);
+  if (clean(body.website, 120)) return respond(201, { ok: true });
+
+  const phone = internationalPhone(body.whatsappCountryCode, body.whatsappLocalNumber, body.phone);
+  const details = clean(body.details, 3000);
+  const service = clean(body.service, 60);
+  const category = clean(body.category, 80);
+  const templateId = clean(body.templateId, 80);
+  const template = templateId ? templateById.get(templateId) : null;
+  const templateAction = clean(body.templateAction, 24);
+  if (!auth.user.name || auth.user.name.length < 2 || !normalizeEmail(auth.user.email) || !isE164Phone(phone) ||
+      details.length < 12 || !serviceCategories[service]?.includes(category) || body.consent !== 'true') {
+    return respond(400, { error: 'أكمل بيانات الطلب وأدخل رقم واتساب صحيحاً مع مفتاح الدولة / Complete the request and enter a valid WhatsApp number with country code' });
+  }
+  if (templateId && (!template || template.service !== service || template.category !== category || !['order', 'customize'].includes(templateAction))) {
+    return respond(400, { error: 'القالب المختار غير صالح لهذا الطلب / The selected template does not match this request' });
+  }
+
+  let attachmentFile = null;
+  if (file) {
+    const extension = extname(file.filename).toLowerCase();
+    const rules = {
+      '.pdf': { type: 'application/pdf', signature: Buffer.from('%PDF-') },
+      '.png': { type: 'image/png', signature: Buffer.from([0x89, 0x50, 0x4e, 0x47]) },
+      '.jpg': { type: 'image/jpeg', signature: Buffer.from([0xff, 0xd8, 0xff]) },
+      '.jpeg': { type: 'image/jpeg', signature: Buffer.from([0xff, 0xd8, 0xff]) },
+      '.webp': { type: 'image/webp', signature: Buffer.from('RIFF') }
+    };
+    const rule = rules[extension];
+    if (!rule || file.content.length > 4 * 1024 * 1024 || !file.content.subarray(0, rule.signature.length).equals(rule.signature)) {
+      return respond(400, { error: 'الملف غير مدعوم أو يتجاوز 4MB / Unsupported file or over 4MB' });
+    }
+    attachmentFile = { ...file, contentType: rule.type };
+  }
+
+  const conversationId = clean(body.conversationId, 80);
+  const createConversation = !conversationId && body.createConversation === 'true';
+  // A registered customer's stored attribution is the only authority for a
+  // project request. URL/body fields remain untrusted display/legacy values.
+  const suppliedKey = clean(req.headers['idempotency-key'] || body.idempotencyKey, 120);
+  const idempotencyKey = /^[A-Za-z0-9_-]{32,120}$/.test(suppliedKey)
+    ? suppliedKey
+    : randomBytes(32).toString('base64url');
+  const createdAt = now();
+  const result = await createPostgresProjectRequest({
+    sessionHash: sessionKey(auth.sid), idempotencyKey,
+    payload: {
+      customerId: auth.user.id, phone, service, category, details,
+      budget: clean(body.budget, 80), templateId, templateAction, conversationId,
+      createConversation,
+      guestHash: guestSessionValue(req) ? hash(guestSessionValue(req)) : '',
+      language: body.lang === 'en' ? 'en' : 'ar'
+    },
+    template: template ? { id: template.id, titleAr: template.title?.ar || '' } : null,
+    siteBase: siteBase(req), trackingTtlMs: TRACKING_TTL_MS,
+    defaultTemplateInclusion,
+    auditId: id('evt'), messageId: id('msg'), at: createdAt, file: attachmentFile
+  }).catch(error => {
+    if (createConversation && ['55P03', '40P01', '40001'].includes(error.code)) return { kind: 'busy' };
+    throw error;
+  });
+  if (result.kind === 'busy') return respond(503, { error: 'الخدمة مشغولة الآن. مسودتك محفوظة؛ حاول مجدداً / The service is busy. Your draft is saved; please retry.' });
+  if (result.kind === 'unauthenticated') return respond(401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' });
+  if (result.kind === 'forbidden') return respond(403, { error: 'استخدم حساب العميل لإرسال الطلب / Use a client account to submit this request' });
+  if (result.kind === 'conversation_forbidden') return respond(403, { error: 'لا يمكن ربط الطلب بهذه المحادثة / This conversation cannot be linked to your request' });
+  if (result.kind === 'conversation_converted') return respond(409, { error: 'هذه المحادثة مرتبطة بطلب رسمي مسبقاً / This conversation already has an official request' });
+  if (result.kind === 'template_mismatch') return respond(400, { error: 'القالب لا يطابق المحادثة / Template does not match the conversation' });
+  if (result.kind === 'template_unavailable') return respond(409, { error: 'هذا القالب متوقف للطلبات حالياً؛ تواصل معنا لطلب بديل / This template is temporarily unavailable for orders; contact us for an alternative' });
+  if (result.kind === 'idempotency_conflict') return respond(409, { error: 'تغيّرت بيانات الطلب بعد محاولة سابقة. أعد الإرسال مرة واحدة لتسجيل الطلب المحدّث / The request changed after a previous attempt. Submit once more to save the updated request' });
+
+  const duplicate = result.kind === 'duplicate';
+  return respond(duplicate ? 200 : 201, {
+    ok: true, id: result.id, duplicate, attributed: Boolean(result.attributed), trackingToken: result.trackingToken,
+    emailQueued: emailReady() && adminEmailReady(),
+    mail: { customerConfigured: emailReady(), adminConfigured: emailReady() && adminEmailReady() }
+  });
+}
+
+function referralRequestHasSameOrigin(req) {
+  const origin = String(req.headers.origin || '').trim();
+  const fetchSite = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+  if (fetchSite === 'cross-site') return false;
+  if (!origin) return true;
+  try {
+    const parsed = new URL(origin);
+    const host = String(req.headers.host || '').toLowerCase();
+    return parsed.host.toLowerCase() === host && ['http:', 'https:'].includes(parsed.protocol);
+  } catch { return false; }
+}
+
+async function handlePostgresReferral(req, res, path) {
+  const isAttribution = path === '/api/referral-attribution';
+  const isEvent = path === '/api/referral-events';
+  const isRevoke = path === '/api/referral-consent/revoke';
+  if (!isAttribution && !isEvent && !isRevoke) return false;
+  if (!stagingAuthorized(req)) return false;
+  const security = responseSecurityHeaders();
+  const respond = (status, body, headers = security) => { json(res, status, body, headers); return true; };
+  const originOk = req.method === 'GET' || referralRequestHasSameOrigin(req);
+  if (!originOk) return respond(403, { error: 'الطلب غير مسموح / Request origin is not allowed' });
+  const ip = req.socket?.remoteAddress || 'unknown';
+  const bucket = isAttribution ? 'referral-attribution' : isEvent ? 'referral-events' : 'referral-consent-revoke';
+  // Public pages check for an existing first-party attribution cookie during
+  // startup, including when the cleaned URL no longer has ?ref=. Keep the
+  // read/capture budget above a normal multi-page session while preserving a
+  // bounded rate for anonymous traffic behind shared office/mobile IPs.
+  const limit = isAttribution ? 300 : isEvent ? 300 : 20;
+  if (!await consumeRateLimitBucket(bucket, ip, limit, 60 * 60_000)) {
+    return respond(429, { error: 'حاول لاحقاً / Please try again later' });
+  }
+
+  const rawCookie = cookieValue(req, REFERRAL_ATTRIBUTION_COOKIE);
+  const validCookie = /^[A-Za-z0-9_-]{40,64}$/.test(rawCookie);
+  const cookieHash = validCookie ? hash(rawCookie) : '';
+  if (isAttribution) {
+    if (req.method !== 'GET') return respond(405, { error: 'Method not allowed' }, { ...security, Allow: 'GET' });
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const code = clean(url.searchParams.get('ref'), 40);
+    let result = null;
+    if (code) {
+      const value = validCookie ? rawCookie : randomBytes(32).toString('base64url');
+      const valueHash = validCookie ? cookieHash : hash(value);
+      result = await capturePostgresReferralAttribution({
+        cookieHash: valueHash, code, at: now(),
+        expiresAt: new Date(Date.now() + REFERRAL_ATTRIBUTION_TTL_SECONDS * 1000).toISOString()
+      });
+      if (result.kind === 'captured' || result.kind === 'existing') {
+        const expiresAt = Date.parse(result.attribution.expiresAt);
+        const maxAge = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+        const headers = { ...security, ...(maxAge ? { 'Set-Cookie': cookie(REFERRAL_ATTRIBUTION_COOKIE, value, maxAge, req) } : {}) };
+        return respond(200, { attributed: true, code: result.attribution.code, expiresAt: result.attribution.expiresAt }, headers);
+      }
+      return respond(200, { attributed: false });
+    }
+    if (validCookie) {
+      const attribution = await getPostgresReferralAttribution(cookieHash);
+      if (attribution) return respond(200, { attributed: true, code: attribution.code, expiresAt: attribution.expiresAt });
+    }
+    return respond(200, { attributed: false });
+  }
+
+  if (req.method !== 'POST') return respond(405, { error: 'Method not allowed' }, { ...security, Allow: 'POST' });
+  if (isRevoke) {
+    const body = await jsonBody(req);
+    const visitorId = clean(body.visitorId, 80);
+    if (!/^[\-_a-zA-Z0-9]{12,80}$/.test(visitorId)) return respond(400, { error: 'معرّف القياس غير صالح / Invalid analytics identifier' });
+    // Consent revocation removes only optional analytics. The essential
+    // first-party attribution cookie stays server-owned until signup/expiry.
+    await deletePostgresReferralAnalyticsByVisitor(hash(visitorId));
+    return respond(202, { ok: true });
+  }
+
+  const body = await jsonBody(req);
+  const type = clean(body.type, 32);
+  const eventId = clean(body.eventId, 80);
+  const visitorId = clean(body.visitorId, 80);
+  const allowedTypes = ['visit', 'service_view', 'template_view', 'whatsapp_click'];
+  if (!validCookie || !allowedTypes.includes(type) || !/^[\-_a-zA-Z0-9]{12,80}$/.test(eventId) ||
+      !/^[\-_a-zA-Z0-9]{12,80}$/.test(visitorId)) return respond(400, { error: 'حدث الإحالة غير صالح / Invalid referral event' });
+  const resourceId = clean(body.resourceId, 100);
+  if (type === 'service_view' && !['web', 'apps', 'ai', 'ideas'].includes(resourceId)) return respond(400, { error: 'الخدمة غير صالحة / Invalid service' });
+  if (type === 'template_view' && !templateById.has(resourceId)) return respond(400, { error: 'القالب غير صالح / Invalid template' });
+  const followupId = type === 'whatsapp_click' ? clean(body.followupId, 32).toUpperCase() : '';
+  if (type === 'whatsapp_click' && !/^ZRI-[A-F0-9]{8,24}$/.test(followupId)) return respond(400, { error: 'رقم المتابعة غير صالح / Invalid follow-up ID' });
+  const result = await recordPostgresReferralEvent({
+    cookieHash, type, eventId, resourceId, followupId,
+    analyticsVisitorHash: hash(visitorId), at: now()
+  });
+  if (result.kind === 'missing_attribution') return respond(409, { error: 'لا يوجد إسناد إحالة صالح / No valid referral attribution' });
+  return respond(202, { ok: true, duplicate: result.kind === 'duplicate' });
+}
+
+async function handlePostgresCoreWrite(req, res, path) {
+  if (!stagingAuthorized(req)) return false;
+  const security = responseSecurityHeaders();
+  const respond = (status, body, headers = security) => { json(res, status, body, headers); return true; };
+
+  if (req.method === 'POST' && path === '/api/conversations') {
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, ['client'])) return true;
+    const ip = req.socket?.remoteAddress || 'unknown';
+    if (!await consumeRateLimitBucket('conversation-start', ip, 15, 60 * 60_000)) {
+      return respond(429, { error: 'وصلنا الحد المؤقت للمحادثات. حاول لاحقاً / Conversation limit reached. Try again later.' });
+    }
+    let body = {}, file = null;
+    if ((req.headers['content-type'] || '').toLowerCase().startsWith('multipart/form-data')) {
+      const parsed = parseMultipart(await bodyBuffer(req), req.headers['content-type']);
+      body = parsed.fields; file = parsed.file;
+    } else body = await jsonBody(req);
+
+    const templateId = clean(body.templateId, 80);
+    const template = templateById.get(templateId);
+    const message = cleanConversationMessage(body.message);
+    if (!template || message.length < 5) return respond(400, { error: 'اختر قالباً متاحاً واكتب استفسارك / Choose an available template and enter your question' });
+    const settings = await queryPostgres('SELECT value FROM app_settings WHERE key=$1', ['zezo-runtime']);
+    if (settings.rows[0]?.value?.templateActive?.[templateId] === false) {
+      return respond(404, { error: 'القالب غير متاح حالياً / This template is not currently available' });
+    }
+
+    let attachmentFile = null;
+    if (file) {
+      const extension = extname(file.filename).toLowerCase();
+      const rules = {
+        '.pdf': { type: 'application/pdf', signature: Buffer.from('%PDF-') },
+        '.png': { type: 'image/png', signature: Buffer.from([0x89, 0x50, 0x4e, 0x47]) },
+        '.jpg': { type: 'image/jpeg', signature: Buffer.from([0xff, 0xd8, 0xff]) },
+        '.jpeg': { type: 'image/jpeg', signature: Buffer.from([0xff, 0xd8, 0xff]) },
+        '.webp': { type: 'image/webp', signature: Buffer.from('RIFF') }
+      };
+      const rule = rules[extension];
+      if (!rule || file.content.length > 4 * 1024 * 1024 || !file.content.subarray(0, rule.signature.length).equals(rule.signature)) {
+        return respond(400, { error: 'الملف غير مدعوم أو يتجاوز 4MB / Unsupported file or over 4MB' });
+      }
+      attachmentFile = { ...file, contentType: rule.type };
+    }
+
+    const suppliedKey = clean(req.headers['idempotency-key'] || body.idempotencyKey, 120);
+    const idempotencyKey = /^[A-Za-z0-9_-]{32,120}$/.test(suppliedKey) ? suppliedKey : token(24);
+    const idempotencyHash = hash(idempotencyKey);
+    const referral = await resolvePostgresReferralForConversation(auth.user);
+    const createdAt = now();
+    const conversation = {
+      id: `chat_${idempotencyHash.slice(0, 40)}`, createdAt, updatedAt: createdAt,
+      templateId: template.id, templateName: template.title.ar, templateService: template.service,
+      templateCategory: template.category, source: clean(body.source, 40) || 'template_catalog',
+      department: 'orders', status: 'new', clientId: auth.user.id,
+      guestSessionHash: null, assignedUserId: null,
+      referralCode: referral?.code || '', referralLinkId: referral?.linkId || null,
+      referralUserId: referral?.userId || null, leadId: null, messages: []
+    };
+    const result = await createPostgresConversation({
+      conversation, message, attachmentFile, actor: auth.user, guestHash: '',
+      idempotencyHash, auditId: id('evt'), messageId: id('msg'), referral, at: createdAt,
+      authorizeRecipient: canReceiveConversationNotification
+    });
+    if (result.kind === 'conflict') return respond(409, { error: 'تعذر إكمال المحادثة بهذا الطلب. حدّث الصفحة وحاول مجدداً / This conversation request could not be completed. Refresh and try again.' });
+    return respond(result.kind === 'duplicate' ? 200 : 201, { ok: true, conversation: result.conversation, messageId: result.messageId || result.conversation?.messages?.at(-1)?.id });
+  }
+
+  const conversationMessageMatch = req.method === 'POST' && /^\/api\/conversations\/([^/]+)\/messages$/.exec(path);
+  if (conversationMessageMatch) {
+    const ip = req.socket?.remoteAddress || 'unknown';
+    if (!await consumeRateLimitBucket('conversation-message', ip, 40, 60 * 60_000)) {
+      return respond(429, { error: 'وصلنا الحد المؤقت للرسائل. حاول لاحقاً / Message limit reached. Try again later.' });
+    }
+    let body = {}, file = null;
+    if ((req.headers['content-type'] || '').toLowerCase().startsWith('multipart/form-data')) {
+      const parsed = parseMultipart(await bodyBuffer(req), req.headers['content-type']);
+      body = parsed.fields; file = parsed.file;
+    } else body = await jsonBody(req);
+    const auth = await directPostgresSessionUser(req);
+    const guest = guestSessionValue(req);
+    if (auth && !directRequireAuth(req, res, auth.user, allRoles)) return true;
+    if (!auth && !guest) return respond(401, { error: 'انتهت جلسة المحادثة. أعد فتح المحادثة من حسابك / Conversation session expired. Reopen this conversation from your account.' });
+    const actor = auth?.user || { id: '', role: 'guest' };
+    if (auth && !['client', 'admin', 'hr_manager', 'marketing_manager', 'order_manager', 'developer'].includes(actor.role)) {
+      return respond(403, { error: 'ليس لديك صلاحية الرد على هذه المحادثة / You cannot reply to this conversation' });
+    }
+    const text = cleanConversationMessage(body.message);
+    if (!text && !file) return respond(400, { error: 'اكتب رسالة أو أرفق ملفاً / Enter a message or attach a file' });
+    let attachmentFile = null;
+    if (file) {
+      const extension = extname(file.filename).toLowerCase();
+      const rules = {
+        '.pdf': { type: 'application/pdf', signature: Buffer.from('%PDF-') },
+        '.png': { type: 'image/png', signature: Buffer.from([0x89, 0x50, 0x4e, 0x47]) },
+        '.jpg': { type: 'image/jpeg', signature: Buffer.from([0xff, 0xd8, 0xff]) },
+        '.jpeg': { type: 'image/jpeg', signature: Buffer.from([0xff, 0xd8, 0xff]) },
+        '.webp': { type: 'image/webp', signature: Buffer.from('RIFF') }
+      };
+      const rule = rules[extension];
+      if (!rule || file.content.length > 4 * 1024 * 1024 || !file.content.subarray(0, rule.signature.length).equals(rule.signature)) {
+        return respond(400, { error: 'الملف غير مدعوم أو يتجاوز 4MB / Unsupported file or over 4MB' });
+      }
+      attachmentFile = { ...file, contentType: rule.type };
+    }
+    const suppliedKey = clean(req.headers['idempotency-key'] || body.idempotencyKey, 120);
+    const idempotencyKey = /^[A-Za-z0-9_-]{32,120}$/.test(suppliedKey) ? suppliedKey : token(24);
+    const result = await createPostgresConversationMessage({
+      conversationId: decodeURIComponent(conversationMessageMatch[1]), actor, guestHash: guest ? hash(guest) : '',
+      text, attachmentFile, idempotencyHash: hash(idempotencyKey), messageId: id('msg'), auditId: id('evt'), at: now(),
+      permissionScope: auth ? effectivePermission(actor, 'conversations.read') : '',
+      emailSiteBase: emailReady() ? siteBase(req) : '',
+      authorizeRecipient: canReceiveConversationNotification,
+      authorize: conversation => {
+        if (actor.role === 'client') return conversation.clientId === actor.id || Boolean(guest && conversation.guestSessionHash === hash(guest));
+        if (actor.role === 'guest') return Boolean(guest && conversation.guestSessionHash === hash(guest));
+        return conversationAccess(actor, conversation, 'conversations.read') &&
+          hasPermission(actor, 'conversations.reply', { assigneeId: conversation.assignedUserId || '', ownerId: conversation.clientId || '', department: conversation.department || 'orders' });
+      }
+    });
+    if (result.kind === 'missing' || result.kind === 'forbidden') return respond(404, { error: 'المحادثة غير موجودة أو لا تملك صلاحية الوصول إليها / Conversation not found or unavailable' });
+    if (result.kind === 'closed') return respond(409, { error: 'المحادثة مغلقة ولا تستقبل رسائل جديدة / This conversation is closed to new messages' });
+    return respond(result.kind === 'duplicate' ? 200 : 201, { ok: true, conversation: result.conversation, messageId: result.messageId });
+  }
+
+  const match = req.method === 'PATCH' && /^\/api\/admin\/permissions\/[^/]+$/.test(path)
+    ? path.split('/').at(-1)
+    : '';
+  if (!match) return false;
+
+  // Core write handlers use a boolean dispatch contract. json() writes the
+  // response but returns undefined, which would otherwise fall through to the
+  // legacy company-wide transaction and wait on its advisory lock.
+  const auth = await directPostgresSessionUser(req);
+  if (!directRequireAuth(req, res, auth?.user, ['admin'])) return true;
+  const targetId = decodeURIComponent(match);
+  const body = await jsonBody(req);
+  const updatedAt = now();
+  const changes = body.permissions;
+  const result = await updatePostgresEmployeePermissions({
+    sessionHash: sessionKey(auth.sid), actorId: auth.user.id, targetId,
+    updatedAt, auditId: id('evt'),
+    applyChanges: ({ actor, target }) => {
+      const nextRole = body.role === undefined ? target.role : clean(body.role, 40);
+      if (!roles.includes(nextRole) || nextRole === 'admin') return { kind: 'invalid_role' };
+      if (nextRole === developmentManagerRole && target.role === 'client') return { kind: 'invalid_role' };
+      if (changes !== undefined && (!changes || typeof changes !== 'object' || Array.isArray(changes))) return { kind: 'invalid_permissions' };
+      if (nextRole === developmentManagerRole && Object.values(changes || {}).some(value => value !== null && value !== 'default' && value !== 'none')) return { kind: 'fixed_permissions' };
+      const fixedScope = nextRole === developmentManagerRole || target.role === developmentManagerRole;
+      const overrides = fixedScope ? {} : { ...(target.permissionOverrides || {}) };
+      for (const [key, value] of Object.entries(changes || {})) {
+        if (!Object.hasOwn(permissionDefinitions, key)) return { kind: 'unknown_permission', key };
+        if (value === null || value === 'default') { delete overrides[key]; continue; }
+        if (value !== 'none' && !permissionDefinitions[key].includes(value)) return { kind: 'invalid_scope', key };
+        if (!fixedScope) overrides[key] = value;
+      }
+      const before = { role: target.role, active: target.active, permissionOverrides: target.permissionOverrides || {} };
+      target.role = nextRole;
+      target.department = body.department === 'people' && nextRole === 'hr_manager' ? 'people' : roleDepartment(nextRole);
+      target.permissionOverrides = overrides;
+      if (typeof body.active === 'boolean') {
+        target.active = body.active;
+        if (body.active) delete target.accountDisabledAt;
+        else target.accountDisabledAt = updatedAt;
+      }
+      if (target.inviteCreatedBy === actor.id && body.active === false) target.inviteStatus = 'revoked';
+      return { auditDetail: { beforeRole: before.role, role: target.role, active: target.active, permissions: Object.keys(changes || {}) } };
+    }
+  });
+
+  if (result.kind === 'unauthenticated') return respond(401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' }, security);
+  if (result.kind === 'forbidden') return respond(403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }, security);
+  if (result.kind === 'missing') return respond(404, { error: 'الحساب غير موجود / Account not found' }, security);
+  if (result.kind === 'owner_protected') return respond(409, { error: 'حساب المالك محمي من تغيير الدور أو الصلاحيات من لوحة التفويض / Owner account is protected from permission changes here' }, security);
+  if (result.kind === 'invalid_role') return respond(400, { error: 'اختر دور موظف صالحاً؛ تعيين Owner يحتاج دعوة مالك منفصلة / Choose a valid employee role; Owner accounts require a separate owner invitation' }, security);
+  if (result.kind === 'invalid_permissions') return respond(400, { error: 'صيغة الصلاحيات غير صالحة / Invalid permission settings' }, security);
+  if (result.kind === 'fixed_permissions') return respond(403, { error: 'صلاحيات مسؤول المبرمجين محددة بنطاق المشاريع التقنية / Development Manager access is fixed to scoped technical projects' }, security);
+  if (result.kind === 'unknown_permission') return respond(400, { error: `صلاحية غير معروفة / Unknown permission: ${result.key}` }, security);
+  if (result.kind === 'invalid_scope') return respond(400, { error: `نطاق غير مسموح / Unsupported scope for ${result.key}` }, security);
+  const target = result.target;
+  return respond(200, {
+    ok: true,
+    user: {
+      ...publicUser(target), department: target.department, permissionOverrides: target.permissionOverrides,
+      effectivePermissions: Object.fromEntries(Object.keys(permissionDefinitions).map(key => [key, effectivePermission(target, key)]))
+    }
+  }, security);
+}
+
+async function handlePostgresInvitationWrite(req, res, path) {
+  const revokeMatch = req.method === 'PATCH' && /^\/api\/admin\/invitations\/[^/]+$/.test(path);
+  const reissueMatch = req.method === 'POST' && /^\/api\/admin\/invitations\/[^/]+\/resend$/.test(path);
+  if (!revokeMatch && !reissueMatch) return false;
+  if (!stagingAuthorized(req)) return false;
+
+  const security = responseSecurityHeaders();
+  const respond = (status, body) => { json(res, status, body, security); return true; };
+  const auth = await directPostgresSessionUser(req);
+  const allowed = reissueMatch ? ['admin', 'hr_manager'] : ['admin'];
+  if (!directRequireAuth(req, res, auth?.user, allowed)) return true;
+  const employeeId = decodeURIComponent(path.split('/').at(reissueMatch ? -2 : -1));
+  const at = now();
+
+  if (revokeMatch) {
+    const body = await jsonBody(req);
+    if (clean(body.status || body.action, 20) !== 'revoked') {
+      return respond(400, { error: 'الإجراء المسموح هو إلغاء الدعوة / Only revoking an invitation is supported' });
+    }
+    const result = await revokePostgresEmployeeInvitation({
+      sessionHash: sessionKey(auth.sid), actorId: auth.user.id, employeeId,
+      auditId: id('evt'), revokedAt: at,
+      authorize: actor => actor.role === 'admin' ? null : { status: 403, error: 'إلغاء الدعوات متاح للمالك فقط / Only the Owner can revoke invitations' }
+    });
+    if (result.kind === 'unauthenticated') return respond(401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' });
+    if (result.kind === 'forbidden') return respond(result.status || 403, { error: result.error || 'ليس لديك صلاحية لإلغاء هذه الدعوة / Not permitted to revoke this invitation' });
+    if (result.kind === 'missing') return respond(404, { error: 'الدعوة غير موجودة / Invitation not found' });
+    if (result.kind === 'accepted') return respond(409, { error: 'تم تفعيل الحساب بالفعل؛ لا يمكن إلغاء دعوته / This account is already active and cannot be revoked as an invitation' });
+    if (result.kind === 'not_pending') return respond(409, { error: 'الدعوة لم تعد معلّقة / Invitation is no longer pending' });
+    return respond(200, { ok: true, user: publicUser(result.employee) });
+  }
+
+  const body = await jsonBody(req);
+  const activation = token(32);
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
+  const mailId = id('mail');
+  const origin = siteBase(req);
+  const activationUrl = `${origin}/activate?token=${encodeURIComponent(activation)}`;
+  const result = await reissuePostgresEmployeeInvitation({
+    sessionHash: sessionKey(auth.sid), actorId: auth.user.id, employeeId,
+    activationHash: hash(activation), activationExpires: Date.parse(expiresAt), expiresAt,
+    issuedAt: at, auditId: id('evt'),
+    outboxMessage: { id: mailId, recipient: null, data: {
+      id: mailId, to: null, recipientType: 'direct', kind: 'team_invitation',
+      ...teamInvitationEmail({ activationUrl, teamUrl: `${origin}/team`, reissued: true }), expiresAt, state: 'pending', attempts: 0,
+      lastError: '', createdAt: at, updatedAt: at
+    } },
+    authorize: (actor, employee) => {
+      if (actor.role === 'hr_manager' &&
+          (employee.inviteCreatedBy !== actor.id || !inviteableEmployeeRoles.includes(employee.role) ||
+           !hasPermission(actor, 'team.invite', { department: 'people' }))) {
+        return { status: 403, error: 'يمكن لمسؤول الموظفين تجديد الدعوات التشغيلية التي أنشأها فقط / HR can only reissue operational invitations they created' };
+      }
+      if (employee.role === 'admin' &&
+          (actor.role !== 'admin' || !actor.mfaEnabledAt || !validTotp(actor.mfaSecret, body.ownerMfaCode))) {
+        return { status: 403, error: 'إعادة دعوة المالك تحتاج رمز تحقق جديداً من تطبيق المصادقة / Reissuing an Owner invitation requires a fresh authenticator code' };
+      }
+      return null;
+    }
+  });
+  if (result.kind === 'unauthenticated') return respond(401, { error: 'انتهت الجلسة. سجّل الدخول من جديد / Session expired. Please sign in again' });
+  if (result.kind === 'forbidden') return respond(result.status || 403, { error: result.error || 'ليس لديك صلاحية لهذه الدعوة / Not permitted to reissue this invitation' });
+  if (result.kind === 'missing') return respond(404, { error: 'الدعوة غير موجودة / Invitation not found' });
+  if (result.kind === 'accepted') return respond(409, { error: 'تم تفعيل الحساب بالفعل؛ لا يمكن إصدار دعوة له / This account is already active and cannot be re-invited' });
+  if (result.kind === 'not_reissuable') return respond(409, { error: 'الدعوة ما زالت صالحة. ألغها أولاً أو انتظر انتهاءها / This invitation is still valid. Revoke it first or wait until it expires' });
+  if (result.kind === 'recently_reissued') return respond(409, { error: 'تم إصدار رابط جديد خلال آخر دقيقة. انتظر دقيقة ثم أعد الإصدار إذا لم يظهر الرابط / A link was issued within the last minute. Wait one minute before reissuing if it is not visible' });
+  if (result.kind === 'duplicate') return respond(409, { error: 'تعذر تدوير رابط الدعوة بسبب تعارض. حدّث القائمة وحاول مرة واحدة / Invitation link rotation conflicted. Refresh the list and retry once' });
+  return respond(200, { ok: true, user: publicUser(result.employee), activationToken: activation, expiresInHours: 24, emailQueued: emailReady() });
+}
+
+function projectDevelopmentConversations(lead, conversations) {
+  if (!lead.clientId || lead.developmentReview?.allowCustomerConversation !== true) return [];
+  return conversations.filter(conversation => conversation.leadId === lead.id && conversation.clientId === lead.clientId &&
+    ['orders', 'development'].includes(conversation.department || 'orders'));
+}
+
+function visibleDevelopmentMessages(conversation) {
+  return (conversation.messages || []).filter(message => ['client', 'staff'].includes(message.senderType) &&
+    !message.internal && ['public', 'customer', undefined, null].includes(message.visibility));
+}
+
+function developmentConversationView(conversation) {
+  let index = 0;
+  return {
+    id: conversation.id, status: conversation.status,
+    messages: visibleDevelopmentMessages(conversation).map(message => ({
+      id: message.id, senderType: message.senderType, text: message.text, createdAt: message.createdAt,
+      attachments: (message.attachments || []).map(file => ({ index: index++, name: file.originalName, size: file.size }))
+    }))
+  };
+}
+
+function developmentTags(value) {
+  if (!Array.isArray(value) || value.length > 20 || value.some(item => typeof item !== 'string')) return null;
+  return [...new Set(value.map(tag => clean(tag, 60)).filter(Boolean))];
+}
+
+function developmentWorkspace(user, leads, users, payments, workload = leads) {
+  const projects = leads.filter(lead => user.role === 'admin' || developmentProjectAccessible(lead, user.id));
+  return {
+    user: developmentManagerIdentity(user),
+    projects: projects.map(lead => developmentProjectView(lead, payments)),
+    developers: users.filter(account => account.role === 'developer').map(account => developmentDeveloperView(account, workload, now().slice(0, 10))),
+    ...(user.role === 'admin' ? { managers: users.filter(account => account.role === developmentManagerRole).map(account => ({
+      id: account.id, name: account.name, username: account.username, active: account.active && !account.accountDisabledAt
+    })) } : {})
+  };
+}
+
+const developmentProfileRoute = /^\/api\/development-manager\/developers\/([^/]+)\/profile$/;
+const developmentProjectRoute = /^\/api\/development-manager\/projects\/([^/]+)(?:\/(review|assignment|delegation|conversation|files\/(\d+)|customer-files\/(\d+)|conversation\/([^/]+)\/files\/(\d+)))?$/;
+const developmentRequestFields = {
+  profile: ['specialties', 'skills', 'availability', 'professionalContact', 'notes'],
+  delegation: ['managerId', 'allowCustomerConversation', 'technicalRequirements', 'version'],
+  review: ['category', 'complexity', 'skills', 'estimateDays', 'priority', 'note', 'updateRequest', 'escalatedIssue', 'requestRevision', 'inReview', 'version'],
+  assignment: ['developerId', 'dueAt', 'note', 'reason', 'version'],
+  conversation: ['conversationId', 'message']
+};
+const validDevelopmentBody = (body, action) => body && typeof body === 'object' && !Array.isArray(body) &&
+  Object.keys(body).every(key => developmentRequestFields[action].includes(key));
+
+function developmentRequestOriginAllowed(req) {
+  if (req.headers['sec-fetch-site'] === 'cross-site') return false;
+  const origin = req.headers.origin;
+  return !origin || origin === `${requestIsSecure(req) ? 'https' : 'http'}://${String(req.headers.host || '').toLowerCase()}`;
+}
+
+async function handleDevelopmentManager(req, res, path, security, postgres = null) {
+  const respond = (status, body) => json(res, status, body, { ...security, 'Cache-Control': 'private, no-store' });
+  const workspace = req.method === 'GET' && path === '/api/development-manager';
+  const profileMatch = developmentProfileRoute.exec(path);
+  const match = developmentProjectRoute.exec(path);
+  if (!workspace && !profileMatch && !match) return respond(404, { error: 'المسار غير موجود / Route not found' });
+  const [, projectId, action = '', fileIndex, customerFileIndex, conversationId, conversationFileIndex] = match || [];
+  const allowed = profileMatch || action === 'delegation' ? ['admin'] : ['admin', developmentManagerRole];
+  const auth = postgres ? postgres.auth : requireAuth(req, res, allowed);
+  if (postgres && !directRequireAuth(req, res, auth?.user, allowed)) return;
+  if (!auth) return;
+  const { user } = auth;
+  const client = postgres?.client;
+  const data = client ? await loadDevelopmentManagement(client, {
+    user, projectId, workspace, action: profileMatch ? 'profile' : action, write: req.method !== 'GET'
+  }) : store;
+  const { leads, users, payments, conversations, workload = leads } = data;
+  const audits = [];
+  const notifications = [];
+  const recordAudit = (event, target, detail = '') => {
+    if (!client) return audit(user, event, target, detail);
+    audits.push({ id: id('evt'), at: now(), actor: user.username, actorId: user.id, role: user.role, action: event, target, detail: clean(detail, 1600) });
+  };
+  const recordNotification = (userId, eventKey, copy, options) => {
+    if (!userId) return;
+    if (!client) return notifyUser(userId, eventKey, copy, options);
+    notifications.push({
+      id: `ntf_${hash(`${userId}:${eventKey}`).slice(0, 40)}`, userId, eventKey, ...copy,
+      descriptionAr: clean(copy.descriptionAr, 320), descriptionEn: clean(copy.descriptionEn, 320),
+      createdAt: now(), readAt: '', target: { tab: options.tab, id: options.targetId, kind: options.targetKind }
+    });
+  };
+  const notifyDevelopmentUser = (userId, lead, key, titleAr, titleEn, descriptionAr, descriptionEn, tab) =>
+    recordNotification(userId, `development-manager:${lead.id}:${key}`, { type: 'project', importance: 'high', titleAr, titleEn, descriptionAr, descriptionEn },
+      { tab, targetId: lead.id, targetKind: 'lead' });
+
+  if (workspace) return respond(200, developmentWorkspace(user, leads, users, payments, workload));
+
+  if (profileMatch && req.method === 'PATCH') {
+    const developer = users.find(account => account.role === 'developer' && account.id === profileMatch[1]);
+    if (!developer) return respond(404, { error: 'المبرمج غير موجود / Developer not found' });
+    const body = postgres ? postgres.body : await jsonBody(req, 32_768);
+    if (!validDevelopmentBody(body, 'profile')) return respond(400, { error: 'حقول الملف المهني غير صالحة / Invalid professional profile fields' });
+    const profile = { ...developer.developmentProfile };
+    for (const field of ['specialties', 'skills']) {
+      if (body[field] === undefined) continue;
+      const tags = developmentTags(body[field]);
+      if (!tags) return respond(400, { error: 'أدخل قائمة مهارات وتخصصات صالحة / Enter a valid skills and specialties list' });
+      profile[field] = tags;
+    }
+    if (body.availability !== undefined) {
+      if (!['', 'available', 'busy', 'unavailable'].includes(body.availability)) return respond(400, { error: 'حالة التوفر غير صالحة / Invalid availability' });
+      profile.availability = body.availability;
+    }
+    if (body.professionalContact !== undefined) profile.professionalContact = clean(body.professionalContact, 200);
+    if (body.notes !== undefined) profile.notes = clean(body.notes, 1000);
+    developer.developmentProfile = profile;
+    recordAudit('development_profile_updated', developer.id);
+    if (client) {
+      await saveDevelopmentProfile(client, developer, now());
+      await saveDevelopmentEvents(client, audits, notifications);
+    } else await persist();
+    return respond(200, { developer: developmentDeveloperView(developer, workload, now().slice(0, 10)) });
+  }
+
+  if (!match) return respond(405, { error: 'الإجراء غير مدعوم / Unsupported action' });
+  const lead = leads.find(project => project.id === projectId);
+  if (!lead || (user.role !== 'admin' && !developmentProjectAccessible(lead, user.id))) {
+    return respond(404, { error: 'المشروع غير موجود ضمن نطاقك / Project not found in your scope' });
+  }
+
+  if (req.method === 'GET') {
+    if (!action) return respond(200, { project: developmentProjectView(lead, payments) });
+    if (action === 'conversation') {
+      if (lead.developmentReview?.allowCustomerConversation !== true) return respond(403, { error: 'يجب أن يفوّض المالك هذه المحادثة / The Owner must authorize this conversation' });
+      return respond(200, { conversations: projectDevelopmentConversations(lead, conversations).map(developmentConversationView) });
+    }
+    let file;
+    if (fileIndex !== undefined) file = lead.developerAttachments?.[Number(fileIndex)];
+    if (customerFileIndex !== undefined && lead.developmentReview?.allowCustomerConversation === true) file = lead.attachments?.[Number(customerFileIndex)];
+    if (conversationFileIndex !== undefined) {
+      const conversation = projectDevelopmentConversations(lead, conversations).find(row => row.id === conversationId);
+      if (conversation) file = visibleDevelopmentMessages(conversation).flatMap(message => message.attachments || [])[Number(conversationFileIndex)];
+    }
+    if (file) return serveUpload(res, file, security);
+    return respond(404, { error: 'الملف غير موجود ضمن نطاقك / File not found in your scope' });
+  }
+
+  const requestMethod = { review: 'PATCH', assignment: 'POST', delegation: 'PATCH', conversation: 'POST' }[action];
+  if (req.method !== requestMethod) return respond(405, { error: 'الإجراء غير مدعوم / Unsupported action' });
+  const body = postgres ? postgres.body : await jsonBody(req, 32_768);
+  if (!validDevelopmentBody(body, action)) return respond(400, { error: 'الحقول المرسلة غير متاحة لهذا الإجراء / These fields are not allowed for this action' });
+  const at = now();
+  if (action === 'conversation') {
+    const scoped = projectDevelopmentConversations(lead, conversations);
+    const conversation = scoped.find(row => row.id === body.conversationId);
+    if (!conversation) return respond(404, { error: 'لم يفوّض المالك هذه المحادثة / The Owner has not authorized this conversation' });
+    if (conversation.status === 'closed') return respond(409, { error: 'المحادثة مغلقة / The conversation is closed' });
+    const messageText = cleanConversationMessage(body.message);
+    if (!messageText) return respond(400, { error: 'أدخل رسالة صحيحة / Enter a valid message' });
+    const message = appendConversationMessage(conversation, { senderType: 'staff', senderId: user.id, text: messageText });
+    if (conversation.status === 'waiting_customer') conversation.status = 'in_progress';
+    recordAudit('development_customer_message_sent', lead.id, message.id);
+    recordNotification(conversation.clientId, `conversation:${conversation.id}:message:${message.id}`, {
+      type: 'inquiry', importance: 'normal', titleAr: 'رد فريق ZEZO على محادثتك', titleEn: 'ZEZO replied to your conversation',
+      descriptionAr: 'افتح المحادثة لمتابعة الرد.', descriptionEn: 'Open the conversation to read the reply.'
+    }, { tab: 'conversations', targetId: conversation.id, targetKind: 'conversation' });
+    if (client) {
+      await saveDevelopmentMessage(client, conversation, message);
+      await saveDevelopmentEvents(client, audits, notifications);
+    } else await persist();
+    return respond(201, { conversation: developmentConversationView(conversation) });
+  }
+
+  const priorReview = lead.developmentReview || {};
+  const version = Number(priorReview.version || 0);
+  if (!Number.isSafeInteger(body.version) || body.version !== version) {
+    return respond(409, { error: 'تغيّر المشروع منذ فتحه. حدّث البيانات قبل إعادة المحاولة / The project changed. Refresh it before retrying' });
+  }
+  const review = { ...priorReview, version: version + 1 };
+  let previousDeveloperId = null;
+  let revisionRequested = false;
+  if (action === 'delegation') {
+    const managerId = clean(body.managerId, 100);
+    const manager = users.find(account => account.id === managerId && account.role === developmentManagerRole && account.active && !account.accountDisabledAt);
+    if (managerId && !manager) return respond(400, { error: 'اختر مسؤول مبرمجين نشطاً / Select an active Development Manager' });
+    if (body.allowCustomerConversation !== undefined && typeof body.allowCustomerConversation !== 'boolean') return respond(400, { error: 'تفويض محادثة غير صالح / Invalid conversation permission' });
+    if (body.allowCustomerConversation && !manager) return respond(400, { error: 'حدّد المسؤول قبل تفويض محادثة العميل / Select the manager before authorizing customer contact' });
+    review.managerId = manager?.id || null;
+    review.allowCustomerConversation = Boolean(manager && body.allowCustomerConversation);
+    if (body.technicalRequirements !== undefined) lead.technicalRequirements = clean(body.technicalRequirements, 6000);
+    recordAudit('development_project_delegated', lead.id, JSON.stringify({ previousManagerId: priorReview.managerId || null, managerId: review.managerId, allowCustomerConversation: review.allowCustomerConversation }));
+    if (manager && (manager.id !== priorReview.managerId || review.allowCustomerConversation !== priorReview.allowCustomerConversation)) {
+      notifyDevelopmentUser(manager.id, lead, `delegated:${review.version}`, 'فُوّضت بإدارة مشروع تقني', 'A technical project was delegated to you', 'افتح قسم المشاريع لمراجعة التفاصيل التقنية.', 'Open your projects to review the technical details.', 'technical-requests');
+    }
+  }
+
+  if (action === 'review') {
+    const note = clean(body.note, 1000);
+    const updateRequest = clean(body.updateRequest, 1000);
+    const escalatedIssue = clean(body.escalatedIssue, 1000);
+    const revision = clean(body.requestRevision, 1000);
+    if ((updateRequest || revision) && !lead.developerUserId) return respond(409, { error: 'أسند المشروع إلى مبرمج أولاً / Assign the project to a developer first' });
+    if (revision && (developmentStage(lead) !== 'technical_review' || lead.developerTaskStatus !== 'review_requested')) {
+      return respond(409, { error: 'لا توجد تسليمات تقنية تنتظر المراجعة / No technical delivery is awaiting review' });
+    }
+    if (body.category !== undefined) review.category = clean(body.category, 100);
+    if (body.complexity !== undefined) {
+      if (!['', 'low', 'medium', 'high'].includes(body.complexity)) return respond(400, { error: 'اختر مستوى تعقيد صالحاً / Select a valid complexity level' });
+      review.complexity = body.complexity;
+    }
+    if (body.priority !== undefined) {
+      if (!['', 'low', 'normal', 'medium', 'high', 'urgent'].includes(body.priority)) return respond(400, { error: 'اختر أولوية صالحة / Select a valid priority' });
+      review.priority = body.priority;
+    }
+    if (body.skills !== undefined) {
+      const skills = developmentTags(body.skills);
+      if (!skills) return respond(400, { error: 'أدخل قائمة مهارات صالحة / Enter a valid skills list' });
+      review.skills = skills;
+    }
+    if (body.estimateDays !== undefined) {
+      const days = body.estimateDays;
+      if (days !== null && (!Number.isSafeInteger(days) || days < 1 || days > 3650)) return respond(400, { error: 'أدخل مدة صحيحة بالأيام / Enter a valid duration in days' });
+      review.estimateDays = days;
+    }
+    if (body.inReview !== undefined && typeof body.inReview !== 'boolean') return respond(400, { error: 'حالة المراجعة غير صالحة / Invalid review state' });
+    if (body.inReview !== undefined) review.inReview = body.inReview;
+    review.reviewedAt = at;
+    review.reviewedBy = user.name || user.username;
+    const entries = [[note, 'note'], [updateRequest, 'update_request'], [escalatedIssue, 'owner_escalation'], [revision, 'revision']]
+      .filter(([value]) => value).map(([value, kind]) => ({ id: id('devnote'), kind, text: value, author: user.name || user.username, at }));
+    review.notes = [...entries, ...(priorReview.notes || [])];
+    if (revision) {
+      revisionRequested = true;
+      lead.developerTaskStatus = 'revision_requested';
+      lead.developerTaskNote = clean(revision, 500);
+      lead.developerUpdatedAt = at;
+      setProjectStage(lead, 'needs_revisions', { ...user, role: developmentManagerRole }, revision);
+    }
+    if (updateRequest || revision) {
+      notifyDevelopmentUser(lead.developerUserId, lead, `review:${review.version}`, revision ? 'ملاحظات على التسليم التقني' : 'طُلب تحديث تقني', revision ? 'Technical delivery revisions requested' : 'Technical update requested', clean([revision, updateRequest].filter(Boolean).join('\n'), 500), clean([revision, updateRequest].filter(Boolean).join('\n'), 500), 'development');
+    }
+    if (escalatedIssue) {
+      for (const owner of users.filter(account => account.active && !account.accountDisabledAt && account.role === 'admin' && account.id !== user.id)) {
+        notifyDevelopmentUser(owner.id, lead, `escalated:${review.version}`, 'مشكلة تقنية تتطلب مراجعة المالك', 'A technical issue needs Owner review', escalatedIssue, escalatedIssue, 'requests');
+      }
+    }
+    recordAudit(revision ? 'development_revision_requested' : 'development_review_updated', lead.id, entries.map(entry => entry.kind).join(', '));
+  }
+
+  if (action === 'assignment') {
+    const developerId = clean(body.developerId, 100);
+    const developer = users.find(account => account.id === developerId && account.role === 'developer' && account.active && !account.accountDisabledAt && account.developmentProfile?.availability !== 'unavailable');
+    if (!developer) return respond(400, { error: 'اختر مبرمجاً نشطاً ومتاحاً / Select an active, available developer' });
+    if (lead.developerUserId === developer.id) return respond(409, { error: 'المشروع مسند إلى هذا المبرمج بالفعل / The project is already assigned to this developer' });
+    if (!developmentAssignmentAllowed(lead, payments)) return respond(409, { error: 'تتطلب حالة المشروع مراجعة المالك قبل تغيير الإسناد / The project requires Owner review before assignment changes' });
+    const dueAt = body.dueAt ?? '';
+    if (typeof dueAt !== 'string' || (dueAt && (!/^\d{4}-\d{2}-\d{2}$/.test(dueAt) || !Number.isFinite(Date.parse(dueAt)) || new Date(dueAt).toISOString().slice(0, 10) !== dueAt))) {
+      return respond(400, { error: 'أدخل موعد تسليم صحيحاً / Enter a valid delivery date' });
+    }
+    const previousId = lead.developerUserId || null;
+    previousDeveloperId = previousId;
+    const previous = users.find(account => account.id === previousId);
+    const reason = clean(body.reason, 500);
+    const note = clean(body.note, 500);
+    if (previousId && !reason) return respond(400, { error: 'أدخل سبب إعادة الإسناد / Enter a reason for reassignment' });
+    const history = { fromDeveloperId: previousId, fromDeveloperName: previous?.name || '', developerId: developer.id, developerName: developer.name || '', reason, note, dueAt, actor: user.name || user.username, at };
+    review.assignmentHistory = [history, ...(priorReview.assignmentHistory || [])];
+    lead.developerUserId = developer.id;
+    lead.developerDueDate = dueAt;
+    lead.developerTaskNote = note;
+    lead.developerTaskStatus = 'offered';
+    lead.developerAssignedAt = at;
+    lead.developerRespondedAt = null;
+    lead.developerDeclinedAt = null;
+    setProjectStage(lead, 'waiting_developer_acceptance', { ...user, role: developmentManagerRole }, 'Developer assignment sent.');
+    recordAudit(previousId ? 'development_project_reassigned' : 'development_project_assigned', lead.id, JSON.stringify(history));
+    notifyDevelopmentUser(developer.id, lead, `assigned:${review.version}`, 'أُسند إليك مشروع جديد', 'A new project was assigned to you', 'راجع المهمة واقبلها أو اعتذر عنها.', 'Review the assignment and accept it or decline.', 'development');
+    if (previousId) notifyDevelopmentUser(previousId, lead, `reassigned:${review.version}`, 'أُعيد إسناد مشروع سابق', 'A previous project was reassigned', 'راجع إشعارات العمل بشأن هذا المشروع.', 'Check the project updates for details.', 'development');
+  }
+
+  lead.developmentReview = review;
+  lead.updatedAt = at;
+  if (client) {
+    await saveDevelopmentProject(client, lead, { action, previousDeveloperId, revision: revisionRequested, commissionRate: developerCommissionRate });
+    await saveDevelopmentEvents(client, audits, notifications);
+  } else await persist();
+  return respond(200, { project: developmentProjectView(lead, payments) });
+}
+
+async function handlePostgresDevelopmentManager(req, res, path) {
+  if (!stagingAuthorized(req)) return handleRequest(req, res);
+  const security = responseSecurityHeaders();
+  const work = (client, target, body) => directPostgresSessionUser(req)
+    .then(auth => handleDevelopmentManager(req, target, path, security, { client, auth, body }));
+  if (req.method === 'GET') return withPostgresReadTransaction(client => work(client, res));
+  if (!['POST', 'PATCH'].includes(req.method)) return json(res, 405, { error: 'الإجراء غير مدعوم / Unsupported action' }, security);
+  if (!developmentRequestOriginAllowed(req)) return json(res, 403, { error: 'هذا الطلب يجب أن يأتي من الموقع نفسه / This request must originate from the same site' }, security);
+  const project = developmentProjectRoute.exec(path);
+  const profile = developmentProfileRoute.test(path);
+  if (!project && !profile) return json(res, 404, { error: 'المسار غير موجود / Route not found' }, security);
+  const auth = await directPostgresSessionUser(req);
+  const allowed = profile || project?.[2] === 'delegation' ? ['admin'] : ['admin', developmentManagerRole];
+  if (!directRequireAuth(req, res, auth?.user, allowed)) return;
+  const response = { writeHead(status, headers) { this.status = status; this.headers = headers; }, end(body) { this.body = body; } };
+  const body = await jsonBody(req, 32_768);
+  await withPostgresTransaction(client => work(client, response, body));
+  res.writeHead(response.status, response.headers);
+  return res.end(response.body);
+}
+
+function feedbackPage(url) {
+  const boundedNumber = (name, fallback, max) => {
+    const value = url.searchParams.get(name);
+    return /^\d{1,5}$/.test(value || '') ? Math.min(Number(value), max) : fallback;
+  };
+  return { limit: Math.max(1, boundedNumber('limit', 12, 40)), offset: boundedNumber('offset', 0, 10000) };
+}
+
+function feedbackText(value, min, max) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  return text.length >= min && text.length <= max && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text) ? text : null;
+}
+
+const projectReviewStatus = ['pending', 'published', 'hidden'];
+
+async function handlePlatformFeedback(req, res, path) {
+  const customerReview = /^\/api\/client\/project-reviews\/([A-Za-z0-9_-]{1,96})$/.exec(path);
+  const moderateReview = /^\/api\/admin\/project-reviews\/([A-Za-z0-9_-]{1,96})$/.exec(path);
+  const publicReviews = path === '/api/reviews';
+  const moderationList = path === '/api/admin/project-reviews';
+  const contact = path === '/api/contact';
+  if (!publicReviews && !moderationList && !contact && !customerReview && !moderateReview) return false;
+
+  const respond = (status, data, extraHeaders = {}) => {
+    json(res, status, data, { ...responseSecurityHeaders(), ...extraHeaders });
+    return true;
+  };
+  const failure = (status, error) => respond(status, { error });
+  if (!stagingAuthorized(req)) return failure(401, 'دخول بيئة الاختبار مطلوب / Staging authentication required');
+  if (!postgresConfigured()) return failure(503, 'الخدمة غير متاحة مؤقتاً / This service is temporarily unavailable');
+
+  const allowed = customerReview ? ['GET', 'POST'] : contact ? ['POST'] : moderateReview ? ['PATCH'] : ['GET'];
+  if (!allowed.includes(req.method)) return respond(405, { error: 'عملية غير متاحة / Method not allowed' }, { Allow: allowed.join(', ') });
+  const isWrite = req.method !== 'GET';
+  if (isWrite && (!referralRequestHasSameOrigin(req) || !/^application\/json(?:\s*;|$)/i.test(String(req.headers['content-type'] || '')))) {
+    return failure(403, 'تعذر التحقق من مصدر الطلب / The request source could not be verified');
+  }
+
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  try {
+    if (publicReviews) return respond(200, await listPublishedProjectReviews({ ...feedbackPage(url), sort: url.searchParams.get('sort') }));
+
+    const auth = await directPostgresSessionUser(req);
+    if (!directRequireAuth(req, res, auth?.user, moderationList || moderateReview ? ['admin'] : ['client'])) return true;
+    if (auth.user.accountDisabledAt) return failure(403, 'هذا الحساب غير متاح / This account is disabled');
+    if (moderationList) {
+      const status = url.searchParams.get('status');
+      return respond(200, await listProjectReviewsForModeration({ ...feedbackPage(url), status: projectReviewStatus.includes(status) ? status : null }));
+    }
+    if (customerReview && !isWrite) {
+      const review = await loadCustomerProjectReview(customerReview[1], auth.user.id);
+      return review ? respond(200, review) : failure(404, 'المشروع غير متاح / Project not available');
+    }
+
+    const key = sessionKey(auth.sid);
+    const body = await jsonBody(req, 12_000);
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return failure(400, 'صيغة البيانات غير صالحة / Invalid request data');
+    if (contact) {
+      const message = feedbackText(body.message, 10, 2000);
+      const requestKey = req.headers['idempotency-key'];
+      if (!message || body.website || typeof requestKey !== 'string' || !/^[a-zA-Z0-9_-]{32,120}$/.test(requestKey)) {
+        return failure(400, 'أدخل رسالة بين 10 و2000 حرف وحاول مجدداً / Enter a message of 10–2,000 characters and try again');
+      }
+      const ip = req.socket?.remoteAddress || 'unknown';
+      if (!await consumeRateLimitBucket('contact-enquiry-client', auth.user.id, 8, 60 * 60_000) ||
+          !await consumeRateLimitBucket('contact-enquiry-ip', ip, 25, 60 * 60_000)) {
+        return failure(429, 'بلغت الحد المؤقت للاستفسارات. حاول لاحقاً / Enquiry limit reached. Try again later');
+      }
+      const referral = await resolvePostgresReferralForConversation(auth.user);
+      const createdAt = now();
+      const conversation = {
+        id: `chat_${hash(`contact:${auth.user.id}:${requestKey}`).slice(0, 40)}`,
+        createdAt, updatedAt: createdAt, templateId: null, templateName: '', templateService: '', templateCategory: '',
+        source: 'contact', department: 'orders', status: 'new', clientId: auth.user.id, assignedUserId: null,
+        guestSessionHash: null, leadId: null, messages: [],
+        referralCode: referral?.code || '', referralLinkId: referral?.linkId || null, referralUserId: referral?.userId || null
+      };
+      const result = await createPostgresConversation({
+        conversation, message, actor: auth.user, guestHash: '', idempotencyHash: hash(`contact:${requestKey}:${message}`),
+        auditId: id('evt'), messageId: id('msg'), at: createdAt, referral, authorizeRecipient: canReceiveConversationNotification,
+        sessionHash: key
+      });
+      if (result.kind === 'unauthorized') return failure(401, 'انتهت الجلسة. سجّل الدخول / Your session has ended. Sign in again');
+      if (result.kind === 'conflict') return failure(409, 'تغيّر محتوى طلب سبق إرساله. حدّث الصفحة وحاول مجدداً / An existing enquiry has different content. Refresh and try again');
+      return respond(result.kind === 'duplicate' ? 200 : 201, { ok: true, id: conversation.id });
+    }
+
+    let result;
+    if (customerReview) {
+      const review = feedbackText(body.body, 8, 1200);
+      if (!review || !Number.isInteger(body.rating) || body.rating < 1 || body.rating > 5) {
+        return failure(400, 'اختر تقييماً من 1 إلى 5 واكتب من 8 إلى 1200 حرف / Choose 1–5 stars and write 8–1,200 characters');
+      }
+      result = await submitProjectReview({ sessionHash: key, actorId: auth.user.id, projectId: customerReview[1], rating: body.rating, body: review });
+    } else {
+      const hasReply = Object.hasOwn(body, 'reply');
+      const reply = hasReply ? feedbackText(body.reply, 0, 1200) : undefined;
+      const hasStatus = Object.hasOwn(body, 'status');
+      if (hasStatus === hasReply || (hasReply && reply === null) || (hasStatus && !['published', 'hidden'].includes(body.status))) {
+        return failure(400, 'إجراء المراجعة غير صالح / Invalid moderation action');
+      }
+      result = await moderateProjectReview({ sessionHash: key, actorId: auth.user.id, projectId: moderateReview[1], status: body.status, reply });
+    }
+    if (result.kind === 'unauthorized') return failure(401, 'انتهت الجلسة. سجّل الدخول / Your session has ended. Sign in again');
+    if (result.kind === 'missing') return failure(404, 'المشروع أو التقييم غير متاح / Project or review not available');
+    if (result.kind === 'ineligible') return failure(409, 'التقييم متاح بعد إكمال المشروع وتسليمه. الرد متاح بعد النشر / Only completed, delivered projects can be reviewed. Publish before replying');
+    return respond(result.kind === 'created' ? 201 : 200, { review: result.review });
+  } catch (error) {
+    if (error.status === 400 || error.status === 413) return failure(error.status, error.message);
+    if (['55P03', '40P01', '40001'].includes(error.code)) return failure(503, 'الخدمة مشغولة الآن. حاول بعد لحظات / The service is busy. Please try again in a moment');
+    throw error;
   }
 }
 
 async function handle(req, res) {
+  const path = new URL(req.url, `http://localhost:${PORT}`).pathname;
+  if (await handlePlatformFeedback(req, res, path)) return;
+  if (!postgresConfigured()) return handleRequest(req, res);
+  if (path === '/api/development-manager' || path.startsWith('/api/development-manager/')) return handlePostgresDevelopmentManager(req, res, path);
+  // Public Owner setup is permanently closed. The first Owner is provisioned
+  // only by scripts/provision-owner.mjs with direct administrative DB access.
+  if (req.method === 'POST' && path === '/api/setup') return handleRequest(req, res);
+  if (req.method === 'POST' && path === '/api/marketer/withdrawals') {
+    if (!stagingAuthorized(req)) return handleRequest(req, res);
+    const security = responseSecurityHeaders();
+    const auth = await directPostgresSessionUser(req);
+    if (!auth) return json(res, 401, { error: 'سجّل الدخول للمتابعة / Please sign in to continue' }, security);
+    if (auth.user.mustChangePassword) return json(res, 428, { error: 'غيّر كلمة المرور المؤقتة أولاً / Change the temporary password first', mustChangePassword: true }, security);
+    if (!['marketer', 'developer'].includes(auth.user.role)) return json(res, 403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }, security);
+    const body = await jsonBody(req);
+    const result = await createPostgresWithdrawalRequest({ sessionHash: sessionKey(auth.sid), body });
+    if (result.error) return json(res, result.status, { error: result.error, ...(result.mustChangePassword ? { mustChangePassword: true } : {}) }, security);
+    return json(res, result.status, { withdrawal: result.withdrawal }, security);
+  }
+  // Health checks disclose no store data or mutable state. Keep them outside the
+  // compatibility-store transaction so probes do not queue behind business writes.
+  if (req.method === 'GET' && path === '/api/health') return handleRequest(req, res);
+  const referralHandled = await handlePostgresReferral(req, res, path);
+  if (referralHandled) return;
+  if (req.method === 'GET' && path === '/api/public') {
+    // Preserve the legacy staging response without loading data when the gate is closed.
+    if (!stagingAuthorized(req)) return handleRequest(req, res);
+    const snapshot = await loadPublicRuntimeSnapshot(referralMonth());
+    // Monthly referral rollover remains on the established write path, which
+    // serializes the related account/link mutations until they get their own repository.
+    if (!snapshot.referral_rollover_required) return handlePublicRuntimeConfig(req, res, snapshot);
+  }
+  if (req.method === 'GET' && path === '/api/track') {
+    if (!stagingAuthorized(req)) return handleRequest(req, res);
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const trackToken = clean(url.searchParams.get('token'), 120);
+    const lead = await loadPublicTrackRecord(hash(trackToken));
+    if (!lead) return json(res, 404, { error: 'رابط التتبع غير صالح أو منتهي / Tracking link is invalid or expired' }, responseSecurityHeaders());
+    const lang = url.searchParams.get('lang') === 'en' ? 'en' : 'ar';
+    return json(res, 200, { createdAt: lead.createdAt, service: lead.service, status: lead.status, statusText: publicStatusLabels[lead.status]?.[lang] || publicStatusLabels.new[lang], note: lead.publicStatusNote || '' }, responseSecurityHeaders());
+  }
+  if (await handlePostgresEmployeeActivation(req, res, path)) return;
+  const projectRequestHandled = await handlePostgresProjectRequest(req, res, path);
+  if (projectRequestHandled) return;
+  const normalizedReadHandled = process.env.ZEZO_BENCH_LEGACY_CORE_READS === 'true'
+    ? false
+    : await handlePostgresCoreRead(req, res, path);
+  if (normalizedReadHandled) return;
+  const invitationWriteHandled = await handlePostgresInvitationWrite(req, res, path);
+  if (invitationWriteHandled) return;
+  const normalizedWriteHandled = await handlePostgresCoreWrite(req, res, path);
+  if (normalizedWriteHandled) return;
+  if (!path.startsWith('/api/')) {
+    return withPostgresTransaction(async client => {
+      await loadPostgresStore(client);
+      const referralLinksCreated = ensureMonthlyReferralLinks();
+      if (referralLinksCreated) await persistPostgresStore(client);
+      return handleRequest(req, res);
+    });
+  }
+  const publicLegacyRoute = ['/api/public', '/api/quote', '/api/referral-inquiries', '/api/crm/inquiries'].includes(path);
+  if (!publicLegacyRoute && !canUseDevelopmentManagerRoute(path) && stagingAuthorized(req) && cookieValue(req, 'zezo_session')) {
+    const auth = await directPostgresSessionUser(req);
+    if (auth?.user.role === developmentManagerRole) {
+      return json(res, 403, { error: 'ليس لديك صلاحية لهذه العملية / Not permitted' }, responseSecurityHeaders());
+    }
+  }
+
+  const buffered = new Writable({ write(chunk, _encoding, callback) { chunks.push(Buffer.from(chunk)); callback(); } });
+  const chunks = [];
+  buffered.statusCode = 200;
+  buffered.headersSent = false;
+  buffered.responseHeaders = {};
+  buffered.writeHead = function writeHead(status, headers = {}) {
+    this.statusCode = status;
+    this.responseHeaders = headers;
+    this.headersSent = true;
+    return this;
+  };
+  const finished = new Promise((resolve, reject) => {
+    buffered.once('finish', resolve);
+    buffered.once('error', reject);
+  });
+  await withPostgresTransaction(async client => {
+    await loadPostgresStore(client);
+    const paymentBaseline = req.method === 'POST' && path === '/api/admin/payment' ? capturePaymentStoreBaseline(store) : null;
+    ensureMonthlyReferralLinks();
+    await handleRequest(req, buffered);
+    if (!buffered.writableFinished) await finished;
+    // Keep the financial lock and existing rules, and commit payments, derived
+    // movements and queued mail together without rewriting unrelated rows.
+    if (paymentBaseline) await persistNormalizedStore(client, store, { paymentBaseline });
+    else await persistPostgresStore(client);
+  });
+  res.writeHead(buffered.statusCode, buffered.responseHeaders);
+  return res.end(Buffer.concat(chunks));
+}
+
+async function handleRequest(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const path = decodeURIComponent(url.pathname);
-  const security = {
-    'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'strict-origin-when-cross-origin',
-    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
-    'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
-  };
-  if (STAGING_MODE) security['X-Robots-Tag'] = 'noindex, nofollow, noarchive, nosnippet';
+  const security = responseSecurityHeaders();
   if (STAGING_MODE && path === '/robots.txt') {
     res.writeHead(200, { ...security, 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
     return res.end('User-agent: *\nDisallow: /\n');
   }
   if (STAGING_MODE && req.method === 'POST' && path === '/__staging/login') {
     const attemptKey = req.socket.remoteAddress || 'unknown';
-    if (!rateAllowedFor(stagingLoginAttempts, attemptKey, 12, 15 * 60_000)) {
+    if (!await rateAllowedFor(stagingLoginAttempts, attemptKey, 12, 15 * 60_000)) {
       res.writeHead(429, { ...security, 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Retry-After': '900' });
       return res.end(stagingLoginPage('محاولات كثيرة. انتظر قليلاً ثم حاول مجدداً.'));
     }
@@ -1206,21 +3443,17 @@ async function handle(req, res) {
       return res.end(stagingLoginPage('تعذر قراءة كلمة المرور. حاول مرة أخرى.'));
     }
     const submittedPassword = new URLSearchParams(raw.toString('utf8')).get('password') || '';
-    const submittedHash = createHash('sha256').update(submittedPassword).digest();
-    if (!timingSafeEqual(submittedHash, STAGING_ACCESS_PASSWORD_HASH)) {
+    if (!stagingPasswordMatches(submittedPassword)) {
       res.writeHead(401, { ...security, 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
       return res.end(stagingLoginPage('كلمة المرور غير صحيحة.'));
     }
-    const sessionId = randomBytes(32).toString('base64url');
-    const maxAge = 12 * 60 * 60;
-    stagingSessions.set(sessionId, { expiresAt: Date.now() + maxAge * 1000 });
-    const accessCookie = 'zezo_staging_access=' + sessionId + '; Path=/; Max-Age=' + maxAge + '; HttpOnly; SameSite=Strict' + (requestIsSecure(req) ? '; Secure' : '');
+    const sessionId = createStagingSession();
+    const accessCookie = STAGING_ACCESS_COOKIE + '=' + encodeURIComponent(sessionId) + '; Path=/; Max-Age=' + STAGING_SESSION_TTL_SECONDS + '; HttpOnly; SameSite=Strict' + (requestIsSecure(req) ? '; Secure' : '');
     res.writeHead(303, { ...security, Location: '/', 'Set-Cookie': accessCookie, 'Cache-Control': 'no-store' });
     return res.end();
   }
   if (STAGING_MODE && path === '/__staging/logout') {
-    stagingSessions.delete(cookieValue(req, 'zezo_staging_access'));
-    const clearCookie = 'zezo_staging_access=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict' + (requestIsSecure(req) ? '; Secure' : '');
+    const clearCookie = STAGING_ACCESS_COOKIE + '=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict' + (requestIsSecure(req) ? '; Secure' : '');
     res.writeHead(303, { ...security, Location: '/', 'Set-Cookie': clearCookie, 'Cache-Control': 'no-store' });
     return res.end();
   }
@@ -1233,26 +3466,32 @@ async function handle(req, res) {
     res.writeHead(401, { ...security, 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
     return res.end('ZEZO Forge staging access required.');
   }
+  if (req.method === 'POST' && path === '/api/setup') {
+    return json(res, 410, { error: 'إنشاء المالك متاح فقط من أداة الإدارة الخاصة وعلى قاعدة PostgreSQL / Owner creation is available only through the private administrative CLI against PostgreSQL' }, security);
+  }
   if (path.startsWith('/api/')) {
-    if (req.method === 'GET' && path === '/api/health') return json(res, 200, { ok: true, app: 'ZEZO', storage: 'local-json', staging: STAGING_MODE }, security);
+    if (req.method === 'GET' && path === '/api/health') return json(res, 200, { ok: true, app: 'ZEZO', storage: postgresConfigured() ? 'postgresql' : 'local-json', staging: STAGING_MODE }, security);
     if (req.method === 'GET' && path === '/api/public') {
       const legacyPhone = process.env.ZEZO_WHATSAPP_NUMBER;
       const customerSupportPhone = STAGING_MODE ? '' : normalizeWhatsAppNumber(process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP !== undefined ? process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP : legacyPhone);
       const ordersPhone = STAGING_MODE ? '' : normalizeWhatsAppNumber(process.env.ZEZO_ORDERS_WHATSAPP !== undefined ? process.env.ZEZO_ORDERS_WHATSAPP : legacyPhone);
       const ordersUrl = buildWhatsAppUrl(ordersPhone);
-      return json(res, 200, { prices: store.settings.prices.filter(price=>price.active!==false), templatePrices: store.settings.templatePrices || {}, templateInclusions:store.settings.templateInclusions||{}, templateActive:store.settings.templateActive||{}, commissionConfigured: store.settings.commissionPercent != null, customerSupportWhatsappNumber:customerSupportPhone, ordersWhatsappNumber:ordersPhone, customerSupportWhatsappUrl:buildWhatsAppUrl(customerSupportPhone), ordersWhatsappUrl:ordersUrl, whatsappUrl:ordersUrl, emailReady: emailReady() && adminEmailReady(), aiQuoteReady:!STAGING_MODE&&Boolean(process.env.OPENAI_API_KEY&&process.env.OPENAI_MODEL), adminSetupAvailable:firstAdminSetupAvailable(), stagingMode:STAGING_MODE }, security);
+      return json(res, 200, { prices: store.settings.prices.filter(price=>price.active!==false), templatePrices: store.settings.templatePrices || {}, templateInclusions:store.settings.templateInclusions||{}, templateActive:store.settings.templateActive||{}, commissionConfigured: store.settings.commissionPercent != null, customerSupportWhatsappNumber:customerSupportPhone, ordersWhatsappNumber:ordersPhone, customerSupportWhatsappUrl:buildWhatsAppUrl(customerSupportPhone), ordersWhatsappUrl:ordersUrl, whatsappUrl:ordersUrl, emailReady: emailReady() && adminEmailReady(), aiQuoteReady:!STAGING_MODE&&Boolean(process.env.OPENAI_API_KEY&&process.env.OPENAI_MODEL), stagingMode:STAGING_MODE }, security);
+    }
+    if (path === '/api/development-manager' || path.startsWith('/api/development-manager/')) {
+      if (req.method !== 'GET' && !developmentRequestOriginAllowed(req)) return json(res, 403, { error: 'هذا الطلب يجب أن يأتي من الموقع نفسه / This request must originate from the same site' }, security);
+      return handleDevelopmentManager(req, res, path, security);
     }
     if(req.method==='POST'&&path==='/api/conversations'){
-      if(!rateAllowedFor(conversationAttempts,`create:${req.socket.remoteAddress||'unknown'}`,15,60*60_000))return json(res,429,{error:'وصلنا الحد المؤقت للمحادثات. حاول لاحقاً / Conversation limit reached. Try again later.'},security);
-      let b={},file=null;if((req.headers['content-type']||'').toLowerCase().startsWith('multipart/form-data')){const parsed=parseMultipart(await bodyBuffer(req),req.headers['content-type']);b=parsed.fields;file=parsed.file;}else b=await jsonBody(req);const templateId=clean(b.templateId,80),template=templateById.get(templateId),message=clean(b.message,2000),auth=sessionUser(req);
-      if(auth&&auth.user.role!=='client')return json(res,403,{error:'إنشاء محادثة قالب متاح للعميل فقط / Template conversations are for customers'},security);
+      const auth=requireAuth(req,res,['client']);if(!auth)return;
+      if(!await rateAllowedFor(conversationAttempts,`create:${req.socket.remoteAddress||'unknown'}`,15,60*60_000))return json(res,429,{error:'وصلنا الحد المؤقت للمحادثات. حاول لاحقاً / Conversation limit reached. Try again later.'},security);
+      let b={},file=null;if((req.headers['content-type']||'').toLowerCase().startsWith('multipart/form-data')){const parsed=parseMultipart(await bodyBuffer(req),req.headers['content-type']);b=parsed.fields;file=parsed.file;}else b=await jsonBody(req);const templateId=clean(b.templateId,80),template=templateById.get(templateId),message=cleanConversationMessage(b.message);
       if(!template||store.settings.templateActive?.[templateId]===false||message.length<5)return json(res,400,{error:'اختر قالباً متاحاً واكتب استفسارك / Choose an available template and enter your question'},security);
-      let guest=guestSessionValue(req),headers={};if(!auth&&!guest){guest=token(32);headers['Set-Cookie']=cookie('zezo_guest',guest,30*24*60*60,req);}
-      const referralCode=clean(b.referralCode||url.searchParams.get('ref'),40),resolved=referralForRequest(req,{...b,referralCode}),conv={id:id('chat'),createdAt:now(),updatedAt:now(),templateId:template.id,templateName:template.title.ar,templateService:template.service,templateCategory:template.category,source:clean(b.source,40)||'template_catalog',department:'orders',status:'new',clientId:auth?.user.role==='client'?auth.user.id:null,guestSessionHash:auth?null:hash(guest),assignedUserId:null,referralCode:resolved?.code||'',referralLinkId:resolved?.link?.id||null,referralUserId:resolved?.user?.id||null,leadId:null,messages:[],quote:null,agreedPriceSnapshot:null};
-      const attachment=await saveUpload(file),first=appendConversationMessage(conv,{senderType:conv.clientId?'client':'guest',senderId:conv.clientId||'',text:message,attachment});store.conversations.unshift(conv);
+      const resolved=referralForAuthenticatedClient(auth.user),conv={id:id('chat'),createdAt:now(),updatedAt:now(),templateId:template.id,templateName:template.title.ar,templateService:template.service,templateCategory:template.category,source:clean(b.source,40)||'template_catalog',department:'orders',status:'new',clientId:auth.user.id,guestSessionHash:null,assignedUserId:null,referralCode:resolved?.code||'',referralLinkId:resolved?.linkId||null,referralUserId:resolved?.userId||null,leadId:null,messages:[],quote:null,agreedPriceSnapshot:null};
+      const attachment=await saveUpload(file,conv.clientId),first=appendConversationMessage(conv,{senderType:'client',senderId:conv.clientId,text:message,attachment});store.conversations.unshift(conv);
       if(conv.referralUserId)recordReferralEvent({userId:conv.referralUserId,code:conv.referralCode,linkId:conv.referralLinkId,type:'inquiry_confirmed',resourceId:conv.id,idempotencyKey:`conversation_inquiry:${conv.id}`});
-      audit(auth?.user||null,'template_conversation_created',conv.id,`${conv.templateId}; referral=${conv.referralCode||'none'}`);notifyConversation(conv,'created',auth?.user||null);await persist();
-      return json(res,201,{ok:true,conversation:safeConversation(conv,false),messageId:first.id}, {...security,...headers});
+      audit(auth.user,'template_conversation_created',conv.id,`${conv.templateId}; referral=${conv.referralCode||'none'}`);notifyConversation(conv,'created',auth.user);await persist();
+      return json(res,201,{ok:true,conversation:safeConversation(conv,false),messageId:first.id},security);
     }
     if(req.method==='GET'&&path==='/api/conversations'){
       const auth=requireAuth(req,res);if(!auth)return;let changed=false;
@@ -1265,6 +3504,7 @@ async function handle(req, res) {
       const conversationId=conversationRoute[1],action=conversationRoute[2]||'',conversation=store.conversations.find(item=>item.id===conversationId);
       if(!conversation)return json(res,404,{error:'المحادثة غير موجودة / Conversation not found'},security);
       const auth=sessionUser(req),staff=Boolean(auth&&auth.user.role!=='client');
+      if(auth&&!requireAuth(req,res,allRoles))return;
       if(req.method==='GET'&&action===''){
         if(!customerCanSeeConversation(req,auth,conversation))return json(res,404,{error:'المحادثة غير موجودة / Conversation not found'},security);
         return json(res,200,{conversation:safeConversation(conversation,auth?.user.role==='admin')},security);
@@ -1272,14 +3512,15 @@ async function handle(req, res) {
       if(req.method==='GET'&&action.startsWith('files/')){
         if(!customerCanSeeConversation(req,auth,conversation))return json(res,404,{error:'الملف غير موجود / File not found'},security);
         const index=Number(conversationRoute[3]),all=(conversation.messages||[]).flatMap(message=>message.attachments||[]),file=all[index];if(!Number.isInteger(index)||!file)return json(res,404,{error:'الملف غير موجود / File not found'},security);
-        res.writeHead(200,{...security,'Content-Type':file.type,'Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(file.originalName)}`,'Cache-Control':'private, no-store'});return createReadStream(join(UPLOAD_DIR,file.storedName)).pipe(res);
+        return serveUpload(res,file,security);
       }
       if(req.method==='POST'&&action==='messages'){
         let b={},file=null;if((req.headers['content-type']||'').toLowerCase().startsWith('multipart/form-data')){const parsed=parseMultipart(await bodyBuffer(req),req.headers['content-type']);b=parsed.fields;file=parsed.file;}else b=await jsonBody(req);
-        const text=clean(b.message,2000);if(text.length<1&&!file)return json(res,400,{error:'اكتب رسالة أو أرفق ملفاً صالحاً / Enter a message or attach a valid file'},security);
+        const text=cleanConversationMessage(b.message);if(text.length<1&&!file)return json(res,400,{error:'اكتب رسالة أو أرفق ملفاً صالحاً / Enter a message or attach a valid file'},security);
         if(staff){if(!conversationAccess(auth.user,conversation,'conversations.read')||!requirePermission(auth,res,'conversations.reply',{assigneeId:conversation.assignedUserId||'',ownerId:conversation.clientId||'',department:conversation.department||'orders'}))return;}
         else if(!customerCanSeeConversation(req,auth,conversation))return json(res,404,{error:'المحادثة غير موجودة / Conversation not found'},security);
-        const attachment=await saveUpload(file),senderType=staff?'staff':auth?'client':'guest',message=appendConversationMessage(conversation,{senderType,senderId:auth?.user.id||'',text,attachment});
+        if(conversation.status==='closed')return json(res,409,{error:'المحادثة مغلقة ولا تستقبل رسائل جديدة / This conversation is closed to new messages'},security);
+        const attachment=await saveUpload(file,auth?.user.id||null),senderType=staff?'staff':auth?'client':'guest',message=appendConversationMessage(conversation,{senderType,senderId:auth?.user.id||'',text,attachment});
         if(staff&&conversation.status==='waiting_customer')conversation.status='in_progress';else if(!staff&&conversation.status==='waiting_customer')conversation.status='in_progress';
         audit(auth?.user||null,'conversation_message_sent',conversation.id,`${senderType}; ${message.id}; attachment=${Boolean(attachment)}`);notifyConversation(conversation,'message',auth?.user||null);await persist();return json(res,201,{ok:true,conversation:safeConversation(conversation,auth?.user.role==='admin')},security);
       }
@@ -1320,7 +3561,7 @@ async function handle(req, res) {
       return json(res,405,{error:'العملية غير مدعومة / Method not allowed'},security);
     }
     if (req.method === 'POST' && path === '/api/referral-events') {
-      if(!rateAllowedFor(quoteAttempts,`referral:${req.socket.remoteAddress||'unknown'}`,300,60*60_000))return json(res,429,{error:'حاول لاحقاً / Try again later'},security);
+      if(!await rateAllowedFor(quoteAttempts,`referral:${req.socket.remoteAddress||'unknown'}`,300,60*60_000))return json(res,429,{error:'حاول لاحقاً / Try again later'},security);
       const b=await jsonBody(req),code=clean(b.code,40),type=clean(b.type,32),visitorId=clean(b.visitorId,80),eventId=clean(b.eventId,80);
       const allowedTypes=['visit','service_view','template_view','whatsapp_click'];
       if(!allowedTypes.includes(type)||!code||!visitorId||!eventId||!/^[-_a-zA-Z0-9]{12,80}$/.test(visitorId)||!/^[-_a-zA-Z0-9]{12,80}$/.test(eventId))return json(res,400,{error:'حدث الإحالة غير صالح / Invalid referral event'},security);
@@ -1339,6 +3580,7 @@ async function handle(req, res) {
       const visitorHash=hash(visitorId),beforeEvents=store.referralEvents.length,beforeAttributions=store.referralAttributions.length;
       store.referralEvents=store.referralEvents.filter(event=>!(event.visitorHash===visitorHash&&['visit','service_view','template_view','whatsapp_click'].includes(event.type)));
       store.referralAttributions=store.referralAttributions.filter(row=>row.visitorHash!==visitorHash);
+      if(postgresConfigured())await deleteReferralTrackingForVisitor(visitorHash);
       if(beforeEvents!==store.referralEvents.length||beforeAttributions!==store.referralAttributions.length)await persist();
       return json(res,202,{ok:true},security);
     }
@@ -1373,12 +3615,13 @@ async function handle(req, res) {
       events.sort((a,b)=>Date.parse(b.createdAt)-Date.parse(a.createdAt));
       const active=events.filter(event=>!event.reversed),counts=type=>active.filter(event=>event.type===type).length;
       const visitors=new Set(active.filter(event=>event.type==='visit').map(event=>event.visitorHash).filter(Boolean)).size;
-      const linkStats=intel.links.filter(link=>(!employee||link.userId===employee)).map(link=>{const subset=active.filter(event=>event.linkId===link.id);const count=type=>subset.filter(event=>event.type===type).length;return {...link,visits:new Set(subset.filter(event=>event.type==='visit').map(event=>event.visitorHash).filter(Boolean)).size,serviceViews:count('service_view'),templateViews:count('template_view'),whatsappClicks:count('whatsapp_click'),inquiries:count('inquiry_confirmed'),requests:new Set(orders.filter(order=>order.linkId===link.id).map(order=>order.id)).size,sales:new Set(subset.filter(event=>event.type==='qualified_sale'&&event.leadId).map(event=>event.leadId)).size};});
+      const linkStats=intel.links.filter(link=>(!employee||link.userId===employee)).map(link=>{const subset=active.filter(event=>event.linkId===link.id);const count=type=>subset.filter(event=>event.type===type).length;return {...link,signups:count('client_signup'),visits:new Set(subset.filter(event=>event.type==='visit').map(event=>event.visitorHash).filter(Boolean)).size,serviceViews:count('service_view'),templateViews:count('template_view'),whatsappClicks:count('whatsapp_click'),inquiries:count('inquiry_confirmed'),requests:new Set(orders.filter(order=>order.linkId===link.id).map(order=>order.id)).size,sales:new Set(subset.filter(event=>event.type==='qualified_sale'&&event.leadId).map(event=>event.leadId)).size};});
+      const clients=(intel.clients||[]).filter(client=>(!employee||client.userId===employee)&&Date.parse(client.createdAt)>=start&&Date.parse(client.createdAt)<=end);
       for(const event of events)delete event.visitorHash;
-      const summary={visits:visitors,serviceViews:counts('service_view'),templateViews:counts('template_view'),whatsappClicks:counts('whatsapp_click'),inquiries:counts('inquiry_confirmed'),requests:new Set(orders.map(order=>order.id)).size,quoteAcceptances:counts('quote_accepted'),payments:counts('payment_received'),sales:new Set(active.filter(event=>event.type==='qualified_sale'&&event.leadId).map(event=>event.leadId)).size,orders:orders.length};
+      const summary={signups:events.filter(event=>event.type==='client_signup').length,visits:visitors,serviceViews:counts('service_view'),templateViews:counts('template_view'),whatsappClicks:counts('whatsapp_click'),inquiries:counts('inquiry_confirmed'),requests:new Set(orders.map(order=>order.id)).size,quoteAcceptances:counts('quote_accepted'),payments:counts('payment_received'),sales:new Set(active.filter(event=>event.type==='qualified_sale'&&event.leadId).map(event=>event.leadId)).size,orders:orders.length};
       const rate=(numerator,denominator)=>denominator?Math.round(numerator/denominator*1000)/10:0;
       summary.conversionRates={visitToRequest:rate(summary.requests,summary.visits),requestToSale:rate(summary.sales,summary.requests),whatsappToInquiry:rate(summary.inquiries,summary.whatsappClicks)};
-      return json(res,200,{retentionDays:90,filters:{from,to,employee,status},summary,employees:intel.employees.filter(row=>!employee||row.id===employee),links:linkStats,orders:orders.slice(0,500),events:events.filter(event=>event.type!=='visit').slice(0,500)},security);
+      return json(res,200,{retentionDays:90,filters:{from,to,employee,status},summary,employees:intel.employees.filter(row=>!employee||row.id===employee),links:linkStats,clients:clients.slice(0,500),orders:orders.slice(0,500),events:events.filter(event=>event.type!=='visit').slice(0,500)},security);
     }
     if (req.method === 'POST' && path.startsWith('/api/admin/leads/') && path.endsWith('/quote-accepted')) {
       const auth=requireAuth(req,res,['admin']);if(!auth)return;
@@ -1389,7 +3632,7 @@ async function handle(req, res) {
       recordLeadMilestone(lead,'quote_accepted',auth.user);syncCrmCaseForOrder(lead,auth.user);audit(auth.user,'quote_acceptance_recorded',lead.id,'Customer acceptance confirmed manually');await persist();return json(res,201,{ok:true,quoteAcceptedAt:lead.quoteAcceptedAt},security);
     }
     if (req.method === 'POST' && path === '/api/quote') {
-      const key=req.socket.remoteAddress||'unknown';if(!rateAllowedFor(quoteAttempts,key,15,60*60_000))return json(res,429,{error:'حاول تقدير فكرتك مرة أخرى بعد قليل / Please try again later'},security);
+      const key=req.socket.remoteAddress||'unknown';if(!await rateAllowedFor(quoteAttempts,key,15,60*60_000))return json(res,429,{error:'حاول تقدير فكرتك مرة أخرى بعد قليل / Please try again later'},security);
       const b=await jsonBody(req),brief=clean(b.brief,800);
       if(brief.length<8) return json(res,400,{error:'اكتب وصفاً أوضح قليلاً للفكرة / Add a little more detail about the idea'},security);
       if(process.env.OPENAI_API_KEY&&process.env.OPENAI_MODEL&&b.consentAi!==true)return json(res,400,{error:'وافق على إرسال الوصف إلى خدمة الذكاء الاصطناعي أو أوقف التفعيل / Consent to AI processing or disable AI'},security);
@@ -1481,27 +3724,29 @@ async function handle(req, res) {
     }
     if(req.method==='GET'&&path==='/api/notifications'){
       const auth=requireAuth(req,res);if(!auth)return;
-      const deadlineChanged=emitDeadlineNotifications();if(deadlineChanged)await persist();
+      const deadlineChanged=auth.user.role!==developmentManagerRole&&emitDeadlineNotifications();if(deadlineChanged)await persist();
       const type=clean(url.searchParams.get('type'),32),status=clean(url.searchParams.get('status'),12),from=clean(url.searchParams.get('from'),10),to=clean(url.searchParams.get('to'),10),limit=Math.min(100,Math.max(1,Number(url.searchParams.get('limit'))||50));
       const notificationTypes=['project','inquiry','withdrawal','rank','sale','commission','quote','payment','team','deadline','finance','referral','update'];
       if((type&&!notificationTypes.includes(type))||(status&&!['all','read','unread'].includes(status))||(from&&!/^\d{4}-\d{2}-\d{2}$/.test(from))||(to&&!/^\d{4}-\d{2}-\d{2}$/.test(to)))return json(res,400,{error:'فلاتر الإشعارات غير صالحة / Invalid notification filters'},security);
-      const unreadCount=store.notifications.filter(row=>row.userId===auth.user.id&&!row.readAt).length,start=from?Date.parse(`${from}T00:00:00.000Z`):-Infinity,end=to?Date.parse(`${to}T23:59:59.999Z`):Infinity;
-      const notifications=store.notifications.filter(row=>row.userId===auth.user.id&&(!type||row.type===type)&&(!status||status==='all'||(status==='read'?Boolean(row.readAt):!row.readAt))&&Date.parse(row.createdAt)>=start&&Date.parse(row.createdAt)<=end).slice(0,limit).map(safeNotification);
+      const visible=store.notifications.filter(row=>canReadNotification(auth.user,row));
+      const unreadCount=visible.filter(row=>!row.readAt).length,start=from?Date.parse(`${from}T00:00:00.000Z`):-Infinity,end=to?Date.parse(`${to}T23:59:59.999Z`):Infinity;
+      const notifications=visible.filter(row=>(!type||row.type===type)&&(!status||status==='all'||(status==='read'?Boolean(row.readAt):!row.readAt))&&Date.parse(row.createdAt)>=start&&Date.parse(row.createdAt)<=end).slice(0,limit).map(safeNotification);
       return json(res,200,{notifications,unreadCount,authenticated:true,emailReady:emailReady()&&adminEmailReady()},security);
     }
     if(req.method==='PATCH'&&path.startsWith('/api/notifications/')){
-      const auth=requireAuth(req,res);if(!auth)return;const notificationId=path.split('/').at(-1),notification=store.notifications.find(row=>row.id===notificationId&&row.userId===auth.user.id);
+      const auth=requireAuth(req,res);if(!auth)return;const notificationId=path.split('/').at(-1),notification=store.notifications.find(row=>row.id===notificationId&&canReadNotification(auth.user,row));
       if(!notification)return json(res,404,{error:'الإشعار غير موجود / Notification not found'},security);
       if(!notification.readAt){notification.readAt=now();await persist();}
-      return json(res,200,{notification:safeNotification(notification),unreadCount:store.notifications.filter(row=>row.userId===auth.user.id&&!row.readAt).length},security);
+      return json(res,200,{notification:safeNotification(notification),unreadCount:store.notifications.filter(row=>canReadNotification(auth.user,row)&&!row.readAt).length},security);
     }
     if(req.method==='POST'&&path==='/api/notifications/read-all'){
       const auth=requireAuth(req,res);if(!auth)return;let changed=false;const at=now();
-      for(const notification of store.notifications)if(notification.userId===auth.user.id&&!notification.readAt){notification.readAt=at;changed=true;}
+      for(const notification of store.notifications)if(canReadNotification(auth.user,notification)&&!notification.readAt){notification.readAt=at;changed=true;}
       if(changed)await persist();return json(res,200,{ok:true,unreadCount:0},security);
     }
     if (req.method === 'GET' && path === '/api/dashboard') {
       const auth = requireAuth(req,res); if (!auth) return;
+      if (auth.user.role === developmentManagerRole) return json(res, 200, dashboardFor(auth.user), security);
       let guestConversationsClaimed=false;if(auth.user.role==='client'&&guestSessionValue(req)){const guestHash=hash(guestSessionValue(req));for(const conversation of store.conversations)if(conversation.guestSessionHash===guestHash&&!conversation.clientId){conversation.clientId=auth.user.id;conversation.guestSessionHash=null;conversation.updatedAt=now();guestConversationsClaimed=true;}}
       let changed=guestConversationsClaimed||ensureMonthlyReferralLinks(); const eventCountBeforeCleanup=store.referralEvents.length;cleanReferralEvents();if(eventCountBeforeCleanup!==store.referralEvents.length)changed=true; const previousRankState=JSON.stringify(store.rankRequests);
       for (const lead of store.leads) { const before=JSON.stringify([lead.commissionStatus,lead.commissionAmount,lead.developerCommissionStatus,lead.developerCommissionAmount]); updateCommission(lead); updateDeveloperCommission(lead);syncLeadFinanceLedger(lead); if(before!==JSON.stringify([lead.commissionStatus,lead.commissionAmount,lead.developerCommissionStatus,lead.developerCommissionAmount])) { changed=true;notifyCurrentCommissions(lead); } }
@@ -1515,34 +3760,21 @@ async function handle(req, res) {
       const auth=requireAuth(req,res,['admin']);if(!auth)return;
       return json(res,200,financeTreasuryFor(Object.fromEntries(url.searchParams)),security);
     }
-    if (req.method === 'POST' && path === '/api/setup') {
-      const b = await jsonBody(req);
-      if (store.users.some(u=>u.role==='admin'&&u.active)) return json(res,409,{error:'تم إنشاء حساب المدير مسبقاً / Initial administrator already exists'},security);
-      if (!canSetUpFirstAdmin()) return json(res,403,{error:'إنشاء المدير الأول متاح في المعاينة المحلية فقط / First administrator setup is available only in local development'},security);
-      const setupKey=`first-admin:${req.socket.remoteAddress||'unknown'}`;
-      if (!rateAllowed(setupKey)) return json(res,429,{error:'محاولات كثيرة. حاول بعد 15 دقيقة / Too many attempts; try again in 15 minutes'},security);
-      const name = clean(b.name,80), username = clean(b.username,40).toLowerCase();
-      if (name.length < 2 || !/^[a-z0-9._-]{3,40}$/.test(username) || !validTemporaryPassword(b.password)) return json(res,400,{error:'أدخل اسماً واسم مستخدم صالحاً وكلمة مرور مؤقتة من 9 خانات على الأقل / Use a valid name, username, and a temporary password of at least 9 characters'},security);
-      const record = passwordRecord(b.password);
-      const admin = { id:id('usr'), name, username, role:'admin', active:true, mustChangePassword:true, createdAt:now(), ...record };
-      store.users.push(admin); loginAttempts.delete(setupKey); audit(admin,'admin_setup','account','First administrator created; temporary password must be changed'); await persist();
-      const sid=token(); sessions.set(sid,{userId:admin.id,expires:Date.now()+SESSION_TTL});
-      return json(res,201,{user:publicUser(admin)}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
-    }
     if (req.method === 'POST' && path === '/api/client/register') {
       const b=await jsonBody(req),ip=req.socket.remoteAddress||'unknown';
       const email=normalizeEmail(b.email),name=clean(b.name,100),password=String(b.password||'');
-      if(!rateAllowedFor(clientRegistrationAttempts,ip,8,60*60_000))return json(res,429,{error:'محاولات تسجيل كثيرة. حاول لاحقاً / Too many registration attempts. Try again later.'},security);
+      if(!await rateAllowedFor(clientRegistrationAttempts,ip,8,60*60_000))return json(res,429,{error:'محاولات تسجيل كثيرة. حاول لاحقاً / Too many registration attempts. Try again later.'},security);
       if(name.length<2||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||!validPassword(password)||String(b.confirmPassword||'')!==password)return json(res,400,{error:'أكمل الاسم والبريد، وتأكد من تطابق كلمتي المرور (12 خانة على الأقل) / Enter your name and email, and make sure both passwords match (12+ characters).'},security);
       if(store.users.some(user=>normalizeEmail(user.email)===email||user.username===email))return json(res,409,{error:'يوجد حساب بهذا البريد. سجّل الدخول بدلاً من إنشاء حساب جديد / An account already exists for this email. Please sign in.'},security);
-      const attribution=referralForRequest(req,b),createdAt=now(),verificationToken=emailReady()?token(32):'';
+      const attribution=referralForRequest(req,b),createdAt=now(),verificationToken=emailReadyForRecipient(email)?token(32):'';
       const student=b.student==='true'||b.student===true;
-      const user={id:id('usr'),name,username:email,email,phone:'',role:'client',active:!emailReady(),student,university:student?clean(b.university,120):'',emailVerified:false,createdAt,...passwordRecord(password)};
+      const language=b.lang==='en'?'en':'ar';
+      const user={id:id('usr'),name,username:email,email,phone:'',role:'client',active:!verificationToken,student,language,university:student?clean(b.university,120):'',emailVerified:false,createdAt,...passwordRecord(password)};
       bindClientReferral(user,attribution);
       if(verificationToken){user.emailVerificationHash=hash(verificationToken);user.emailVerificationExpires=Date.now()+24*60*60_000;}
       store.users.push(user);audit(user,'client_registered',user.id,user.referralCode?`Referral ${user.referralCode}`:'');await persist();
-      if(verificationToken){const verifyUrl=`${siteBase(req)}/?verifyEmail=${encodeURIComponent(verificationToken)}`;await queueMail({to:email,kind:'client_email_verification',subject:'تأكيد بريد حساب ZEZO',text:`مرحباً ${name}،\n\nأكد بريدك لتفعيل حسابك في ZEZO خلال 24 ساعة:\n${verifyUrl}\n\nإذا لم تنشئ هذا الحساب، تجاهل الرسالة.`});void processMailQueue();return json(res,201,{verificationRequired:true,emailQueued:emailReady()},security);}
-      const sid=token();sessions.set(sid,{userId:user.id,expires:Date.now()+SESSION_TTL});
+      if(verificationToken){const verifyUrl=`${siteBase(req)}/?verifyEmail=${encodeURIComponent(verificationToken)}`;await queueMail({to:email,kind:'client_email_verification',eventKey:`client-verification:${user.id}`,expiresAt:new Date(user.emailVerificationExpires).toISOString(),...verificationEmail({name,verifyUrl,language})});return json(res,201,{verificationRequired:true,emailQueued:true},security);}
+      const sid=token();sessions.set(sessionKey(sid),{userId:user.id,expires:Date.now()+SESSION_TTL});
       return json(res,201,{user:publicUser(user),verificationRequired:false,emailConfigured:false}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
     }
     if(req.method==='POST'&&path==='/api/auth/verify-email'){
@@ -1550,12 +3782,12 @@ async function handle(req, res) {
       const user=store.users.find(row=>row.role==='client'&&row.emailVerificationHash===hash(verificationToken)&&Number(row.emailVerificationExpires)>Date.now());
       if(!user)return json(res,400,{error:'رابط تأكيد البريد غير صالح أو منتهي / Verification link is invalid or expired'},security);
       user.emailVerificationHash=null;user.emailVerificationExpires=0;user.emailVerified=true;user.active=true;user.emailVerifiedAt=now();audit(user,'client_email_verified',user.id);await persist();
-      const sid=token();sessions.set(sid,{userId:user.id,expires:Date.now()+SESSION_TTL});
+      const sid=token();sessions.set(sessionKey(sid),{userId:user.id,expires:Date.now()+SESSION_TTL});
       return json(res,200,{user:publicUser(user)}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
     }
     if(req.method==='POST'&&path==='/api/auth/forgot-password'){
       const b=await jsonBody(req),email=normalizeEmail(b.email),ip=req.socket.remoteAddress||'unknown',user=store.users.find(row=>row.active&&normalizeEmail(row.email)===email);
-      if(!rateAllowedFor(passwordResetAttempts,ip,8,60*60_000))return json(res,429,{error:'محاولات كثيرة. حاول لاحقاً / Too many reset requests. Try again later.'},security);
+      if(!await rateAllowedFor(passwordResetAttempts,ip,8,60*60_000))return json(res,429,{error:'محاولات كثيرة. حاول لاحقاً / Too many reset requests. Try again later.'},security);
       if(user&&emailReady()){const resetToken=token(32);user.passwordResetHash=hash(resetToken);user.passwordResetExpires=Date.now()+60*60_000;await persist();const resetUrl=`${siteBase(req)}/?resetPassword=${encodeURIComponent(resetToken)}`;await queueMail({to:user.email,kind:'account_password_reset',subject:'إعادة تعيين كلمة مرور ZEZO',text:`استخدم الرابط خلال ساعة لإعادة تعيين كلمة المرور:\n${resetUrl}\n\nإذا لم تطلب ذلك، تجاهل الرسالة.`});void processMailQueue();}
       return json(res,202,{ok:true,message:'إذا كان البريد مرتبطاً بحساب نشط وخدمة البريد مفعّلة، فستصلك رسالة بالخطوات.'},security);
     }
@@ -1565,33 +3797,42 @@ async function handle(req, res) {
       if(Number(user.passwordResetExpires)<=Date.now()){user.passwordResetHash=null;user.passwordResetExpires=0;await persist();return json(res,400,{error:'انتهت صلاحية رابط إعادة التعيين / Password reset link has expired'},security);}
       if(!validPassword(b.password))return json(res,400,{error:'كلمة المرور يجب أن تكون 12 خانة على الأقل / Password must contain at least 12 characters'},security);
       Object.assign(user,passwordRecord(String(b.password)));user.passwordResetHash=null;user.passwordResetExpires=0;user.mustChangePassword=false;audit(user,'password_reset',user.id);for(const [sid,session] of sessions)if(session.userId===user.id)sessions.delete(sid);await persist();
-      const sid=token();sessions.set(sid,{userId:user.id,expires:Date.now()+SESSION_TTL});return json(res,200,{user:publicUser(user)}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
+      if(user.role!=='client'&&user.mfaEnabledAt)return json(res,200,{ok:true,user:publicUser(user)}, {...security,'Set-Cookie':cookie('zezo_session','',0,req)});
+      const sid=token();sessions.set(sessionKey(sid),{userId:user.id,expires:Date.now()+SESSION_TTL});return json(res,200,{user:publicUser(user)}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
     }
     if (req.method === 'POST' && path === '/api/auth/login') {
       const b=await jsonBody(req); const username=clean(b.username,150).toLowerCase(); const key=`${req.socket.remoteAddress}:${username}`;
-      if (!rateAllowed(key)) return json(res,429,{error:'محاولات كثيرة. جرّب بعد 15 دقيقة / Too many attempts; try again in 15 minutes'},security);
+      if (!await rateAllowed(key)) return json(res,429,{error:'محاولات كثيرة. جرّب بعد 15 دقيقة / Too many attempts; try again in 15 minutes'},security);
       const user=store.users.find(u=>u.username===username&&u.active);
       if (!user || !passwordMatches(String(b.password||''),user) || !accountTypes[b.accountType]?.includes(user.role)) return json(res,401,{error:'اسم المستخدم أو كلمة المرور غير صحيحة لهذا النوع من الدخول / Incorrect username or password for this sign-in type'},security);
-      if(sensitiveManagementRole(user.role)&&user.mfaEnabledAt&&!validTotp(user.mfaSecret,b.mfaCode))return json(res,401,{error:'أدخل رمز تطبيق المصادقة الحالي / Enter the current authenticator code',mfaRequired:true},security);
-      loginAttempts.delete(key); const sid=token(); sessions.set(sid,{userId:user.id,expires:Date.now()+SESSION_TTL}); audit(user,'login',user.id); await persist();
+      if(user.role!=='client'&&user.mfaEnabledAt&&!validTotp(user.mfaSecret,b.mfaCode))return json(res,401,{error:'أدخل رمز تطبيق المصادقة الحالي / Enter the current authenticator code',mfaRequired:true},security);
+       loginAttempts.delete(key); await clearRateLimit('login', key); const sid=token(); sessions.set(sessionKey(sid),{userId:user.id,expires:Date.now()+SESSION_TTL}); audit(user,'login',user.id); await persist();
       return json(res,200,{user:publicUser(user)}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
     }
-    if(req.method==='GET'&&path==='/api/auth/mfa/setup'){
-      const auth=requireAuth(req,res,['admin','marketing_manager','hr_manager','order_manager']);if(!auth)return;
+    if(['GET','POST'].includes(req.method)&&path==='/api/auth/mfa/setup'){
+      const developerSetup=req.method==='POST';
+      const auth=requireAuth(req,res,developerSetup?['developer']:mandatoryMfaRoles);if(!auth)return;
       if(auth.user.mfaEnabledAt)return json(res,409,{error:'التحقق بخطوتين مفعّل مسبقاً / Two-step verification is already enabled'},security);
+      if(developerSetup){
+        if(!await rateAllowedFor(developerMfaSetupAttempts,auth.user.id,8,15*60_000))return json(res,429,{error:'جرّب مجدداً بعد 15 دقيقة / Try again in 15 minutes'},security);
+        const b=await jsonBody(req),password=typeof b.currentPassword==='string'?b.currentPassword.slice(0,201):'';
+        if(!passwordMatches(password,auth.user))return json(res,401,{error:'كلمة المرور الحالية غير صحيحة / Current password is incorrect'},security);
+      }
       auth.user.mfaSetupSecret ||= base32Encode(randomBytes(20));await persist();
       const issuer='ZEZO Forge',label=encodeURIComponent(`${issuer}:${auth.user.username}`),otpAuthUri=`otpauth://totp/${label}?secret=${auth.user.mfaSetupSecret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
       return json(res,200,{secret:auth.user.mfaSetupSecret,otpAuthUri},security);
     }
     if(req.method==='POST'&&path==='/api/auth/mfa/enable'){
-      const auth=requireAuth(req,res,['admin','marketing_manager','hr_manager','order_manager']);if(!auth)return;const b=await jsonBody(req);
+      const auth=requireAuth(req,res,mfaEnrollmentRoles);if(!auth)return;
+      if(auth.user.role==='developer'&&!await rateAllowedFor(developerMfaEnableAttempts,auth.user.id,8,15*60_000))return json(res,429,{error:'جرّب مجدداً بعد 15 دقيقة / Try again in 15 minutes'},security);
+      const b=await jsonBody(req);
       if(auth.user.mfaEnabledAt)return json(res,409,{error:'التحقق بخطوتين مفعّل مسبقاً / Two-step verification is already enabled'},security);
       if(!validTotp(auth.user.mfaSetupSecret,b.code))return json(res,400,{error:'رمز التحقق غير صحيح؛ افحص الساعة والرمز الحالي / Invalid code; check the device clock and current code'},security);
-      auth.user.mfaSecret=auth.user.mfaSetupSecret;delete auth.user.mfaSetupSecret;auth.user.mfaEnabledAt=now();audit(auth.user,'management_mfa_enabled',auth.user.id);await persist();
+      auth.user.mfaSecret=auth.user.mfaSetupSecret;delete auth.user.mfaSetupSecret;auth.user.mfaEnabledAt=now();audit(auth.user,auth.user.role==='developer'?'developer_mfa_enabled':'management_mfa_enabled',auth.user.id);await persist();
       return json(res,200,{ok:true,user:publicUser(auth.user)},security);
     }
     if (req.method === 'POST' && path === '/api/auth/logout') {
-      const sid=cookieValue(req,'zezo_session'); const auth=sessionUser(req); if(auth) audit(auth.user,'logout',auth.user.id); sessions.delete(sid); await persist();
+      const sid=cookieValue(req,'zezo_session'); const auth=sessionUser(req); if(auth) audit(auth.user,'logout',auth.user.id); sessions.delete(sessionKey(sid)); await persist();
       return json(res,200,{ok:true}, {...security,'Set-Cookie':cookie('zezo_session','',0,req)});
     }
     if (req.method === 'POST' && path === '/api/auth/password') {
@@ -1629,7 +3870,7 @@ async function handle(req, res) {
       if(Number(user.activationExpires)<=Date.now()){user.activationHash=null;user.activationExpires=0;user.inviteStatus='expired';await persist();return json(res,400,{error:'انتهت صلاحية الدعوة / Invitation has expired'},security);}
       if (!validPassword(b.password)) return json(res,400,{error:'كلمة المرور يجب أن تكون 12 خانة على الأقل / Password must be at least 12 characters'},security);
       Object.assign(user,passwordRecord(b.password)); user.activationHash=null; user.activationExpires=0; user.inviteStatus='accepted';user.inviteAcceptedAt=now();user.active=true; ensureMonthlyReferralLinks(); audit(user,'account_activated',user.id); await persist();
-      const sid=token(); sessions.set(sid,{userId:user.id,expires:Date.now()+SESSION_TTL});
+      const sid=token(); sessions.set(sessionKey(sid),{userId:user.id,expires:Date.now()+SESSION_TTL});
       return json(res,200,{user:publicUser(user)}, {...security,'Set-Cookie':cookie('zezo_session',sid,SESSION_TTL/1000,req)});
     }
     if(req.method==='POST'&&/^\/api\/client\/orders\/[^/]+\/quote-accept$/.test(path)){
@@ -1664,11 +3905,11 @@ async function handle(req, res) {
       const auth=requireAuth(req,res,['client']);if(!auth)return;const pathParts=path.split('/'),orderId=pathParts[4],kind=pathParts[6],indexText=pathParts[7],lead=store.leads.find(row=>row.id===orderId&&row.clientId===auth.user.id);if(!lead)return json(res,404,{error:'الملف غير موجود / File not found'},security);
       const index=Number(indexText),canSeeDeliverables=lead.developerReviewStatus==='approved'&&['ready_delivery','waiting_client_review','delivered','completed'].includes(lead.projectStage||''),file=kind==='customer_upload'?lead.attachments?.[index]:canSeeDeliverables?lead.developerAttachments?.[index]:null;
       if(!file)return json(res,404,{error:'الملف غير موجود / File not found'},security);
-      res.writeHead(200,{...security,'Content-Type':file.type,'Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(file.originalName)}`,'Cache-Control':'private, no-store'});return createReadStream(join(UPLOAD_DIR,file.storedName)).pipe(res);
+      return serveUpload(res,file,security);
     }
     if (req.method === 'POST' && path === '/api/leads') {
       const auth=requireAuth(req,res,['client']);if(!auth)return;
-      if(!publicRateAllowed(req.socket.remoteAddress||'unknown')) return json(res,429,{error:'وصلنا الحد المؤقت للطلبات من هذا الاتصال. حاول لاحقاً / Too many enquiries from this connection. Please try again later.'},security);
+      if(!await publicRateAllowed(req.socket.remoteAddress||'unknown')) return json(res,429,{error:'وصلنا الحد المؤقت للطلبات من هذا الاتصال. حاول لاحقاً / Too many enquiries from this connection. Please try again later.'},security);
       let b, file;
       if ((req.headers['content-type']||'').toLowerCase().startsWith('multipart/form-data')) { const parsed=parseMultipart(await bodyBuffer(req),req.headers['content-type']); b=parsed.fields; file=parsed.file; }
       else b=await jsonBody(req);
@@ -1683,7 +3924,7 @@ async function handle(req, res) {
       if(conversationId&&(!linkedConversation||!(linkedConversation.clientId===auth.user.id||(!linkedConversation.clientId&&guest&&linkedConversation.guestSessionHash===hash(guest)))))return json(res,403,{error:'لا يمكن ربط الطلب بهذه المحادثة / This conversation cannot be linked to your request'},security);
       if(linkedConversation&&(linkedConversation.leadId||linkedConversation.status==='converted'))return json(res,409,{error:'هذه المحادثة مرتبطة بطلب رسمي مسبقاً / This conversation already has an official request'},security);
       if(linkedConversation?.templateId&&linkedConversation.templateId!==requestedTemplateId)return json(res,400,{error:'القالب لا يطابق المحادثة / Template does not match the conversation'},security);
-      const attachment=await saveUpload(file); const existingClientReferral=auth.user.referralUserId?referralLinkForCode(auth.user.referralCode||''):null;const conversationReferral=linkedConversation?.referralCode?referralLinkForCode(linkedConversation.referralCode):null;const resolvedReferral=existingClientReferral||conversationReferral||referralForRequest(req,b);const ref=resolvedReferral?.code||resolvedReferral?.user?.currentReferralCode||resolvedReferral?.user?.referralCode||'';let refUser=resolvedReferral?.user||null;
+      const attachment=await saveUpload(file,auth.user.id); const existingClientReferral=auth.user.referralUserId?referralLinkForCode(auth.user.referralCode||''):null;const conversationReferral=linkedConversation?.referralCode?referralLinkForCode(linkedConversation.referralCode):null;const resolvedReferral=existingClientReferral||conversationReferral||referralForRequest(req,b);const ref=resolvedReferral?.code||resolvedReferral?.user?.currentReferralCode||resolvedReferral?.user?.referralCode||'';let refUser=resolvedReferral?.user||null;
       const selfReferral=Boolean(refUser&&((refUser.email&&normalizeEmail(refUser.email)===email)||(refUser.phone&&normalizePhone(refUser.phone)===phone)));
       if(selfReferral){audit(null,'self_referral_blocked',refUser.id,'Matching employee email or phone');refUser=null;}
       const trackingToken=token(32), createdAt=now(), service=clean(b.service,60), category=clean(b.category,80),acceptedQuote=linkedConversation?.quote?.status==='accepted'?linkedConversation.agreedPriceSnapshot:null,initialStatus=acceptedQuote?'waiting_payment':'new';
@@ -1701,6 +3942,7 @@ async function handle(req, res) {
     if (req.method === 'POST' && path === '/api/admin/invite') {
       const auth=requireAuth(req,res,['admin','hr_manager']); if(!auth)return; const b=await jsonBody(req);
       const name=clean(b.name,80), username=clean(b.username,40).toLowerCase(), email=normalizeEmail(b.email); let role=clean(b.role,40);
+      if(role===developmentManagerRole&&auth.user.role!=='admin')return json(res,403,{error:'تعيين مسؤول المبرمجين متاح للمالك فقط / Only the Owner can grant the Development Manager role'},security);
       if(role==='admin'&&(auth.user.role!=='admin'||!auth.user.mfaEnabledAt||!validTotp(auth.user.mfaSecret,b.ownerMfaCode)))return json(res,403,{error:'إنشاء دعوة مالك يحتاج تحققاً إضافياً من تطبيق المصادقة / Creating an Owner invitation requires fresh authenticator verification'},security);
       if(auth.user.role==='hr_manager'&&!hasPermission(auth.user,'team.invite',{department:'people'}))return json(res,403,{error:'لا تملك تفويض إنشاء دعوات / You are not delegated to create invitations'},security);
       if(auth.user.role==='hr_manager'&&!(['marketer','developer'].includes(role)||(role==='order_manager'&&effectivePermission(auth.user,'team.invite')==='all'))) return json(res,403,{error:'مسؤول الموظفين لا يعيّن إلا الأدوار المفوضة له صراحة / HR cannot invite roles beyond its explicit delegation'},security);
@@ -1738,14 +3980,17 @@ async function handle(req, res) {
       if(target.role==='admin')return json(res,409,{error:'حساب المالك محمي من تغيير الدور أو الصلاحيات من لوحة التفويض / Owner account is protected from permission changes here'},security);
       const b=await jsonBody(req),nextRole=b.role===undefined?target.role:clean(b.role,40);
       if(!roles.includes(nextRole)||nextRole==='admin')return json(res,400,{error:'اختر دور موظف صالحاً؛ تعيين Owner يحتاج دعوة مالك منفصلة / Choose a valid employee role; Owner accounts require a separate owner invitation'},security);
+      if(nextRole===developmentManagerRole&&target.role==='client')return json(res,400,{error:'اختر حساب موظف لهذا الدور / Select an employee account for this role'},security);
       const changes=b.permissions;
       if(changes!==undefined&&(!changes||typeof changes!=='object'||Array.isArray(changes)))return json(res,400,{error:'صيغة الصلاحيات غير صالحة / Invalid permission settings'},security);
-      const overrides={...(target.permissionOverrides||{})};
+      if(nextRole===developmentManagerRole&&Object.values(changes||{}).some(value=>value!==null&&value!=='default'&&value!=='none'))return json(res,403,{error:'صلاحيات مسؤول المبرمجين محددة بنطاق المشاريع التقنية / Development Manager access is fixed to scoped technical projects'},security);
+      const fixedScope=nextRole===developmentManagerRole||target.role===developmentManagerRole;
+      const overrides=fixedScope?{}:{...(target.permissionOverrides||{})};
       for(const [key,value] of Object.entries(changes||{})){
         if(!Object.hasOwn(permissionDefinitions,key))return json(res,400,{error:`صلاحية غير معروفة / Unknown permission: ${key}`},security);
         if(value===null||value==='default'){delete overrides[key];continue;}
         if(value!=='none'&&!permissionDefinitions[key].includes(value))return json(res,400,{error:`نطاق غير مسموح / Unsupported scope for ${key}`},security);
-        overrides[key]=value;
+        if(!fixedScope)overrides[key]=value;
       }
       if(b.active===false&&target.role==='admin')return json(res,409,{error:'حساب المالك محمي من التعطيل العرضي / Owner account is protected from accidental deactivation'},security);
       const before={role:target.role,active:target.active,permissionOverrides:target.permissionOverrides||{}};
@@ -1762,7 +4007,7 @@ async function handle(req, res) {
       const b=await jsonBody(req);
       if(target.role==='admin'||b.role==='admin')return json(res,409,{error:'حساب المالك محمي؛ لا يمكن تغيير الملكية أو دور Owner من هذا المسار / Owner accounts are protected from role transfer here'},security);
       if(['email','phone','instagram','socialLinks','telegramUsername'].some(key=>Object.hasOwn(b,key))) return json(res,403,{error:'يحدّث الموظف بيانات تواصله من ملفه الشخصي / Employees update their own contact details from their profile'},security);
-      if(b.role!==undefined){if(!roles.includes(b.role))return json(res,400,{error:'الدور غير صالح / Invalid role'},security);if(target.role==='admin'&&b.role!=='admin'&&store.users.filter(u=>u.role==='admin'&&u.active).length<=1)return json(res,409,{error:'يجب أن يبقى حساب مالك نشط واحد على الأقل / Keep at least one active owner account'},security);target.role=b.role;if(referralEnabled(target)){target.referralCode ||= newReferralCode();target.rank ||= 'rookie';target.activeCommissionRate ??= 15;target.teamLeaderTermsPending ??= false;}}
+      if(b.role!==undefined){if(!roles.includes(b.role))return json(res,400,{error:'الدور غير صالح / Invalid role'},security);if(target.role===developmentManagerRole||b.role===developmentManagerRole)return json(res,409,{error:'غيّر دور مسؤول المبرمجين من إدارة الصلاحيات / Change the Development Manager role under Access Management'},security);if(target.role==='admin'&&b.role!=='admin'&&store.users.filter(u=>u.role==='admin'&&u.active).length<=1)return json(res,409,{error:'يجب أن يبقى حساب مالك نشط واحد على الأقل / Keep at least one active owner account'},security);target.role=b.role;if(referralEnabled(target)){target.referralCode ||= newReferralCode();target.rank ||= 'rookie';target.activeCommissionRate ??= 15;target.teamLeaderTermsPending ??= false;}}
       if(b.active===false&&target.role==='admin'&&store.users.filter(u=>u.role==='admin'&&u.active).length<=1)return json(res,409,{error:'لا يمكن تعطيل آخر حساب مالك نشط / Cannot disable the last active owner account'},security);
       if(typeof b.active==='boolean'){target.active=b.active;if(b.active)delete target.accountDisabledAt;else target.accountDisabledAt=now();}
       if(b.name) target.name=clean(b.name,80);
@@ -1913,13 +4158,17 @@ async function handle(req, res) {
       if(b.stage==='waiting_developer_acceptance'&&!lead.developerUserId)return json(res,409,{error:'عيّن مبرمجاً قبل انتظار القبول / Assign a developer before awaiting acceptance'},security);
       if(['waiting_client_review','ready_delivery','delivered'].includes(b.stage)&&lead.developerReviewStatus!=='approved')return json(res,409,{error:'اعتمد المراجعة الفنية قبل تسليم الملفات للعميل / Approve technical review before delivery'},security);
       if(b.stage==='completed'&&lead.developerUserId&&lead.developerReviewStatus!=='approved')return json(res,409,{error:'اعتمد تسليم المبرمج قبل إكمال المشروع / Approve the developer delivery before completing the project'},security);
-      const previous=lead.projectStage;setProjectStage(lead,b.stage,auth.user,clean(b.note,500),clean(b.clientNote,500));if(b.clientNote!==undefined)lead.publicStatusNote=clean(b.clientNote,500);
+      const previous=lead.projectStage, previousPublicNote=lead.publicStatusNote||'';
+      setProjectStage(lead,b.stage,auth.user,clean(b.note,500),clean(b.clientNote,500));if(b.clientNote!==undefined)lead.publicStatusNote=clean(b.clientNote,500);
       if(b.stage==='completed')lead.status='completed';
       if(b.stage==='cancelled'){lead.status='cancelled';lead.refunded=true;lead.developerTaskStatus='cancelled';cancelWithdrawalForLead(lead,auth.user);}
       updateCommission(lead);updateDeveloperCommission(lead);syncLeadFinanceLedger(lead,auth.user);syncLeadReferralMilestones(lead,auth.user);syncCrmCaseForOrder(lead,auth.user);const rankRequestsCreated=syncAllRankRequests();
       audit(auth.user,'project_stage_updated',lead.id,`${previous||'—'} -> ${b.stage}`);await persist();
       if(lead.clientId)notifyUser(lead.clientId,`project-stage:${lead.id}:${lead.projectHistory.at(-1).at}`,{type:'project',importance:['completed','cancelled','waiting_client_review'].includes(b.stage)?'high':'normal',titleAr:'تحدّثت مرحلة مشروعك',titleEn:'Your project stage changed',descriptionAr:clean(b.clientNote,320)||`المرحلة الجديدة: ${b.stage}`,descriptionEn:clean(b.clientNote,320)||`New stage: ${b.stage}`},{tab:'orders',targetId:lead.id,targetKind:'lead'});
       if(lead.developerUserId)notifyUser(lead.developerUserId,`project-stage:${lead.id}:${lead.projectHistory.at(-1).at}`,{type:'project',importance:'normal',titleAr:'تحدّثت مرحلة المشروع',titleEn:'Project stage changed',descriptionAr:`المرحلة الجديدة: ${b.stage}`,descriptionEn:`New stage: ${b.stage}`},{tab:'development',targetId:lead.id,targetKind:'lead'});
+      if (previous !== lead.projectStage || previousPublicNote !== (lead.publicStatusNote || '')) {
+        await queueProjectWorkspaceMail(req, lead, { eventKey: `project-stage:${lead.id}:${lead.projectHistory.at(-1).at}`, kind: 'project_stage_changed' });
+      }
       for(const request of rankRequestsCreated)await queueRankRequestMail(request);
       return json(res,200,{lead:safeLead(lead,true)},security);
     }
@@ -1934,6 +4183,9 @@ async function handle(req, res) {
       updateDeveloperCommission(lead);syncCrmCaseForOrder(lead,auth.user);audit(auth.user,b.decision==='approved'?'project_delivery_approved':'project_delivery_revision_requested',lead.id,note);
       notifyUser(lead.developerUserId,`quality-review:${lead.id}:${at}`,{type:'project',importance:'high',titleAr:b.decision==='approved'?'اعتمد المالك مراجعة التسليم':'طلب المالك تعديلات على التسليم',titleEn:b.decision==='approved'?'Owner approved the technical delivery':'Owner requested delivery revisions',descriptionAr:note||'راجع تحديثات المشروع في مساحتك.',descriptionEn:note||'Review the project update in your workspace.'},{tab:'development',targetId:lead.id,targetKind:'lead'});await persist();
       if(lead.clientId)notifyUser(lead.clientId,`project-review:${lead.id}:${at}`,{type:'project',importance:'high',titleAr:b.decision==='approved'?'تسليم مشروعك جاهز للمراجعة':'هناك تحديث على مراجعة مشروعك',titleEn:b.decision==='approved'?'Your delivery is ready for review':'Your project review was updated',descriptionAr:b.decision==='approved'?'راجع الملفات المعتمدة وأكد الاستلام أو أرسل ملاحظة تعديل.':clean(b.clientNote,320)||'يراجع فريق ZEZO التعديلات المطلوبة.',descriptionEn:b.decision==='approved'?'Review the approved files and confirm receipt or request a change.':clean(b.clientNote,320)||'The ZEZO team is reviewing the requested changes.'},{tab:'orders',targetId:lead.id,targetKind:'lead'});
+      const projectMail = { eventKey: `project-review:${lead.id}:${at}`, kind: 'project_delivery_review', approved: b.decision === 'approved' };
+      await queueProjectWorkspaceMail(req, lead, projectMail);
+      await queueProjectWorkspaceMail(req, lead, { ...projectMail, staff: true });
       return json(res,200,{project:safeDeveloperProject(lead),projectStage:lead.projectStage},security);
     }
     if (req.method === 'PATCH' && path.startsWith('/api/admin/leads/')) {
@@ -2005,7 +4257,7 @@ async function handle(req, res) {
       const auth=requireAuth(req,res,['developer']);if(!auth)return;const leadId=path.split('/').at(-2),lead=store.leads.find(l=>l.id===leadId&&l.developerUserId===auth.user.id);
       if(!lead||!['accepted','in_progress','revision_requested','review_requested'].includes(lead.developerTaskStatus))return json(res,404,{error:'المشروع غير متاح لرفع الملفات / Project is not available for uploads'},security);
       if(!(req.headers['content-type']||'').toLowerCase().startsWith('multipart/form-data'))return json(res,400,{error:'أرسل الملف بصيغة multipart / Submit the file as multipart form data'},security);
-      const parsed=parseMultipart(await bodyBuffer(req),req.headers['content-type']),attachment=await saveUpload(parsed.file);if(!attachment)return json(res,400,{error:'اختر ملفاً قبل الرفع / Choose a file to upload'},security);
+      const parsed=parseMultipart(await bodyBuffer(req),req.headers['content-type']),attachment=await saveUpload(parsed.file,auth.user.id);if(!attachment)return json(res,400,{error:'اختر ملفاً قبل الرفع / Choose a file to upload'},security);
       lead.developerAttachments??=[];lead.developerAttachments.push({...attachment,uploadedBy:auth.user.username,uploadedAt:now()});audit(auth.user,'developer_file_uploaded',lead.id,attachment.originalName);await persist();return json(res,201,{files:lead.developerAttachments.map(a=>({name:a.originalName,size:a.size}))},security);
     }
     if(req.method==='PATCH'&&path.startsWith('/api/admin/developer-projects/')&&path.endsWith('/review')){
@@ -2021,26 +4273,34 @@ async function handle(req, res) {
     if(req.method==='GET'&&path.startsWith('/api/developer/attachment/')){
       const auth=requireAuth(req,res,['admin','developer']);if(!auth)return;const [leadId,indexText]=path.split('/').slice(-2),lead=store.leads.find(l=>l.id===leadId);
       if(!lead||(auth.user.role==='developer'&&lead.developerUserId!==auth.user.id))return json(res,404,{error:'الملف غير موجود / File not found'},security);const file=lead.developerAttachments?.[Number(indexText)];if(!file)return json(res,404,{error:'الملف غير موجود / File not found'},security);
-      res.writeHead(200,{...security,'Content-Type':file.type,'Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(file.originalName)}`,'Cache-Control':'private, no-store'});return createReadStream(join(UPLOAD_DIR,file.storedName)).pipe(res);
+      return serveUpload(res,file,security);
     }
     if (req.method === 'POST' && path === '/api/admin/payment') {
       const auth=requireAuth(req,res,['admin']); if(!auth)return; const b=await jsonBody(req); const lead=store.leads.find(l=>l.id===b.leadId);
       const amount=Number(b.amount); if(!lead||!Number.isFinite(amount)||amount<=0||amount>10000000||!['payment','refund'].includes(b.kind)||b.verified!==true) return json(res,400,{error:'سجّل مبلغاً صحيحاً وأكد التحقق اليدوي / Enter a valid amount and confirm manual verification'},security);
       const idempotencyKey=clean(b.idempotencyKey,80);
-      if(idempotencyKey){if(!/^[a-zA-Z0-9_-]{12,80}$/.test(idempotencyKey))return json(res,400,{error:'مفتاح الحركة غير صالح / Invalid transaction key'},security);const existing=store.payments.find(row=>row.idempotencyKey===idempotencyKey);if(existing)return json(res,200,{payment:existing,lead:safeLead(lead,true),duplicate:true},security);}
+      if(!idempotencyKey)return json(res,400,{error:'مفتاح فريد مطلوب لمنع تكرار الحركة / A unique key is required to prevent duplicate transactions'},security);
+      if(!/^[a-zA-Z0-9_-]{12,80}$/.test(idempotencyKey))return json(res,400,{error:'مفتاح الحركة غير صالح / Invalid transaction key'},security);
+      const existing=store.payments.find(row=>row.idempotencyKey===idempotencyKey);
+      if(existing){
+        if(existing.leadId!==lead.id||(existing.kind||existing.status)!==b.kind||Number(existing.amount)!==money(amount))return json(res,409,{error:'مفتاح الحركة مستخدم لعملية مختلفة / This transaction key was already used for a different operation'},security);
+        return json(res,200,{payment:existing,lead:safeLead(lead,true),duplicate:true},security);
+      }
       if(b.kind==='payment'&&(!lead.contractAmount||!['active','waiting_payment','completed'].includes(lead.status))) return json(res,409,{error:'حدّد قيمة العقد وفعّل المشروع قبل تسجيل دفعة / Set the contract amount and activate the project before recording a payment'},security);
+      const transactionOwnsPersistence=Boolean(currentPostgresClient())&&url.pathname==='/api/admin/payment';
       const payment={id:id('pay'),idempotencyKey:idempotencyKey||null,leadId:lead.id,at:now(),kind:b.kind,amount:money(amount),note:clean(b.note,300),verifiedBy:auth.user.username};
       if(b.kind==='refund'){
         if(amount>lead.paidTotal)return json(res,400,{error:'المبلغ المسترد أكبر من المدفوع المسجل / Refund exceeds recorded payments'},security);
-        cancelWithdrawalForLead(lead,auth.user);lead.paidTotal=money(lead.paidTotal-amount);lead.refunded=true;lead.refundAt=now();lead.commissionHoldUntil=lead.refundAt;
+        cancelWithdrawalForLead(lead,auth.user,{persistMailImmediately:!transactionOwnsPersistence});lead.paidTotal=money(lead.paidTotal-amount);lead.refunded=true;lead.refundAt=now();lead.commissionHoldUntil=lead.refundAt;
       } else {
         if(lead.paidTotal+amount>lead.contractAmount)return json(res,400,{error:'الدفعة تتجاوز رصيد العقد / Payment exceeds the remaining contract balance'},security);
         const wasFullyPaid=lead.paidTotal>=lead.contractAmount;lead.paidTotal=money(lead.paidTotal+amount);
         if(!wasFullyPaid&&lead.paidTotal>=lead.contractAmount){lead.fullyPaidAt=now();lead.everFullyPaid=true;lead.commissionHoldUntil=lead.fullyPaidAt;}
         if(lead.paidTotal>=lead.contractAmount)lead.refunded=false;
       }
-      store.payments.unshift(payment); if(lead.referralUserId)recordReferralEvent({userId:lead.referralUserId,code:lead.referralCode,linkId:lead.referralLinkId,type:b.kind==='refund'?'refund':'payment_received',leadId:lead.id,idempotencyKey:`${b.kind==='refund'?'refund':'payment_received'}:${payment.id}`});updateCommission(lead); updateDeveloperCommission(lead);syncLeadFinanceLedger(lead,auth.user);syncLeadReferralMilestones(lead,auth.user);syncCrmCaseForOrder(lead,auth.user); const rankRequestsCreated=syncAllRankRequests(); audit(auth.user,b.kind==='refund'?'refund_recorded':'manual_payment_verified',lead.id,`${amount} ILS`); await persist();
-      for(const request of rankRequestsCreated) await queueRankRequestMail(request);
+      store.payments.unshift(payment); if(lead.referralUserId)recordReferralEvent({userId:lead.referralUserId,code:lead.referralCode,linkId:lead.referralLinkId,type:b.kind==='refund'?'refund':'payment_received',leadId:lead.id,idempotencyKey:`${b.kind==='refund'?'refund':'payment_received'}:${payment.id}`});updateCommission(lead); updateDeveloperCommission(lead);syncLeadFinanceLedger(lead,auth.user);syncLeadReferralMilestones(lead,auth.user);syncCrmCaseForOrder(lead,auth.user); const rankRequestsCreated=syncAllRankRequests(); audit(auth.user,b.kind==='refund'?'refund_recorded':'manual_payment_verified',lead.id,`${amount} ILS`);
+      if(!transactionOwnsPersistence) await persist();
+      for(const request of rankRequestsCreated) await queueRankRequestMail(request,{persistImmediately:!transactionOwnsPersistence});
       return json(res,201,{payment,lead:safeLead(lead,true)},security);
     }
     if (req.method === 'POST' && path === '/api/admin/commission/paid') {
@@ -2064,7 +4324,7 @@ async function handle(req, res) {
       if(store.withdrawals.some(item=>item.userId===auth.user.id&&item.month===month)) return json(res,409,{error:'تم استخدام طلب السحب الشهري لهذا الشهر / Your monthly withdrawal request has already been used'},security);
       const offsetAmount=money(Math.min(totalDebt,amount)),grossAmount=money(amount+offsetAmount);let remainingGross=grossAmount;
       const commissionItems=[];let referralAmount=0,developerAmount=0;
-      for(const [kind,leads] of [['referral',referralAvailable],['developer',developerAvailable]])for(const lead of leads){if(remainingGross<=0.001)break;const available=kind==='referral'?outstandingCommission(lead):outstandingDeveloperCommission(lead),selected=money(Math.min(available,remainingGross));if(selected<=0)continue;commissionItems.push({leadId:lead.id,kind,amount:selected});if(kind==='referral')referralAmount=money(referralAmount+selected);else developerAmount=money(developerAmount+selected);remainingGross=money(remainingGross-selected);}
+      for(const [kind,leads] of [['referral',referralAvailable],['developer',developerAvailable]])for(const lead of leads){if(remainingGross<=0.001)break;const available=availableOutstandingCommission(lead,kind),selected=money(Math.min(available,remainingGross));if(selected<=0)continue;commissionItems.push({leadId:lead.id,kind,amount:selected});if(kind==='referral')referralAmount=money(referralAmount+selected);else developerAmount=money(developerAmount+selected);remainingGross=money(remainingGross-selected);}
       if(remainingGross>0.01)return json(res,409,{error:'تغير الرصيد أثناء إعداد الطلب؛ حدّث الصفحة وأعد المحاولة / Balance changed; refresh and retry'},security);
       const withdrawal={id:id('wd'),userId:auth.user.id,name:auth.user.name,email:auth.user.email,role:auth.user.role,month,createdAt:now(),updatedAt:now(),amount,grossAmount,offsetAmount,balanceAtRequest:netAvailable,referralAmount,developerAmount,method:clean(b.method,20)||'binance',destination,status:'pending',commissionItems,commissionIds:commissionItems.map(item=>item.leadId),transferReference:'',transferDetails:null,note:'',statusHistory:[{status:'pending',at:now(),by:auth.user.username}]};
       for(const item of commissionItems){const lead=store.leads.find(row=>row.id===item.leadId);if(item.kind==='developer')lead.developerWithdrawalId=withdrawal.id;else lead.withdrawalId=withdrawal.id;}
@@ -2111,8 +4371,8 @@ async function handle(req, res) {
         withdrawal.transferReference=transferReference;withdrawal.paidAt=new Date(transferredAt).toISOString();withdrawal.method=method;withdrawal.transferDetails={ilsDue:withdrawal.amount,sentAmount:money(sentAmount),sentCurrency,exchangeRate:money(exchangeRate),feeAmount:money(feeAmount),feeBearer,reference:transferReference,transferredAt:withdrawal.paidAt,proofReference,verifiedBy:auth.user.username,verifiedAt:now()};withdrawal.statusHistory.push({status:'paid',from:priorStatus,at:withdrawal.paidAt,by:auth.user.username});
         for(const debt of offsetAllocations){if(debt.kind==='developer'){debt.lead.developerCommissionOffsetAmount=money(Number(debt.lead.developerCommissionOffsetAmount||0)+debt.applied);updateDeveloperCommission(debt.lead);}else{debt.lead.commissionOffsetAmount=money(Number(debt.lead.commissionOffsetAmount||0)+debt.applied);updateCommission(debt.lead);}}
         for(const item of withdrawal.commissionItems||[]){const lead=store.leads.find(row=>row.id===item.leadId);if(!lead)continue;
-          if(item.kind==='developer'&&lead.developerWithdrawalId===withdrawal.id&&lead.developerCommissionStatus==='confirmed'){lead.developerCommissionPaidAmount=money(Number(lead.developerCommissionPaidAmount||0)+Number(item.amount||0));lead.developerCommissionPaidAt=withdrawal.paidAt;updateDeveloperCommission(lead);syncLeadFinanceLedger(lead,auth.user);}
-          if(item.kind!=='developer'&&lead.withdrawalId===withdrawal.id&&lead.commissionStatus==='confirmed'){lead.commissionPaidAmount=money(Number(lead.commissionPaidAmount||0)+Number(item.amount||outstandingCommission(lead)));lead.commissionPaidAt=withdrawal.paidAt;updateCommission(lead);syncLeadFinanceLedger(lead,auth.user);}
+          if(item.kind==='developer'&&lead.developerUserId===withdrawal.userId&&lead.developerCommissionStatus==='confirmed'){lead.developerCommissionPaidAmount=money(Number(lead.developerCommissionPaidAmount||0)+Number(item.amount||outstandingDeveloperCommission(lead)));lead.developerCommissionPaidAt=withdrawal.paidAt;if(lead.developerWithdrawalId===withdrawal.id)delete lead.developerWithdrawalId;updateDeveloperCommission(lead);syncLeadFinanceLedger(lead,auth.user);}
+          if(item.kind!=='developer'&&lead.referralUserId===withdrawal.userId&&lead.commissionStatus==='confirmed'){lead.commissionPaidAmount=money(Number(lead.commissionPaidAmount||0)+Number(item.amount||outstandingCommission(lead)));lead.commissionPaidAt=withdrawal.paidAt;if(lead.withdrawalId===withdrawal.id)delete lead.withdrawalId;updateCommission(lead);syncLeadFinanceLedger(lead,auth.user);}
         }
         appendFinanceEntry({idempotencyKey:`withdrawal:${withdrawal.id}:paid`,type:'withdrawal_paid',employeeId:withdrawal.userId,withdrawalId:withdrawal.id,amountCents:cents(withdrawal.amount),statusSnapshot:'paid',actor:auth.user.username,transferReference,postedAt:withdrawal.paidAt,note:`${sentAmount} ${sentCurrency}; rate ${exchangeRate}; fee ${feeAmount} ${feeBearer}`});
       }
@@ -2121,9 +4381,17 @@ async function handle(req, res) {
       return json(res,200,{withdrawal:{id:withdrawal.id,status:withdrawal.status,amount:withdrawal.amount,updatedAt:withdrawal.updatedAt}},security);
     }
     if (req.method === 'GET' && path.startsWith('/api/admin/attachment/')) {
-      const auth=requireAuth(req,res,['admin','marketing_manager','hr_manager','developer']); if(!auth)return; const [leadId,indexText]=path.split('/').slice(-2); const lead=store.leads.find(l=>l.id===leadId); if(auth.user.role==='developer'&&(!lead||lead.developerUserId!==auth.user.id||!['accepted','in_progress','review_requested','approved','revision_requested'].includes(lead.developerTaskStatus)))return json(res,404,{error:'الملف غير موجود / File not found'},security); const a=lead?.attachments[Number(indexText)];
-      if(!a) return json(res,404,{error:'الملف غير موجود'},security);
-      res.writeHead(200,{...security,'Content-Type':a.type,'Content-Disposition':`attachment; filename*=UTF-8''${encodeURIComponent(a.originalName)}`,'Cache-Control':'private, no-store'}); return createReadStream(join(UPLOAD_DIR,a.storedName)).pipe(res);
+      const auth = requireAuth(req, res, ['admin', 'marketing_manager', 'hr_manager', 'developer']);
+      if (!auth) return;
+      const [leadId, indexText] = path.split('/').slice(-2);
+      const lead = store.leads.find(row => row.id === leadId);
+      const unavailable = () => json(res, 404, { error: 'الملف غير موجود / File not found' }, security);
+      if (!lead) return unavailable();
+      if (auth.user.role === 'developer') {
+        if (lead.developerUserId !== auth.user.id || !['accepted', 'in_progress', 'review_requested', 'approved', 'revision_requested'].includes(lead.developerTaskStatus)) return unavailable();
+      } else if (auth.user.role !== 'admin' && !crmAccess(auth.user, { ...lead, assignedUserId: lead.orderManagerUserId || lead.assignedUserId || '' })) return unavailable();
+      const attachment = /^\d+$/.test(indexText) ? lead.attachments?.[Number(indexText)] : null;
+      return attachment ? serveUpload(res, attachment, security) : unavailable();
     }
     return json(res,404,{error:'Not found'},security);
   }
@@ -2140,7 +4408,7 @@ async function handle(req, res) {
     if(cookies.length)headers['Set-Cookie']=cookies;
   }
   const types={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.svg':'image/svg+xml','.jpg':'image/jpeg','.png':'image/png'};
-  const file=join(PUBLIC_DIR,target.slice(1));
+  const file=target==='/index.html'?join(ROOT,'src','legacy','index.html'):join(PUBLIC_DIR,target.slice(1));
   try {
     const data=await readFile(file);
     const body=target==='/index.html'&&STAGING_MODE
@@ -2154,16 +4422,66 @@ async function handle(req, res) {
   catch { res.writeHead(404,headers); res.end('Not found'); }
 }
 
+function responseSecurityHeaders() {
+  const security = {
+    'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'strict-origin-when-cross-origin',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+    'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+  };
+  if (STAGING_MODE) security['X-Robots-Tag'] = 'noindex, nofollow, noarchive, nosnippet';
+  return security;
+}
+
+function handlePublicRuntimeConfig(req, res, snapshot) {
+  const storedSettings = snapshot.settings && typeof snapshot.settings === 'object' ? snapshot.settings : {};
+  const settings = { ...defaultStore().settings, ...storedSettings };
+  const templatePrices = { ...(settings.templatePrices || {}) };
+  for (const [templateId, amount] of Object.entries(snapshot.template_prices || {})) {
+    // null means quote-only; preserve it instead of exposing the typed-column fallback of 0.
+    if (templatePrices[templateId] !== null) {
+      const numericAmount = Number(amount);
+      if (Number.isFinite(numericAmount)) templatePrices[templateId] = numericAmount;
+    }
+  }
+  const templateActive = { ...(settings.templateActive || {}), ...(snapshot.template_active || {}) };
+  const templateInclusions = { ...(settings.templateInclusions || {}), ...(snapshot.template_inclusions || {}) };
+  const legacyPhone = process.env.ZEZO_WHATSAPP_NUMBER;
+  const customerSupportPhone = STAGING_MODE ? '' : normalizeWhatsAppNumber(process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP !== undefined ? process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP : legacyPhone);
+  const ordersPhone = STAGING_MODE ? '' : normalizeWhatsAppNumber(process.env.ZEZO_ORDERS_WHATSAPP !== undefined ? process.env.ZEZO_ORDERS_WHATSAPP : legacyPhone);
+  const ordersUrl = buildWhatsAppUrl(ordersPhone);
+  return json(res, 200, {
+    prices: (Array.isArray(settings.prices) ? settings.prices : []).filter(price => price.active !== false),
+    templatePrices,
+    templateInclusions,
+    templateActive,
+    commissionConfigured: settings.commissionPercent != null,
+    customerSupportWhatsappNumber: customerSupportPhone,
+    ordersWhatsappNumber: ordersPhone,
+    customerSupportWhatsappUrl: buildWhatsAppUrl(customerSupportPhone),
+    ordersWhatsappUrl: ordersUrl,
+    whatsappUrl: ordersUrl,
+    emailReady: emailReady() && adminEmailReady(),
+    aiQuoteReady: !STAGING_MODE && Boolean(process.env.OPENAI_API_KEY && process.env.OPENAI_MODEL),
+    stagingMode: STAGING_MODE
+  }, {
+    ...responseSecurityHeaders(),
+    // This payload contains only shared public settings (template prices,
+    // public WhatsApp links, and feature readiness), never user-specific data.
+    // Keep browser caching disabled while allowing Netlify's CDN to absorb
+    // repeated reads and avoid a database round-trip for every page load.
+    'Netlify-CDN-Cache-Control': 'public, max-age=15, stale-while-revalidate=45, durable'
+  });
+}
+
 export { init, handle };
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
-  const setupAvailable = await init();
+  await init();
   void processMailQueue();
   const mailRetryTimer=setInterval(()=>void processMailQueue(),60_000);
   mailRetryTimer.unref();
   const referralRolloverTimer=setInterval(()=>{const eventCount=store.referralEvents.length,attributionCount=store.referralAttributions.length,linksChanged=ensureMonthlyReferralLinks();cleanReferralEvents();cleanReferralAttributions();if(linksChanged||eventCount!==store.referralEvents.length||attributionCount!==store.referralAttributions.length)void persist().catch(error=>console.error('Referral maintenance failed:',error));},6*60*60_000);
   referralRolloverTimer.unref();
-  if (setupAvailable) console.log('\nLocal ZEZO setup is available: open Team access to create the first administrator. A temporary password is required to be changed immediately.\n');
   createServer((req,res)=>{
     handle(req,res).catch(async error=>{
       if(!res.headersSent){const status=error.status||500; json(res,status,{error:status===500?'حدث خطأ داخلي / Internal server error':error.message},{'X-Content-Type-Options':'nosniff'});}

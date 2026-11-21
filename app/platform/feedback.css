@@ -1,0 +1,43 @@
+.zf-feedback-page { padding-block: clamp(2rem, 5vw, 4.75rem); }
+.zf-feedback-hero { max-width: 50rem; padding-block-end: clamp(1.75rem, 4vw, 3.25rem); }
+.zf-feedback-hero h1 { font-size: clamp(2rem, 5.4vw, 4rem); line-height: 1.16; margin-block: 0 .65rem; }
+.zf-feedback-hero p { color: var(--zf-muted, #aebbd0); font-size: clamp(1rem, 2vw, 1.18rem); margin-block: 0 1rem; }
+.zf-feedback-box { background: var(--zf-panel, #0e151f); border: 1px solid var(--zf-line, #273448); border-radius: .95rem; padding: clamp(1rem, 3vw, 1.75rem); }
+.zf-feedback-box h2 { margin-block: 0 .6rem; font-size: clamp(1.35rem, 3vw, 1.9rem); line-height: 1.3; }
+.zf-feedback-box p { margin-block: .5rem .85rem; }
+.zf-feedback-box .zf-feedback-error { color: #ffb5bc; }
+.zf-feedback-box input, .zf-feedback-box textarea, .zf-feedback-box select { color: inherit; font: inherit; background: #080d14; border: 1px solid #485875; border-radius: .48rem; padding: .55rem .72rem; }
+.zf-feedback-box :is(input, select, button, a) { min-height: 44px; }
+.zf-feedback-box textarea { display: block; width: 100%; min-width: 0; resize: vertical; font-weight: 400; }
+.zf-feedback-box label { display: grid; gap: .35rem; min-width: 0; font-weight: 650; }
+.zf-feedback-box button:disabled, .zf-feedback-box select:disabled { cursor: not-allowed; opacity: .55; }
+.zf-feedback-form { display: grid; gap: .65rem; }
+.zf-feedback-form p { color: var(--zf-muted, #aebbd0); margin-block: .15rem; }
+.zf-feedback-filter { display: flex; justify-content: end; margin-block-end: .9rem; }
+.zf-feedback-buttons, .zf-review-pagination { display: flex; align-items: center; flex-wrap: wrap; gap: .55rem; }
+.zf-review-pagination { justify-content: center; margin-block-start: 1.25rem; }
+.zf-feedback-success button { margin-inline-start: .65rem; }
+.zf-contact-grid { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); gap: 1rem; margin-block-end: 1rem; }
+.zf-contact-side { display: grid; gap: 1rem; align-content: start; }
+.zf-contact-faq details + details { border-block-start: 1px solid var(--zf-line, #273448); }
+.zf-contact-faq summary { min-height: 44px; padding-block: .65rem; cursor: pointer; font-weight: 650; }
+.zf-contact-faq summary:focus-visible { outline: 3px solid #91bdff; outline-offset: 4px; }
+.zf-contact-faq details p { color: var(--zf-muted, #aebbd0); }
+.zf-contact-trap { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.zf-review-preview { min-height: 1px; }
+.zf-review-preview section > a { color: var(--zf-lime, #a3ff12); display: inline-flex; align-items: center; margin-block-start: .65rem; }
+.zf-review-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 17rem), 1fr)); gap: .8rem; align-items: start; }
+.zf-review-card { border: 1px solid var(--zf-line, #273448); border-radius: .65rem; padding: 1rem; background: #080e17; }
+.zf-review-card header, .zf-review-reply > div { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .35rem .65rem; }
+.zf-review-stars { color: var(--zf-lime, #a3ff12); font-size: 1.12rem; letter-spacing: .07em; }
+.zf-review-card time, .zf-review-service { color: var(--zf-muted, #aebbd0); font-size: .85rem; }
+.zf-review-card .zf-review-body, .zf-review-reply p { white-space: pre-wrap; overflow-wrap: anywhere; }
+.zf-review-card .zf-review-service { margin-block-end: 0; }
+.zf-review-reply { border-inline-start: 3px solid var(--zf-blue, #0066ff); margin-block-start: .8rem; padding-inline-start: .7rem; }
+.zf-review-reply p { margin-block-end: 0; }
+.zf-review-rating { display: flex; flex-wrap: wrap; gap: .35rem .65rem; margin: 0; padding: .45rem .65rem; border: 1px solid var(--zf-line, #273448); border-radius: .65rem; }
+.zf-review-rating label { display: inline-flex; align-items: center; gap: .15rem; padding-inline: .15rem; }
+.zf-review-rating input { accent-color: var(--zf-lime, #a3ff12); }
+.zf-review-moderation-card { padding: .65rem; border: 1px solid var(--zf-line, #273448); border-radius: .65rem; }
+.zf-review-moderation-card > .zf-feedback-buttons, .zf-review-moderation-card form { margin-block-start: .65rem; }
+@media (max-width: 48rem) { .zf-contact-grid { grid-template-columns: 1fr; } }

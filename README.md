@@ -1,65 +1,69 @@
 # ZEZO Forge
 
-منصة ZEZO ثنائية اللغة لخدمات المواقع والتطبيقات والذكاء الاصطناعي. يتضمن هذا المستودع كود الخادم والواجهة، القوالب التفاعلية الأربعين وأصولها، ملفات فريق ZEZO المساعدة، اختبارات التكامل، وعينة بيانات المشروع الحالية.
+ZEZO Forge is ZEZO's bilingual Arabic/English website and team workspace. This branch contains the Next.js App Router shell, the existing ZEZO domain behavior, and a PostgreSQL-backed runtime for local review.
 
-## المتطلبات
+## Current migration status
 
-- Node.js 20 أو أحدث.
-- npm مرفق مع Node.js.
-- لا توجد حزم تشغيل خارجية مطلوبة حالياً.
+- The website shell preserves the 40 interactive template demos, Arabic/English interface, existing CSS, imagery, customer flows, and team workspace.
+- Next.js API routes adapt requests to the existing Node domain handler. The handler uses PostgreSQL tables whenever `DATABASE_URL` is set; it does not read or write `application_state_compat` and does not load local JSON data in that mode.
+- PostgreSQL-backed runtime tables cover accounts and hashed sessions, project requests/projects/assignments, conversations/messages/quotes, CRM records, payments, commissions, withdrawals, finance entries, expenses, referral links/events/attributions, rank requests, campaigns and mail outbox, notifications, audit entries, template prices, app settings, employee invitations, shared rate limits, and attachments.
+- Ownership, workflow, amounts, and idempotency fields use typed columns and constraints. Some less frequently queried domain fields remain in JSONB `data` columns on each entity row. The legacy single JSONB application snapshot is no longer the runtime source of truth.
+- Payments have unique idempotency keys; commissions are unique per user/request/kind; referral events use unique idempotency keys; referral visitor hashes are unique. API mutations and reads load and persist state under PostgreSQL transactions and an advisory lock. This global lock prioritizes consistency over throughput and still needs load testing and finer-grained transactions before production scale.
+- PostgreSQL-backed attachments are stored as `BYTEA` and served only through the existing authorization checks. This is suitable for local review and modest files, but an external object-storage adapter is recommended before production volume grows.
+- Shared rate-limit counters and monthly referral-link creation use PostgreSQL. Vercel's `x-vercel-forwarded-for` is used for the request IP; other reverse proxies should set `ZEZO_TRUST_PROXY=1` only when they overwrite the forwarded header.
+- Without `DATABASE_URL`, local preview keeps the existing JSON storage behavior. Existing JSON data is never copied, imported, or deleted by these changes.
+- The Next.js adapter fails closed with `503` on Vercel if `DATABASE_URL` is absent. The branch has not been deployed or validated on Vercel, and is not declared production-ready.
 
-## التثبيت والتشغيل
+## Requirements
 
-استنسخ المستودع، ثم افتح PowerShell داخل مجلده:
+- Node.js 20.19+, 22.12+, or 24+
+- pnpm 11
+- PostgreSQL for the PostgreSQL-backed runtime and its integration tests
 
-```powershell
-git clone https://github.com/Foadmonzer/zezo-forge.git
-cd zezo-forge
-Copy-Item .env.example .env
-npm install
-npm start
-```
-
-افتح `http://localhost:4173`. يعمل الخادم محلياً افتراضياً. يمكنك استخدام `npm run dev` للتشغيل مع إعادة التشغيل عند تغيّر ملفات الخادم.
-
-## بيانات الاختبار والحسابات
-
-يتضمن `data/zezo-data.json` نسخة بيانات الاختبار الموجودة وقت تجهيز هذا المستودع، بما فيها حساب تجريبي محفوظ بكلمة مرور مشفّرة تجزئياً. لا يحتوي المستودع على كلمة المرور النصية. إذا لم تكن تعرف كلمة مرور الحساب التجريبي، أوقف الخادم وأعد تسمية الملف محلياً قبل التشغيل؛ سينشئ التطبيق مخزن بيانات جديداً ويمكنك إعداد حساب مالك محلياً. لا ترفع بيانات تشغيل حقيقية إلى هذا المستودع.
-
-ترفع ملفات الاختبار والمرفقات الجديدة إلى `data/` محلياً. احفظها خارج Git إذا أضفت بيانات شخصية أو تشغيلية لاحقاً.
-
-## الإعدادات
-
-- انسخ `.env.example` إلى `.env` للتشغيل المحلي.
-- قيم الاتصال المعروضة في `.env.example` مخصصة لإعدادات ZEZO الحالية. تبقى مفاتيح API الفعلية فارغة؛ أضف أي مفتاح محلياً إلى `.env` فقط.
-- `.env` وسجلات الخادم والملفات المؤقتة والمرفقات المحلية مستثناة من Git.
-- البريد وOpenAI تكاملان اختياريان، وعمليات الدفع والتحويلات المالية ليست جزءاً من اختبارات محلية.
-
-## الاختبارات
-
-شغّل مجموعتي الاختبار:
+## Run the Next.js preview
 
 ```powershell
-npm test
+pnpm install --frozen-lockfile
+pnpm dev --port 4187
 ```
 
-أو كل مجموعة على حدة:
+Open `http://127.0.0.1:4187`. Without `DATABASE_URL`, local JSON state is created under `data/` unless `ZEZO_DATA_DIR` is set. With `DATABASE_URL`, use an isolated review database and synthetic records; production or customer data is not needed.
+
+## Database setup
+
+Copy `.env.example` to `.env` and set `DATABASE_URL` only for a private, isolated PostgreSQL database. Never commit `.env` or use production credentials for tests.
 
 ```powershell
-npm run test:smoke
-npm run test:staging
+pnpm db:generate
+pnpm db:migrate:deploy
 ```
 
-الاختبارات تستخدم مساحات بيانات مؤقتة؛ لا تشغّلها ببيانات تشغيل فعلية. ملفات `fixtures/` أمثلة اصطناعية ولا تُحمّل تلقائياً إلى التطبيق.
+Existing JSON files are not imported automatically. Keep them as a separate backup; migration and data-import scripts are intentionally separate work.
 
-## مكونات المشروع
+## Checks
 
-- `server.js`: خادم Node.js وواجهات API والتخزين المحلي.
-- `public/`: واجهة عربية/إنجليزية، القوالب الأربعون، العروض التفاعلية، الصور وملفات التصميم.
-- `data/zezo-data.json`: عينة بيانات اختبار محلية مضمّنة.
-- `smoke-test.js` و`staging-smoke-test.js`: اختبارات التكامل.
-- `Start-ZezoStaging.ps1` و`Reset-ZezoStaging.ps1`: أدوات بيئة الاختبار الاختيارية على Windows.
-- `zezo-ai-team-plugin/`: ملفات مصدر إضافة فريق ZEZO.
-- `.agents/` و`.codex/`: إرشادات ووصف الوكلاء المساعدين في مساحة التطوير.
+```powershell
+pnpm typecheck
+pnpm build
+pnpm test
+pnpm test:postgres
+```
 
-بيئة staging والنفق المؤقت اختياريان؛ راجع `README-STAGING.md` قبل تشغيلهما. افحص إعدادات الأمان والبيانات قبل استخدام أي نسخة في الإنتاج.
+The regular smoke suites use isolated synthetic stores. The PostgreSQL suite verifies schema relations and uniqueness, then exercises first-Owner setup and setup lock, password change/MFA/login/logout, client registration, employee invitations and role dashboards, conversation assignment and access denial, messages and quote acceptance, official order/CRM linkage, developer assignment at 25%, marketer commission at 15%, payment idempotency, normalized-row persistence, and cleanup. It requires a disposable PostgreSQL database.
+
+## PostgreSQL-backed local preview
+
+Start a local test database and apply migrations, then set `DATABASE_URL` in the shell before `pnpm dev --port 4187`. `/api/health` reports `storage: postgresql`. All synthetic records are deleted by the API smoke test; app settings may remain because they contain default runtime configuration, not personal data.
+
+## Known production work
+
+- A production PostgreSQL service, restricted credentials, connection-pool sizing, backup/restore rehearsal, monitoring, and disaster recovery have not been configured or tested.
+- The request handler still materializes domain rows into the current ZEZO store shape per request and serializes access with one database-wide advisory lock. It is durable and shared across processes, but throughput and large-dataset behavior need redesign and load testing.
+- PostgreSQL `BYTEA` attachment storage is persistent but not a substitute for object storage at scale. No object-storage service has been purchased or configured.
+- The standalone server runs the mail-outbox retry timer. Next.js/serverless requests persist the outbox but do not start a worker or scheduled job. Email delivery therefore remains disabled/unverified until a worker and provider are configured.
+- WhatsApp is a user-initiated external handoff; no official WhatsApp API integration or delivery confirmation is enabled. Payment collection and staff transfers remain manual/simulated.
+- Browser coverage and supported desktop/mobile browser/device coverage must be reported from the actual test run. No deployment or production readiness is implied by a successful local build.
+
+## External service status
+
+No production database, object storage, mail provider, payment gateway, or hosting credentials are included. Do not deploy this branch or connect production data until the remaining operational work and the commercial hosting plan are reviewed.

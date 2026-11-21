@@ -1,19 +1,24 @@
 import assert from 'node:assert/strict';
 import { Readable, Writable } from 'node:stream';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomBytes, createHmac } from 'node:crypto';
+import { randomBytes, createHmac, scryptSync } from 'node:crypto';
 import { templateCatalog, templateById } from './public/template-catalog.js';
 import { buildTemplateEnquiryMessage, buildWhatsAppUrl, normalizeWhatsAppNumber } from './public/whatsapp.js';
 
 const testDataDir = await mkdtemp(join(tmpdir(), 'zezo-v1-smoke-'));
 process.env.ZEZO_DATA_DIR = testDataDir;
 process.env.NODE_ENV = 'test';
+process.env.DATABASE_URL = '';
 process.env.ZEZO_CUSTOMER_SUPPORT_WHATSAPP = '+971500000001';
 process.env.ZEZO_ORDERS_WHATSAPP = '+971500000002';
 for (const key of ['RESEND_API_KEY','ZEZO_FROM_EMAIL','ZEZO_NOTIFICATION_EMAIL','OPENAI_API_KEY','OPENAI_MODEL']) process.env[key]='';
 const temporaryPassword = () => `Smoke!${randomBytes(24).toString('base64url')}`;
+const initialAdminPassword = temporaryPassword();
+const adminPassword = temporaryPassword();
+const adminSalt = randomBytes(16).toString('hex');
+await writeFile(join(testDataDir, 'zezo-data.json'), JSON.stringify({ users: [{ id: 'synthetic_smoke_owner', name: 'Smoke Admin', username: 'smokeadmin', email: 'smoke-admin@example.test', role: 'admin', active: true, mustChangePassword: true, salt: adminSalt, passwordHash: scryptSync(initialAdminPassword, adminSalt, 64).toString('hex'), createdAt: new Date().toISOString() }] }));
 function currentTotp(secret){
   const alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';let bits=0,value=0,bytes=[];
   for(const char of secret){const index=alphabet.indexOf(char);if(index<0)continue;value=(value<<5)|index;bits+=5;if(bits>=8){bytes.push((value>>>(bits-8))&255);bits-=8;}}
@@ -79,8 +84,7 @@ async function enableManagementMfa(handle,cookie){
 let app;
 try {
   app = await import('./server.js');
-  const setupAvailable = await app.init();
-  assert.equal(setupAvailable, true, 'first run in local development should allow secure owner setup without a setup code');
+  assert.equal(await app.init(), false, 'public app startup never enables Owner self-registration');
 
   const home = await call(app.handle, 'GET', '/');
   assertStatus(home, 200, 'homepage');
@@ -88,13 +92,14 @@ try {
   assert.match(home.body,/data-customer-view="login"[\s\S]*?data-customer-view="register"/,'public client access starts with separate sign-in and account creation choices');
   assert.match(home.body,/name="confirmPassword"/,'client registration asks for password confirmation');
   assert.match(home.body,/name="student"/,'client registration asks whether the user is a university student');
+  assert.doesNotMatch(home.body,/id="firstAdminSetup"|id="setupForm"|Create the first Owner account/i,'public UI does not expose Owner creation');
   assert.doesNotMatch(home.body,/footer-team[^>]*>\s*(?:مساحة الفريق|Team access)/,'public footer does not expose a staff portal link');
   const teamPortal = await call(app.handle,'GET','/team');
   assertStatus(teamPortal,200,'direct team portal route');
   assert.match(teamPortal.body,/employeeLoginForm/,'team portal route serves the protected sign-in interface');
   const badClientRegistration=await call(app.handle,'POST','/api/client/register',{remoteAddress:'127.0.0.11',body:{name:'Smoke Signup',email:'signup-mismatch@example.test',password:'Smoke!Registration123',confirmPassword:'Smoke!Registration456',student:true,university:'Test University'}});
   assertStatus(badClientRegistration,400,'client registration rejects mismatched passwords');
-  const clientSignup=await call(app.handle,'POST','/api/client/register',{remoteAddress:'127.0.0.12',body:{name:'Smoke Signup',email:'signup-client@example.test',password:'Smoke!Registration123',confirmPassword:'Smoke!Registration123',student:true,university:'Test University'}});
+  const clientSignup=await call(app.handle,'POST','/api/client/register',{remoteAddress:'127.0.0.12',body:{name:'Smoke Signup',email:'signup-client@example.test',password:'Smoke!Registration123',confirmPassword:'Smoke!Registration123',student:true,university:'Test University',role:'admin'}});
   assertStatus(clientSignup,201,'client registration creates a client account');
   const signedUpClient=asJson(clientSignup);
   assert.equal(signedUpClient.user.role,'client','public registration cannot choose a staff role');
@@ -180,7 +185,7 @@ try {
   assert.equal(templateUrl.pathname,'/971500000002','template order opens the orders department number');
   assert.equal(templateUrl.searchParams.get('text'),templateMessage,'Arabic and line breaks survive wa.me URL encoding');
   assert.ok(!buildTemplateEnquiryMessage({title:'Template',code:'WEB-003',price:200}).includes('رمز الإحالة'),'template message omits absent referral attribution');
-  assert.equal(publicConfig.adminSetupAvailable,true,'local first-admin setup should be available before the first administrator exists');
+  assert.equal(Object.hasOwn(publicConfig,'adminSetupAvailable'),false,'public configuration does not advertise Owner setup');
   assert.equal(publicConfig.prices.find(p=>p.id==='landing-basic')?.price,150,'basic landing page price should be 150 ILS');
   assert.equal(publicConfig.prices.find(p=>p.id==='landing-custom')?.price,300,'custom landing page price should be 300 ILS');
   assert.equal(Object.keys(publicConfig.templatePrices||{}).length,40,'public pricing config should expose all template price slots');
@@ -189,16 +194,15 @@ try {
   const quote=asJson(await call(app.handle,'POST','/api/quote',{body:{brief:'أحتاج صفحة تعريف بسيطة من صفحة واحدة',lang:'ar'}}));
   assert.equal(quote.packageId,'landing-basic','quote assistant should recommend only a scoped fixed package');
   assert.equal(quote.price,150);
-  const initialAdminPassword = temporaryPassword();
-  const adminPassword = temporaryPassword();
   process.env.NODE_ENV='production';
-  assert.equal(asJson(await call(app.handle,'GET','/api/public')).adminSetupAvailable,false,'production must hide first-admin setup');
-  assertStatus(await call(app.handle,'POST','/api/setup',{body:{name:'Public Admin',username:'publicadmin',password:'123456789'}}),403,'production cannot create a first administrator through the public form');
+  assert.equal(Object.hasOwn(asJson(await call(app.handle,'GET','/api/public')),'adminSetupAvailable'),false,'production public configuration omits Owner setup');
+  assertStatus(await call(app.handle,'POST','/api/setup',{body:{name:'Public Admin',username:'publicadmin',password:'Synthetic-Only-Password-9876'}}),410,'production public API permanently refuses Owner creation');
   process.env.NODE_ENV='test';
-  const adminSetup = await call(app.handle, 'POST', '/api/setup', { body: { name: 'Smoke Admin', username: 'smokeadmin', password: initialAdminPassword } });
-  assertStatus(adminSetup, 201, 'first administrator setup');
-  const adminCookie = sessionFrom(adminSetup);
-  assert.equal(asJson(adminSetup).user.mustChangePassword,true,'first administrator must change the temporary password before accessing data');
+  assertStatus(await call(app.handle,'POST','/api/setup',{body:{name:'Smoke Admin',username:'smokeadmin',password:initialAdminPassword}}),410,'test-mode public API also permanently refuses Owner creation');
+  const adminLogin=await call(app.handle,'POST','/api/auth/login',{body:{username:'smokeadmin',password:initialAdminPassword,accountType:'management'}});
+  assertStatus(adminLogin,200,'synthetic pre-provisioned Owner login');
+  const adminCookie = sessionFrom(adminLogin);
+  assert.equal(asJson(adminLogin).user.mustChangePassword,true,'synthetic Owner must change the bootstrap password before accessing data');
   assertStatus(await call(app.handle,'GET','/api/dashboard',{cookie:adminCookie}),428,'temporary admin password locks the dashboard');
   assertStatus(await call(app.handle,'POST','/api/auth/password',{cookie:adminCookie,body:{currentPassword:initialAdminPassword,newPassword:adminPassword}}),200,'first admin changes temporary password');
   assertStatus(await call(app.handle,'GET','/api/dashboard',{cookie:adminCookie}),428,'management dashboard stays locked until two-step verification is enabled');
@@ -212,7 +216,7 @@ try {
   assertStatus(login, 200, 'administrator login');
   assertStatus(await call(app.handle, 'POST', '/api/auth/login', { body:{username:'smokeadmin',password:adminPassword,accountType:'employee'} }), 401, 'administrator cannot use the employee login lane');
   assertStatus(await call(app.handle, 'POST', '/api/auth/login', { body:{username:'smokeadmin',password:'incorrect',accountType:'management'} }), 401, 'invalid password');
-  assertStatus(await call(app.handle, 'POST', '/api/setup', { body: { name: 'Another Admin', username: 'otheradmin', password: temporaryPassword() } }), 409, 'only one initial administrator setup');
+  assertStatus(await call(app.handle, 'POST', '/api/setup', { body: { name: 'Another Admin', username: 'otheradmin', password: temporaryPassword() } }), 410, 'public Owner creation remains permanently closed after an Owner exists');
 
   async function invite(name, username, role) {
     const body={ name, username, role, email:`${username}@example.test` };if(role==='admin')body.ownerMfaCode=currentTotp(ownerMfaSecret);
@@ -330,7 +334,7 @@ try {
   assert.equal(referralReport.summary.serviceViews,1);
   assert.equal(referralReport.summary.templateViews,1);
   assert.equal(referralReport.summary.whatsappClicks,1);
-  assert.doesNotMatch(JSON.stringify(referralReport),/temporary@example\.test|Temporary Client|smoke test request/i,'referral analytics never includes client contact or brief text');
+  assert.doesNotMatch(JSON.stringify(referralReport),/temporary@example\.test|\+971500000099|smoke test request|distinct returning visitor request/i,'referral analytics never includes client contact or brief text');
   assertStatus(await call(app.handle,'GET','/api/referral-intelligence'),401,'referral report requires authentication');
   const returningReferralLead=asJson(await call(app.handle,'POST','/api/leads',{remoteAddress:'127.0.0.40',body:{name:'Returning Referral Client',email:'returning-referral@example.test',phone:'',service:'web',category:'site',details:'A distinct returning visitor request for a landing page.',budget:'300 ILS',consent:'true',referralVisitorId:visitorId}}));
   assert.equal(returningReferralLead.attributed,true,'server-side consented visitor attribution survives client navigation without resubmitting the referral code');
@@ -339,7 +343,7 @@ try {
   assert.equal(attributedRequest.referralCode,currentReferralLink.code,'first-touch original monthly link receives the later request');
   assert.equal(attributedRequest.referralLinkId,currentReferralLink.id,'request is pinned to its original monthly-link record');
   assert.equal(marketerDash.rank.qualifiedSales,0,'unpaid enquiries do not qualify for rank sales');
-  assert.doesNotMatch(JSON.stringify(marketerDash), /temporary@example\.test|Temporary Client|smoke test request/i, 'marketer view must not expose client contact or description');
+  assert.doesNotMatch(JSON.stringify(marketerDash), /temporary@example\.test|\+971500000099|smoke test request|distinct returning visitor request/i, 'marketer view must not expose client contact or description');
   assert.doesNotMatch(JSON.stringify(marketerDash), /\+971500000099|wa\.me\/971500000099/i, 'marketers cannot see a client WhatsApp number');
 
   const marketingInvite = await invite('Smoke Marketing Lead', 'smokemarketing', 'marketing_manager');
@@ -400,11 +404,14 @@ try {
   const orderManagerInvite=await invite('Smoke Order Manager','smokeorders','order_manager'),orderManagerPassword=temporaryPassword(),orderManager=await activate(orderManagerInvite,orderManagerPassword),orderManagerMfa=await enableManagementMfa(app.handle,orderManager.cookie);
   assertStatus(await call(app.handle,'GET','/api/dashboard',{cookie:orderManager.cookie}),200,'Order Manager sees the embedded conversation workspace');
   assert.equal(asJson(await call(app.handle,'GET','/api/dashboard',{cookie:orderManager.cookie})).role,'order_manager');
-  const conversationClient=await ensureTestClient(app.handle,{name:'Conversation Client',email:'conversation-client@example.test'});
-  const conversationStart=await call(app.handle,'POST','/api/conversations',{cookie:conversationClient.cookie,body:{templateId:'web-copper-table',source:'template_catalog',referralCode:marketerInvite.user.referralCode,message:'I want to order and customize the restaurant website template.'}});
+  const conversationClient=await ensureTestClient(app.handle,{name:'Conversation Client',email:'conversation-client@example.test',referralCode:marketerInvite.user.referralCode});
+  const anonymousConversation=await call(app.handle,'POST','/api/conversations',{body:{templateId:'web-copper-table',source:'template_catalog',message:'Anonymous request must not be saved.'}});
+  assertStatus(anonymousConversation,401,'anonymous visitors must authenticate before a conversation is created');
+  assertStatus(await call(app.handle,'GET','/api/notifications'),401,'anonymous visitors cannot read team notifications');
+  const conversationStart=await call(app.handle,'POST','/api/conversations',{cookie:conversationClient.cookie,body:{templateId:'web-copper-table',source:'template_catalog',referralCode:marketer.user.referralCode,message:'I want to order and customize the restaurant website template.'}});
   assertStatus(conversationStart,201,'customer starts a real template conversation');
   const conversation=asJson(conversationStart).conversation;
-  assert.equal(conversation.referralCode,marketerInvite.user.referralCode,'template chat keeps referral attribution');
+  assert.equal(conversation.referralCode,marketerInvite.user.referralCode,'template chat uses the referral bound to the client account and ignores a forged override');
   assert.equal(conversation.source,'template_catalog','template chat stores its source');
   assert.equal(conversation.status,'new','new conversation starts in the new state');
   assertStatus(await call(app.handle,'GET',`/api/conversations/${conversation.id}`,{cookie:marketer.cookie}),404,'marketer cannot read customer conversations');
@@ -551,6 +558,7 @@ try {
   assertStatus(await call(app.handle,'GET','/api/admin/attachment/'+lead.id+'/0',{cookie:developer.cookie}),200,'assigned developer can access files after accepting task');
   assertStatus(await call(app.handle,'POST',`/api/developer/projects/${lead.id}/decision`,{cookie:developer.cookie,body:{decision:'accept'}}),404,'developer cannot accept the same task twice');
   const depositKey='PAYMENT-RETRY-0001';
+  assertStatus(await call(app.handle,'POST','/api/admin/payment',{cookie:adminCookie,body:{leadId:lead.id,amount:1,kind:'payment',note:'Missing idempotency key test',verified:true}}),400,'payment requires an idempotency key');
   const deposit = await call(app.handle, 'POST', '/api/admin/payment', { cookie:adminCookie, body:{leadId:lead.id,amount:100,kind:'payment',note:'Temporary test',verified:true,idempotencyKey:depositKey} });
   assertStatus(deposit, 201, 'verified deposit');
   const repeatedDeposit=await call(app.handle,'POST','/api/admin/payment',{cookie:adminCookie,body:{leadId:lead.id,amount:100,kind:'payment',note:'Retry after timeout',verified:true,idempotencyKey:depositKey}});
@@ -558,7 +566,7 @@ try {
   assert.equal(asJson(repeatedDeposit).lead.paidTotal,100,'payment retry cannot double-charge the local ledger');
   assert.equal(asJson(deposit).lead.commissionStatus, 'none', 'commission should not accrue until the contract is fully paid');
   assert.equal(asJson(await call(app.handle, 'GET', '/api/dashboard', { cookie:marketer.cookie })).summary.confirmed, 0);
-  const balance = await call(app.handle, 'POST', '/api/admin/payment', { cookie:adminCookie, body:{leadId:lead.id,amount:200,kind:'payment',note:'Temporary test',verified:true} });
+  const balance = await call(app.handle, 'POST', '/api/admin/payment', { cookie:adminCookie, body:{leadId:lead.id,amount:200,kind:'payment',note:'Temporary test',verified:true,idempotencyKey:'PAYMENT-FINAL-0002'} });
   assertStatus(balance, 201, 'verified final payment');
   assert.equal(asJson(balance).lead.commissionStatus, 'pending','fully paid referral commission waits for project completion');
   assert.equal(asJson(balance).lead.commissionAmount, 45);
@@ -628,7 +636,7 @@ try {
   assertStatus(await call(app.handle,'PATCH',`/api/admin/leads/${secondDeveloperLead.id}`,{cookie:adminCookie,body:{status:'active',contractAmount:100,developerUserId:developer.user.id}}),200,'owner assigns a second small project');
   assertStatus(await call(app.handle,'POST',`/api/developer/projects/${secondDeveloperLead.id}/decision`,{cookie:developer.cookie,body:{decision:'accept'}}),200,'developer accepts the second project');
   assertStatus(await call(app.handle,'PATCH',`/api/admin/leads/${secondDeveloperLead.id}`,{cookie:adminCookie,body:{status:'completed'}}),200,'owner marks second project complete');
-  assertStatus(await call(app.handle,'POST','/api/admin/payment',{cookie:adminCookie,body:{leadId:secondDeveloperLead.id,amount:100,kind:'payment',note:'Temporary developer test',verified:true}}),201,'owner records second project collection');
+  assertStatus(await call(app.handle,'POST','/api/admin/payment',{cookie:adminCookie,body:{leadId:secondDeveloperLead.id,amount:100,kind:'payment',note:'Temporary developer test',verified:true,idempotencyKey:'PAYMENT-SECOND-DEV-0001'}}),201,'owner records second project collection');
   assertStatus(await call(app.handle,'PATCH',`/api/developer/projects/${secondDeveloperLead.id}`,{cookie:developer.cookie,body:{status:'review_requested'}}),200,'developer requests review for second project');
   assertStatus(await call(app.handle,'PATCH',`/api/admin/developer-projects/${secondDeveloperLead.id}/review`,{cookie:adminCookie,body:{decision:'approved'}}),200,'owner approves second project delivery');
   const developerWithdrawalResponse=await call(app.handle,'POST','/api/marketer/withdrawals',{cookie:developer.cookie,body:{amount:100,method:'binance'}});
@@ -689,7 +697,7 @@ try {
   const projectComplete=await call(app.handle,'PATCH',`/api/admin/projects/${lifecycleId}/stage`,{cookie:adminCookie,body:{stage:'completed',note:'Project accepted and closed.'}});
   assertStatus(projectComplete,200,'owner completes delivery separately from payment');
   assert.equal(asJson(projectComplete).lead.developerCommissionAmount,0,'completion alone does not pay an uncollected developer entitlement');
-  const lifecyclePayment=await call(app.handle,'POST','/api/admin/payment',{cookie:adminCookie,body:{leadId:lifecycleId,amount:300,kind:'payment',note:'Lifecycle test verified receipt',verified:true}});
+  const lifecyclePayment=await call(app.handle,'POST','/api/admin/payment',{cookie:adminCookie,body:{leadId:lifecycleId,amount:300,kind:'payment',note:'Lifecycle test verified receipt',verified:true,idempotencyKey:'PAYMENT-LIFECYCLE-0001'}});
   assertStatus(lifecyclePayment,201,'owner records verified project collection');
   assert.equal(asJson(lifecyclePayment).lead.developerCommissionRate,25,'verified payment retains the agreed 25% rate');
   assert.equal(asJson(lifecyclePayment).lead.developerCommissionAmount,75,'eligible collected amount of 300 ILS yields 75 ILS implementation commission');
@@ -713,7 +721,7 @@ try {
     const leadId=asJson(order).id;
     assertStatus(await call(app.handle,'PATCH',`/api/admin/leads/${leadId}`,{cookie:adminCookie,body:{status:'active',contractAmount:amount}}),200,`rank test agreement ${sequence}`);
     assertStatus(await call(app.handle,'PATCH',`/api/admin/leads/${leadId}`,{cookie:adminCookie,body:{status:'completed'}}),200,`rank project completion ${sequence}`);
-    const payment=await call(app.handle,'POST','/api/admin/payment',{cookie:adminCookie,body:{leadId,amount,kind:'payment',note:'Temporary rank test',verified:true}});
+    const payment=await call(app.handle,'POST','/api/admin/payment',{cookie:adminCookie,body:{leadId,amount,kind:'payment',note:'Temporary rank test',verified:true,idempotencyKey:`RANK-SALE-${sequence}-${randomBytes(6).toString('hex')}`}});
     assertStatus(payment,201,`rank test paid sale ${sequence}`);
     return asJson(payment).lead;
   }
@@ -756,7 +764,7 @@ try {
   assert.match(privateFile.bytes.toString('utf8'), /^%PDF-1\.4/);
   const forbiddenFile = await call(app.handle, 'GET', `/api/admin/attachment/${lead.id}/0`, { cookie:marketer.cookie });
   assertStatus(forbiddenFile, 403, 'marketer attachment boundary');
-  const refund = await call(app.handle, 'POST', '/api/admin/payment', { cookie:adminCookie, body:{leadId:lead.id,amount:50,kind:'refund',note:'Temporary test reversal',verified:true} });
+  const refund = await call(app.handle, 'POST', '/api/admin/payment', { cookie:adminCookie, body:{leadId:lead.id,amount:50,kind:'refund',note:'Temporary test reversal',verified:true,idempotencyKey:'PAYMENT-REFUND-0001'} });
   assertStatus(refund, 201, 'verified refund');
   assert.equal(asJson(refund).lead.commissionStatus, 'reversed');
   assert.equal(asJson(await call(app.handle,'GET','/api/dashboard',{cookie:marketer.cookie})).summary.debt,7.5,'partial refunds after payout create a balance offset');
