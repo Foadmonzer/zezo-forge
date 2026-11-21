@@ -5,6 +5,13 @@ const buildDir = requestedBuildDir && /^\.next-[a-z0-9-]+$/.test(requestedBuildD
   ? requestedBuildDir
   : '.next';
 
+const protectedPageHeaders = [
+  { key: 'X-Robots-Tag', value: 'noindex, nofollow, noarchive, nosnippet' },
+  { key: 'Referrer-Policy', value: 'no-referrer' },
+  { key: 'X-Frame-Options', value: 'DENY' },
+  { key: 'Content-Security-Policy', value: "frame-ancestors 'none'" },
+];
+
 const nextConfig: NextConfig = {
   distDir: buildDir,
   poweredByHeader: false,
@@ -23,20 +30,7 @@ const nextConfig: NextConfig = {
           { key: 'Permissions-Policy', value: 'camera=(), microphone=(), geolocation=()' }
         ]
       },
-      {
-        source: '/team',
-        headers: [
-          { key: 'X-Robots-Tag', value: 'noindex, nofollow, noarchive, nosnippet' },
-          { key: 'Referrer-Policy', value: 'no-referrer' }
-        ]
-      },
-      {
-        source: '/activate',
-        headers: [
-          { key: 'X-Robots-Tag', value: 'noindex, nofollow, noarchive, nosnippet' },
-          { key: 'Referrer-Policy', value: 'no-referrer' }
-        ]
-      }
+      ...['/team', '/activate', '/account/:path*', '/reviews/moderation'].map(source => ({ source, headers: protectedPageHeaders }))
     ];
   }
 };

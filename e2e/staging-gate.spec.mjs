@@ -68,8 +68,14 @@ test('staging gate protects pages, API, and static assets until a secure session
   await expect.poll(() => protectedHero.evaluate(image => image.naturalWidth)).toBeGreaterThan(0);
   await expect(page.locator('body')).not.toContainText('دخول بيئة الاختبار');
 
-  await page.goto('/__staging/logout');
-  expect(new URL(page.url()).origin).toBe(pageUrl.origin);
+  // Make the logout request with the browser context's cookie jar, then verify
+  // its redirect separately from any pending navigation or dev-server reload.
+  const logoutResponse = await page.request.get('/__staging/logout', { maxRedirects: 0 });
+  expect(logoutResponse.status()).toBe(303);
+  const logoutDestination = new URL(logoutResponse.headers().location, pageUrl.origin);
+  expect(logoutDestination.href).toBe(new URL('/', pageUrl.origin).href);
+  expect((await page.context().cookies()).some(cookie => cookie.name === 'zezo_staging_access')).toBe(false);
+  await page.goto(logoutDestination.href, { waitUntil: 'domcontentloaded' });
   await expect(page.getByRole('heading', { name: 'دخول بيئة الاختبار' })).toBeVisible();
   const anonymousApiResponse = await page.request.get('/api/public');
   expect(anonymousApiResponse.status(), 'logging out should remove the staging cookie from subsequent browser requests').toBe(401);
